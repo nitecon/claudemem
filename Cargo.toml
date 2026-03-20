@@ -22,9 +22,6 @@ tokio = { version = "1", features = ["full"] }
 # Database
 rusqlite = { version = "0.31", features = ["bundled"] }
 
-# Full-text search
-tantivy = "0.22"
-
 # Embeddings
 fastembed = "4"
 
@@ -40,4 +37,3 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 dirs = "6"
-tempfile = "3"

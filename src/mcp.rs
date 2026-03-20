@@ -7,20 +7,18 @@ use rmcp::schemars;
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use rusqlite::Connection;
 use serde::Deserialize;
-use tantivy::Index;
 
 use crate::config::Config;
 use crate::db::models::Memory;
 use crate::db::queries;
 use crate::embedding;
 use crate::error::MemoryError;
-use crate::search::{self, bm25};
+use crate::search;
 
 #[derive(Clone)]
 pub struct MemoryServer {
     tool_router: ToolRouter<Self>,
     conn: Arc<Mutex<Connection>>,
-    index: Arc<Mutex<Index>>,
     config: Arc<Config>,
 }
 
@@ -91,14 +89,12 @@ pub struct ContextArgs {
 }
 
 impl MemoryServer {
-    pub fn new(config: Config, conn: Connection, index: Index) -> Self {
-        let server = Self {
+    pub fn new(config: Config, conn: Connection) -> Self {
+        Self {
             tool_router: Self::tool_router(),
             conn: Arc::new(Mutex::new(conn)),
-            index: Arc::new(Mutex::new(index)),
             config: Arc::new(config),
-        };
-        server
+        }
     }
 
     fn err_str(e: MemoryError) -> String {
@@ -131,13 +127,9 @@ impl MemoryServer {
         };
         memory.embedding = Some(emb);
 
+        // Insert into SQLite (FTS5 triggers handle full-text indexing)
         let conn = self.conn.lock().unwrap();
         if let Err(e) = queries::insert_memory(&conn, &memory) {
-            return format!("{{\"error\": \"{}\"}}", Self::err_str(e));
-        }
-
-        let index = self.index.lock().unwrap();
-        if let Err(e) = bm25::index_memory(&index, &memory) {
             return format!("{{\"error\": \"{}\"}}", Self::err_str(e));
         }
 
@@ -154,11 +146,9 @@ impl MemoryServer {
     fn search(&self, Parameters(args): Parameters<SearchArgs>) -> String {
         let limit = args.limit.unwrap_or(10);
         let conn = self.conn.lock().unwrap();
-        let index = self.index.lock().unwrap();
 
         let results = match search::hybrid_search(
             &conn,
-            &index,
             &args.query,
             limit,
             &self.config.model_cache_dir,
@@ -239,12 +229,10 @@ impl MemoryServer {
     #[tool(name = "memory_forget")]
     fn forget(&self, Parameters(args): Parameters<ForgetArgs>) -> String {
         let conn = self.conn.lock().unwrap();
-        let index = self.index.lock().unwrap();
 
         if let Some(id) = args.id {
             match queries::delete_memory(&conn, &id) {
                 Ok(true) => {
-                    let _ = bm25::remove_from_index(&index, &id);
                     serde_json::json!({"status": "deleted", "id": id}).to_string()
                 }
                 Ok(false) => {
@@ -255,7 +243,6 @@ impl MemoryServer {
         } else if let Some(query) = args.query {
             let results = match search::hybrid_search(
                 &conn,
-                &index,
                 &query,
                 5,
                 &self.config.model_cache_dir,
@@ -267,7 +254,6 @@ impl MemoryServer {
             let mut deleted_ids = Vec::new();
             for r in &results {
                 if let Ok(true) = queries::delete_memory(&conn, &r.memory.id) {
-                    let _ = bm25::remove_from_index(&index, &r.memory.id);
                     deleted_ids.push(r.memory.id.clone());
                 }
             }
@@ -296,13 +282,6 @@ impl MemoryServer {
             Err(e) => return format!("{{\"error\": \"{}\"}}", Self::err_str(e)),
         };
 
-        if !dry_run {
-            let index = self.index.lock().unwrap();
-            for m in &pruned {
-                let _ = bm25::remove_from_index(&index, &m.id);
-            }
-        }
-
         serde_json::json!({
             "status": if dry_run { "dry_run" } else { "pruned" },
             "count": pruned.len(),
@@ -322,11 +301,9 @@ impl MemoryServer {
     fn context(&self, Parameters(args): Parameters<ContextArgs>) -> String {
         let limit = args.limit.unwrap_or(5);
         let conn = self.conn.lock().unwrap();
-        let index = self.index.lock().unwrap();
 
         let results = match search::hybrid_search(
             &conn,
-            &index,
             &args.description,
             limit,
             &self.config.model_cache_dir,

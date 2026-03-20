@@ -4,7 +4,6 @@ pub mod vector;
 
 use rusqlite::Connection;
 use std::path::Path;
-use tantivy::Index;
 
 use crate::db::models::Memory;
 use crate::db::queries;
@@ -22,15 +21,14 @@ pub struct SearchResult {
 
 pub fn hybrid_search(
     conn: &Connection,
-    index: &Index,
     query: &str,
     limit: usize,
     model_cache_dir: &Path,
 ) -> Result<Vec<SearchResult>, MemoryError> {
     let expanded_limit = limit * 3;
 
-    // BM25 search
-    let bm25_results = search_bm25(index, query, expanded_limit).unwrap_or_default();
+    // BM25 search via FTS5
+    let bm25_results = search_bm25(conn, query, expanded_limit).unwrap_or_default();
 
     // Vector search
     let query_embedding = embedding::embed_text(query, model_cache_dir)?;

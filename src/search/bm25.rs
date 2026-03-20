@@ -1,118 +1,43 @@
-use std::path::Path;
+use rusqlite::{params, Connection};
 
-use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
-use tantivy::schema::*;
-use tantivy::{Index, IndexWriter, ReloadPolicy};
-
-use crate::db::models::Memory;
 use crate::error::MemoryError;
 
-fn build_schema() -> Schema {
-    let mut schema_builder = Schema::builder();
-    schema_builder.add_text_field("id", STRING | STORED);
-    schema_builder.add_text_field("content", TEXT | STORED);
-    schema_builder.build()
-}
-
-pub fn open_or_create_index(tantivy_dir: &Path) -> Result<Index, MemoryError> {
-    let schema = build_schema();
-
-    match Index::open_in_dir(tantivy_dir) {
-        Ok(index) => Ok(index),
-        Err(_) => {
-            // If directory exists but index is corrupted, clear it
-            if tantivy_dir.exists() {
-                let _ = std::fs::remove_dir_all(tantivy_dir);
-                std::fs::create_dir_all(tantivy_dir)?;
-            }
-            Ok(Index::create_in_dir(tantivy_dir, schema)?)
-        }
-    }
-}
-
-pub fn index_memory(index: &Index, memory: &Memory) -> Result<(), MemoryError> {
-    let schema = index.schema();
-    let id_field = schema.get_field("id").unwrap();
-    let content_field = schema.get_field("content").unwrap();
-
-    let mut writer: IndexWriter = index.writer(50_000_000)?;
-
-    // Remove existing doc with same id (for updates)
-    let id_term = tantivy::Term::from_field_text(id_field, &memory.id);
-    writer.delete_term(id_term);
-
-    let mut doc = tantivy::TantivyDocument::new();
-    doc.add_text(id_field, &memory.id);
-    doc.add_text(content_field, &memory.content);
-    writer.add_document(doc)?;
-    writer.commit()?;
-
-    Ok(())
-}
-
-pub fn remove_from_index(index: &Index, memory_id: &str) -> Result<(), MemoryError> {
-    let schema = index.schema();
-    let id_field = schema.get_field("id").unwrap();
-
-    let mut writer: IndexWriter = index.writer(50_000_000)?;
-    let id_term = tantivy::Term::from_field_text(id_field, memory_id);
-    writer.delete_term(id_term);
-    writer.commit()?;
-
-    Ok(())
-}
-
+/// Search memories using SQLite FTS5 with BM25 ranking.
+/// The FTS5 virtual table is kept in sync via triggers on the memories table.
 pub fn search_bm25(
-    index: &Index,
-    query_str: &str,
+    conn: &Connection,
+    query: &str,
     limit: usize,
 ) -> Result<Vec<(String, f32)>, MemoryError> {
-    let schema = index.schema();
-    let content_field = schema.get_field("content").unwrap();
-    let id_field = schema.get_field("id").unwrap();
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
 
-    let reader = index
-        .reader_builder()
-        .reload_policy(ReloadPolicy::OnCommitWithDelay)
-        .try_into()?;
-    let searcher = reader.searcher();
+    let mut stmt = conn.prepare(
+        "SELECT m.id, bm25(memories_fts) as score
+         FROM memories_fts
+         JOIN memories m ON m.rowid = memories_fts.rowid
+         WHERE memories_fts MATCH ?1
+         ORDER BY score
+         LIMIT ?2",
+    )?;
 
-    let query_parser = QueryParser::for_index(index, vec![content_field]);
-    let query = query_parser
-        .parse_query(query_str)
-        .map_err(|e| MemoryError::SearchIndex(tantivy::TantivyError::InvalidArgument(e.to_string())))?;
-
-    let top_docs = searcher.search(&query, &TopDocs::with_limit(limit))?;
+    let rows = match stmt.query_map(params![trimmed, limit as i64], |row| {
+        let id: String = row.get(0)?;
+        let score: f64 = row.get(1)?;
+        Ok((id, (-score) as f32)) // Negate: FTS5 bm25() returns negative values (closer to 0 = better)
+    }) {
+        Ok(r) => r,
+        Err(_) => return Ok(Vec::new()), // Malformed FTS5 query
+    };
 
     let mut results = Vec::new();
-    for (score, doc_address) in top_docs {
-        let doc: tantivy::TantivyDocument = searcher.doc(doc_address)?;
-        if let Some(id_value) = doc.get_first(id_field) {
-            if let Some(id_str) = id_value.as_str() {
-                results.push((id_str.to_string(), score));
-            }
+    for row in rows {
+        match row {
+            Ok(r) => results.push(r),
+            Err(_) => return Ok(results), // Stop on error (likely FTS5 parse issue)
         }
     }
-
     Ok(results)
-}
-
-pub fn rebuild_index(index: &Index, memories: &[Memory]) -> Result<(), MemoryError> {
-    let schema = index.schema();
-    let id_field = schema.get_field("id").unwrap();
-    let content_field = schema.get_field("content").unwrap();
-
-    let mut writer: IndexWriter = index.writer(50_000_000)?;
-    writer.delete_all_documents()?;
-
-    for memory in memories {
-        let mut doc = tantivy::TantivyDocument::new();
-        doc.add_text(id_field, &memory.id);
-        doc.add_text(content_field, &memory.content);
-        writer.add_document(doc)?;
-    }
-
-    writer.commit()?;
-    Ok(())
 }

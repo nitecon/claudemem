@@ -6,7 +6,6 @@ use crate::error::MemoryError;
 pub struct Config {
     pub data_dir: PathBuf,
     pub db_path: PathBuf,
-    pub tantivy_dir: PathBuf,
     pub model_cache_dir: PathBuf,
 }
 
@@ -22,7 +21,6 @@ impl Config {
 
         Ok(Self {
             db_path: data_dir.join("memory.db"),
-            tantivy_dir: data_dir.join("tantivy"),
             model_cache_dir: data_dir.join("models"),
             data_dir,
         })
@@ -30,7 +28,6 @@ impl Config {
 
     pub fn ensure_dirs(&self) -> Result<(), MemoryError> {
         std::fs::create_dir_all(&self.data_dir)?;
-        std::fs::create_dir_all(&self.tantivy_dir)?;
         std::fs::create_dir_all(&self.model_cache_dir)?;
         Ok(())
     }

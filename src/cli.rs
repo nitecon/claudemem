@@ -1,13 +1,12 @@
 use clap::Parser;
 use rusqlite::Connection;
-use tantivy::Index;
 
 use crate::config::Config;
 use crate::db::models::Memory;
 use crate::db::queries;
 use crate::embedding;
 use crate::error::MemoryError;
-use crate::search::{self, bm25};
+use crate::search;
 
 #[derive(Parser)]
 #[command(name = "claude-memory", about = "Persistent hybrid-search memory system for Claude Code")]
@@ -98,7 +97,6 @@ pub fn execute(
     cmd: Cli,
     config: Config,
     conn: &Connection,
-    index: &Index,
 ) -> Result<(), MemoryError> {
     match cmd {
         Cli::Store {
@@ -123,11 +121,8 @@ pub fn execute(
             let emb = embedding::embed_text(&content, &config.model_cache_dir)?;
             memory.embedding = Some(emb);
 
-            // Store in SQLite
+            // Store in SQLite (FTS5 triggers handle indexing)
             queries::insert_memory(conn, &memory)?;
-
-            // Index in Tantivy
-            bm25::index_memory(index, &memory)?;
 
             let output = serde_json::json!({
                 "status": "stored",
@@ -136,7 +131,7 @@ pub fn execute(
             println!("{}", serde_json::to_string_pretty(&output)?);
         }
         Cli::Search { query, limit } => {
-            let results = search::hybrid_search(conn, index, &query, limit, &config.model_cache_dir)?;
+            let results = search::hybrid_search(conn, &query, limit, &config.model_cache_dir)?;
 
             let output: Vec<_> = results
                 .iter()
@@ -196,21 +191,19 @@ pub fn execute(
             if let Some(id) = id {
                 let deleted = queries::delete_memory(conn, &id)?;
                 if deleted {
-                    bm25::remove_from_index(index, &id)?;
                     println!(r#"{{"status": "deleted", "id": "{}"}}"#, id);
                 } else {
                     println!(r#"{{"status": "not_found", "id": "{}"}}"#, id);
                 }
             } else if let Some(query) = query {
                 let results =
-                    search::hybrid_search(conn, index, &query, 5, &config.model_cache_dir)?;
+                    search::hybrid_search(conn, &query, 5, &config.model_cache_dir)?;
                 if results.is_empty() {
                     println!(r#"{{"status": "no_matches"}}"#);
                 } else {
                     let mut deleted_ids = Vec::new();
                     for r in &results {
                         if queries::delete_memory(conn, &r.memory.id)? {
-                            bm25::remove_from_index(index, &r.memory.id)?;
                             deleted_ids.push(r.memory.id.clone());
                         }
                     }
@@ -232,12 +225,6 @@ pub fn execute(
         } => {
             let pruned = queries::prune_memories(conn, max_age_days, min_access_count, dry_run)?;
 
-            if !dry_run {
-                for m in &pruned {
-                    bm25::remove_from_index(index, &m.id)?;
-                }
-            }
-
             let output = serde_json::json!({
                 "status": if dry_run { "dry_run" } else { "pruned" },
                 "count": pruned.len(),
@@ -257,7 +244,7 @@ pub fn execute(
         } => {
             // Context is essentially search with task-oriented framing
             let results =
-                search::hybrid_search(conn, index, &description, limit, &config.model_cache_dir)?;
+                search::hybrid_search(conn, &description, limit, &config.model_cache_dir)?;
 
             let output: Vec<_> = results
                 .iter()

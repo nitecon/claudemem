@@ -13,7 +13,6 @@ use tracing_subscriber::EnvFilter;
 use crate::cli::Cli;
 use crate::config::Config;
 use crate::db::open_database;
-use crate::search::bm25::open_or_create_index;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -31,9 +30,8 @@ async fn main() -> anyhow::Result<()> {
             let config = Config::load()?;
             config.ensure_dirs()?;
             let conn = open_database(&config.db_path)?;
-            let index = open_or_create_index(&config.tantivy_dir)?;
 
-            let server = mcp::MemoryServer::new(config, conn, index);
+            let server = mcp::MemoryServer::new(config, conn);
 
             tracing::info!("Starting claude-memory MCP server");
 
@@ -52,9 +50,8 @@ async fn main() -> anyhow::Result<()> {
             let config = Config::load()?;
             config.ensure_dirs()?;
             let conn = open_database(&config.db_path)?;
-            let index = open_or_create_index(&config.tantivy_dir)?;
 
-            cli::execute(other, config, &conn, &index)?;
+            cli::execute(other, config, &conn)?;
         }
     }
 

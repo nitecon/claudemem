@@ -5,9 +5,6 @@ pub enum MemoryError {
     #[error("Database error: {0}")]
     Database(#[from] rusqlite::Error),
 
-    #[error("Search index error: {0}")]
-    SearchIndex(#[from] tantivy::TantivyError),
-
     #[error("Embedding error: {0}")]
     Embedding(String),
 
