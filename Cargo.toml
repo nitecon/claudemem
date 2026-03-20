@@ -1,0 +1,43 @@
+[package]
+name = "claude-memory"
+version = "0.1.0"
+edition = "2021"
+description = "Persistent hybrid-search memory system for Claude Code"
+
+[[bin]]
+name = "claude-memory"
+path = "src/main.rs"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# MCP server
+rmcp = { version = "1", features = ["server", "transport-io"] }
+schemars = "1"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Database
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Full-text search
+tantivy = "0.22"
+
+# Embeddings
+fastembed = "4"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+dirs = "6"
+tempfile = "3"
