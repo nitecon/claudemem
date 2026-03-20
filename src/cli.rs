@@ -89,6 +89,18 @@ pub enum Cli {
         #[arg(short, long)]
         project: Option<String>,
     },
+    /// List all stored memories
+    List {
+        /// Number of results
+        #[arg(short = 'k', long, default_value = "50")]
+        limit: usize,
+        /// Filter by project
+        #[arg(short, long)]
+        project: Option<String>,
+        /// Filter by memory type
+        #[arg(short = 'm', long)]
+        memory_type: Option<String>,
+    },
     /// Start MCP stdio server
     Serve,
 }
@@ -259,6 +271,35 @@ pub fn execute(
                     })
                 })
                 .collect();
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
+        Cli::List {
+            limit,
+            project,
+            memory_type,
+        } => {
+            let memories = queries::list_memories(
+                conn,
+                project.as_deref(),
+                None,
+                None,
+                memory_type.as_deref(),
+                limit,
+            )?;
+
+            let output: Vec<_> = memories.iter().map(|m| {
+                serde_json::json!({
+                    "id": m.id,
+                    "content": m.content,
+                    "tags": m.tags,
+                    "project": m.project,
+                    "agent": m.agent,
+                    "memory_type": m.memory_type,
+                    "access_count": m.access_count,
+                    "created_at": m.created_at,
+                    "updated_at": m.updated_at,
+                })
+            }).collect();
             println!("{}", serde_json::to_string_pretty(&output)?);
         }
         Cli::Serve => {
