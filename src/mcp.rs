@@ -312,6 +312,15 @@ impl MemoryServer {
             Err(e) => return format!("{{\"error\": \"{}\"}}", Self::err_str(e)),
         };
 
+        let results: Vec<_> = if let Some(ref project) = args.project {
+            results
+                .into_iter()
+                .filter(|r| r.memory.project.as_deref() == Some(project.as_str()))
+                .collect()
+        } else {
+            results
+        };
+
         let output: Vec<_> = results
             .iter()
             .map(|r| {
