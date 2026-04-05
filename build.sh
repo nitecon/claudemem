@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 set -e
 
-echo "Building claude-memory (release)..."
+echo "Building memory (release)..."
 cargo build --release
 
-BINARY="target/release/claude-memory"
+BINARY="target/release/memory"
 
 if [ -n "$1" ]; then
     mkdir -p "$1"
-    cp "$BINARY" "$1/claude-memory"
-    INSTALL_PATH="$(cd "$1" && pwd)/claude-memory"
+    cp "$BINARY" "$1/memory"
+    INSTALL_PATH="$(cd "$1" && pwd)/memory"
     echo "Installed to $INSTALL_PATH"
 else
     INSTALL_PATH="$(pwd)/$BINARY"
@@ -19,4 +19,4 @@ echo ""
 echo "Build complete."
 echo ""
 echo "To register as MCP server:"
-echo "  claude mcp add claude-memory -- \"$INSTALL_PATH\" serve"
+echo "  claude mcp add memory -- \"$INSTALL_PATH\" serve"

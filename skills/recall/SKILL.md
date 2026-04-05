@@ -2,7 +2,7 @@
 name: recall
 description: Search and retrieve stored memories. Use when the user asks to recall, remember, look up past context, or when you need to find relevant information from previous conversations.
 argument-hint: "[search query or topic]"
-allowed-tools: mcp__claude-memory__memory_search, mcp__claude-memory__memory_context, mcp__claude-memory__memory_recall
+allowed-tools: mcp__agent-memory__memory_search, mcp__agent-memory__memory_context, mcp__agent-memory__memory_recall
 ---
 
 The user wants to retrieve memories. The query is:

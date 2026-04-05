@@ -33,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
 
             let server = mcp::MemoryServer::new(config, conn);
 
-            tracing::info!("Starting claude-memory MCP server");
+            tracing::info!("Starting agent-memory MCP server");
 
             let service = server
                 .serve(rmcp::transport::io::stdio())

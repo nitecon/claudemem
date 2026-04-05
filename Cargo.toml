@@ -1,11 +1,11 @@
 [package]
-name = "claude-memory"
+name = "agent-memory"
 version = "0.1.0"
 edition = "2021"
-description = "Persistent hybrid-search memory system for Claude Code"
+description = "Persistent hybrid-search memory system for AI coding agents"
 
 [[bin]]
-name = "claude-memory"
+name = "memory"
 path = "src/main.rs"
 
 [dependencies]

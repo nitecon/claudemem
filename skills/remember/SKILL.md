@@ -2,7 +2,7 @@
 name: remember
 description: Store a memory for future retrieval. Use when the user says "remember this", wants to save context, preferences, decisions, or any information that should persist across conversations.
 argument-hint: "[memory text or description of what to remember]"
-allowed-tools: mcp__claude-memory__memory_store, mcp__claude-memory__memory_search
+allowed-tools: mcp__agent-memory__memory_store, mcp__agent-memory__memory_search
 ---
 
 The user wants to store a memory. The input is:

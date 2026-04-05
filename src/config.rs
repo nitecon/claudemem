@@ -10,13 +10,24 @@ pub struct Config {
 }
 
 impl Config {
+    /// Resolve the data directory with the following priority:
+    ///
+    /// 1. `AGENT_MEMORY_DIR` environment variable (explicit override)
+    /// 2. `~/.agentic/` if `~/.agentic/memory.db` already exists (user-local)
+    /// 3. `/opt/agentic/` as the global default (Linux/macOS)
+    ///    `%USERPROFILE%\.agentic\` on Windows
     pub fn load() -> Result<Self, MemoryError> {
-        let data_dir = if let Ok(dir) = std::env::var("CLAUDE_MEMORY_DIR") {
+        let data_dir = if let Ok(dir) = std::env::var("AGENT_MEMORY_DIR") {
             PathBuf::from(dir)
+        } else if let Some(user_dir) = Self::user_local_dir() {
+            if user_dir.join("memory.db").exists() {
+                user_dir
+            } else {
+                Self::global_dir().unwrap_or(user_dir)
+            }
         } else {
-            let home = dirs::home_dir()
-                .ok_or_else(|| MemoryError::Config("Could not determine home directory".into()))?;
-            home.join(".claude").join("memory")
+            Self::global_dir()
+                .ok_or_else(|| MemoryError::Config("Could not determine data directory".into()))?
         };
 
         Ok(Self {
@@ -24,6 +35,20 @@ impl Config {
             model_cache_dir: data_dir.join("models"),
             data_dir,
         })
+    }
+
+    /// User-local directory: ~/.agentic/
+    fn user_local_dir() -> Option<PathBuf> {
+        dirs::home_dir().map(|h| h.join(".agentic"))
+    }
+
+    /// Global directory: /opt/agentic/ on Unix, %USERPROFILE%\.agentic\ on Windows
+    fn global_dir() -> Option<PathBuf> {
+        if cfg!(windows) {
+            dirs::home_dir().map(|h| h.join(".agentic"))
+        } else {
+            Some(PathBuf::from("/opt/agentic"))
+        }
     }
 
     pub fn ensure_dirs(&self) -> Result<(), MemoryError> {

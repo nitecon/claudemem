@@ -9,7 +9,7 @@ use crate::error::MemoryError;
 use crate::search;
 
 #[derive(Parser)]
-#[command(name = "claude-memory", about = "Persistent hybrid-search memory system for Claude Code")]
+#[command(name = "memory", about = "Persistent hybrid-search memory system for AI coding agents")]
 pub enum Cli {
     /// Save a memory with auto-embedding and BM25 indexing
     Store {

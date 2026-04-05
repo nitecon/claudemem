@@ -346,7 +346,7 @@ impl ServerHandler for MemoryServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(
-                "Persistent memory system for Claude Code. \
+                "Persistent memory system for AI coding agents. \
                  Use memory_store to save important context, \
                  memory_search for hybrid retrieval, \
                  memory_context for task-relevant memories, \
