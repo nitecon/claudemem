@@ -37,3 +37,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 dirs = "6"
+
+# Auto-updater
+reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-features = false }
+semver = "1"
+flate2 = "1"
+tar = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }

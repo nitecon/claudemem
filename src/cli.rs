@@ -9,7 +9,7 @@ use crate::error::MemoryError;
 use crate::search;
 
 #[derive(Parser)]
-#[command(name = "memory", about = "Persistent hybrid-search memory system for AI coding agents")]
+#[command(name = "memory", about = "Persistent hybrid-search memory system for AI coding agents", version = env!("CARGO_PKG_VERSION"))]
 pub enum Cli {
     /// Save a memory with auto-embedding and BM25 indexing
     Store {
@@ -103,6 +103,8 @@ pub enum Cli {
     },
     /// Start MCP stdio server
     Serve,
+    /// Check for updates and install the latest version
+    Update,
 }
 
 pub fn execute(
@@ -304,6 +306,9 @@ pub fn execute(
         }
         Cli::Serve => {
             unreachable!("Serve is handled in main.rs");
+        }
+        Cli::Update => {
+            crate::updater::manual_update()?;
         }
     }
     Ok(())

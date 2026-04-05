@@ -19,4 +19,7 @@ pub enum MemoryError {
 
     #[error("Configuration error: {0}")]
     Config(String),
+
+    #[error("Update error: {0}")]
+    Update(String),
 }

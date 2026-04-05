@@ -5,6 +5,7 @@ mod embedding;
 mod error;
 mod mcp;
 mod search;
+mod updater;
 
 use clap::Parser;
 use rmcp::ServiceExt;
@@ -49,6 +50,10 @@ async fn main() -> anyhow::Result<()> {
 
             let config = Config::load()?;
             config.ensure_dirs()?;
+
+            // Auto-update check (rate-limited, non-blocking on failure)
+            updater::auto_update(&config.data_dir);
+
             let conn = open_database(&config.db_path)?;
 
             cli::execute(other, config, &conn)?;
