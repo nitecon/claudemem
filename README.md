@@ -161,7 +161,22 @@ memory prune --max-age-days 90
 
 # List all memories
 memory list -k 50 --project myapp
+
+# Check for updates and install the latest version
+memory update
 ```
+
+## Auto-update
+
+The binary checks for new releases on GitHub once per hour (at most) during normal CLI usage. If a newer version is found, it downloads and replaces the binary automatically. The update check is non-blocking — failures are logged to stderr and never interrupt normal operation.
+
+To disable auto-updates, set the environment variable:
+
+```bash
+export AGENT_MEMORY_NO_UPDATE=1
+```
+
+You can also trigger an update manually at any time with `memory update`.
 
 ## MCP tools
 
