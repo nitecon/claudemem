@@ -50,6 +50,8 @@ jobs:
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
+        env:
+          AGENT_MEMORY_VERSION: ${{ github.ref_name }}
 
       - name: Package (Windows)
         if: runner.os == 'Windows'

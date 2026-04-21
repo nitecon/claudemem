@@ -25,7 +25,7 @@ pub enum OutputFormat {
 }
 
 #[derive(Parser)]
-#[command(name = "memory", about = "Persistent hybrid-search memory system for AI coding agents", version = env!("CARGO_PKG_VERSION"))]
+#[command(name = "memory", about = "Persistent hybrid-search memory system for AI coding agents", version = env!("AGENT_MEMORY_VERSION"))]
 pub enum Cli {
     /// Save a memory with auto-embedding and BM25 indexing.
     ///

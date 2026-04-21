@@ -15,8 +15,14 @@ use crate::error::MemoryError;
 /// GitHub repository in `owner/repo` format.
 const REPO: &str = "nitecon/agent-memory";
 
-/// Compiled-in version from Cargo.toml.
-const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Compiled-in version.
+///
+/// Prefers `AGENT_MEMORY_VERSION` (set by `build.rs` from the release tag in
+/// CI, e.g. `1.0.3`) and falls back to `CARGO_PKG_VERSION` for local
+/// development builds. This lets release binaries report the real tagged
+/// version even when `Cargo.toml` has not been bumped, which is required for
+/// the auto-updater to stop looping once it reaches the latest release.
+const CURRENT_VERSION: &str = env!("AGENT_MEMORY_VERSION");
 
 /// Minimum interval (in seconds) between automatic update checks.
 const CHECK_INTERVAL_SECS: u64 = 3600;
@@ -386,7 +392,6 @@ mod tests {
 
     #[test]
     fn test_is_newer_greater() {
-        // Assumes CURRENT_VERSION is 0.1.0 during tests.
         assert!(is_newer("99.0.0"));
     }
 
