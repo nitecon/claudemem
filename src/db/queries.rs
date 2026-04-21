@@ -82,10 +82,7 @@ pub fn list_memories(
     let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
     if let Some(p) = project {
-        sql.push_str(&format!(
-            " AND project = ?{}",
-            param_values.len() + 1
-        ));
+        sql.push_str(&format!(" AND project = ?{}", param_values.len() + 1));
         param_values.push(Box::new(p.to_string()));
     }
     if let Some(a) = agent {
@@ -93,18 +90,12 @@ pub fn list_memories(
         param_values.push(Box::new(a.to_string()));
     }
     if let Some(mt) = memory_type {
-        sql.push_str(&format!(
-            " AND memory_type = ?{}",
-            param_values.len() + 1
-        ));
+        sql.push_str(&format!(" AND memory_type = ?{}", param_values.len() + 1));
         param_values.push(Box::new(mt.to_string()));
     }
     if let Some(tag_list) = tags {
         for tag in tag_list {
-            sql.push_str(&format!(
-                " AND tags LIKE ?{}",
-                param_values.len() + 1
-            ));
+            sql.push_str(&format!(" AND tags LIKE ?{}", param_values.len() + 1));
             param_values.push(Box::new(format!("%\"{tag}\"%")));
         }
     }
@@ -330,8 +321,7 @@ pub fn prune_memories(
     min_access_count: i64,
     dry_run: bool,
 ) -> Result<Vec<Memory>, MemoryError> {
-    let cutoff = chrono::Utc::now()
-        - chrono::Duration::days(max_age_days as i64);
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(max_age_days as i64);
     let cutoff_str = cutoff.to_rfc3339();
 
     let mut stmt = conn.prepare(

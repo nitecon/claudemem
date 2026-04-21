@@ -255,14 +255,19 @@ impl MemoryServer {
         };
 
         let conn = self.conn.lock().unwrap();
-        let results = match search::hybrid_search(&conn, &args.query, opts, &self.config.model_cache_dir) {
-            Ok(r) => r,
-            Err(e) => return format!("{{\"error\": \"{}\"}}", Self::err_str(e)),
-        };
+        let results =
+            match search::hybrid_search(&conn, &args.query, opts, &self.config.model_cache_dir) {
+                Ok(r) => r,
+                Err(e) => return format!("{{\"error\": \"{}\"}}", Self::err_str(e)),
+            };
 
-        let out = render_ranked_output(&results, boost_project_owned.as_deref(), format, preview_chars);
-        serde_json::to_string_pretty(&out)
-            .unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e))
+        let out = render_ranked_output(
+            &results,
+            boost_project_owned.as_deref(),
+            format,
+            preview_chars,
+        );
+        serde_json::to_string_pretty(&out).unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e))
     }
 
     /// Filter memories by project, agent, tags, or memory type. Use for structured retrieval
@@ -292,8 +297,7 @@ impl MemoryServer {
         };
 
         let out = render_memory_list(&memories, cwd_project.as_deref(), format, preview_chars);
-        serde_json::to_string_pretty(&out)
-            .unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e))
+        serde_json::to_string_pretty(&out).unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e))
     }
 
     /// Remove memories by ID or by search query. Use with an ID for precise deletion,
@@ -310,10 +314,11 @@ impl MemoryServer {
             }
         } else if let Some(query) = args.query {
             let opts = SearchOptions::new(5);
-            let results = match search::hybrid_search(&conn, &query, opts, &self.config.model_cache_dir) {
-                Ok(r) => r,
-                Err(e) => return format!("{{\"error\": \"{}\"}}", Self::err_str(e)),
-            };
+            let results =
+                match search::hybrid_search(&conn, &query, opts, &self.config.model_cache_dir) {
+                    Ok(r) => r,
+                    Err(e) => return format!("{{\"error\": \"{}\"}}", Self::err_str(e)),
+                };
 
             let mut deleted_ids = Vec::new();
             for r in &results {
@@ -385,14 +390,23 @@ impl MemoryServer {
         };
 
         let conn = self.conn.lock().unwrap();
-        let results = match search::hybrid_search(&conn, &args.description, opts, &self.config.model_cache_dir) {
+        let results = match search::hybrid_search(
+            &conn,
+            &args.description,
+            opts,
+            &self.config.model_cache_dir,
+        ) {
             Ok(r) => r,
             Err(e) => return format!("{{\"error\": \"{}\"}}", Self::err_str(e)),
         };
 
-        let out = render_ranked_output(&results, boost_project_owned.as_deref(), format, preview_chars);
-        serde_json::to_string_pretty(&out)
-            .unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e))
+        let out = render_ranked_output(
+            &results,
+            boost_project_owned.as_deref(),
+            format,
+            preview_chars,
+        );
+        serde_json::to_string_pretty(&out).unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e))
     }
 
     /// Fetch full content for one or more memory IDs. Pair with memory_search or memory_context
@@ -444,7 +458,13 @@ impl MemoryServer {
         let to = empty_to_none_owned(&args.to);
         let dry_run = args.dry_run.unwrap_or(false);
         let conn = self.conn.lock().unwrap();
-        match run_move(&conn, args.id.as_deref(), args.from.as_deref(), to.as_deref(), dry_run) {
+        match run_move(
+            &conn,
+            args.id.as_deref(),
+            args.from.as_deref(),
+            to.as_deref(),
+            dry_run,
+        ) {
             Ok(v) => serde_json::to_string_pretty(&v)
                 .unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e)),
             Err(e) => format!("{{\"error\": \"{}\"}}", Self::err_str(e)),
@@ -462,7 +482,13 @@ impl MemoryServer {
         let to = empty_to_none_owned(&args.to);
         let dry_run = args.dry_run.unwrap_or(false);
         let conn = self.conn.lock().unwrap();
-        match run_copy(&conn, args.id.as_deref(), args.from.as_deref(), to.as_deref(), dry_run) {
+        match run_copy(
+            &conn,
+            args.id.as_deref(),
+            args.from.as_deref(),
+            to.as_deref(),
+            dry_run,
+        ) {
             Ok(v) => serde_json::to_string_pretty(&v)
                 .unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e)),
             Err(e) => format!("{{\"error\": \"{}\"}}", Self::err_str(e)),

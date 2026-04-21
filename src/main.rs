@@ -37,9 +37,7 @@ async fn main() -> anyhow::Result<()> {
 
             tracing::info!("Starting agent-memory MCP server");
 
-            let service = server
-                .serve(rmcp::transport::io::stdio())
-                .await?;
+            let service = server.serve(rmcp::transport::io::stdio()).await?;
             service.waiting().await?;
         }
         other => {

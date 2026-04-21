@@ -193,7 +193,9 @@ memory update
 
 ## Project auto-detection and cross-project boost
 
-`store`, `search`, and `context` derive the current project identifier from the working directory's git remote (normalized: SSH and HTTPS for the same repo produce the same ident), falling back to the canonical absolute path for non-git directories. New memories are auto-tagged with this project unless you pass `--project` explicitly or `--no-project`.
+`store`, `search`, and `context` derive the current project identifier from the working directory's git remote and reduce it to the repository shortname (e.g. `git@github.com:nitecon/eventic.git` → `eventic`). SSH and HTTPS for the same repo produce the same ident. Non-git directories fall back to the directory basename. New memories are auto-tagged with this project unless you pass `--project` explicitly or `--no-project`.
+
+Shortname is deliberate so auto-derived idents match the hand-written shortnames most agents already use. The trade-off is that two repos with the same basename across different orgs will collide; in that case, tag them explicitly with `--project`.
 
 At query time, memories tagged with the current project receive a 1.5× score boost before re-sorting. The goal is to surface local context first while letting strong cross-project matches still appear as prior art. When the top-K contains cross-project results, the response includes a `hint` field that flags them so models treat those memories as general guidance rather than direct context.
 

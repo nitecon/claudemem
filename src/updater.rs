@@ -129,7 +129,11 @@ fn is_newer(latest: &str) -> bool {
 
 /// Determines the correct release asset filename for the running platform.
 fn get_asset_name() -> Result<String, MemoryError> {
-    let name = match (cfg!(target_os = "linux"), cfg!(target_os = "macos"), cfg!(target_os = "windows")) {
+    let name = match (
+        cfg!(target_os = "linux"),
+        cfg!(target_os = "macos"),
+        cfg!(target_os = "windows"),
+    ) {
         (true, _, _) => {
             if cfg!(target_arch = "x86_64") {
                 "agent-memory-linux-x86_64.tar.gz"
@@ -152,7 +156,9 @@ fn get_asset_name() -> Result<String, MemoryError> {
             if cfg!(target_arch = "x86_64") {
                 "agent-memory-windows-x86_64.zip"
             } else {
-                return Err(MemoryError::Update("unsupported Windows architecture".into()));
+                return Err(MemoryError::Update(
+                    "unsupported Windows architecture".into(),
+                ));
             }
         }
         _ => return Err(MemoryError::Update("unsupported operating system".into())),
@@ -226,8 +232,7 @@ fn extract_from_tar_gz(data: &[u8], binary_name: &str) -> Result<Vec<u8>, Memory
         .entries()
         .map_err(|e| MemoryError::Update(format!("tar read error: {e}")))?
     {
-        let mut entry =
-            entry.map_err(|e| MemoryError::Update(format!("tar entry error: {e}")))?;
+        let mut entry = entry.map_err(|e| MemoryError::Update(format!("tar entry error: {e}")))?;
         let path = entry
             .path()
             .map_err(|e| MemoryError::Update(format!("tar path error: {e}")))?;

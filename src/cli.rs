@@ -324,8 +324,7 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
                 boost_factor,
                 only_project: only.as_deref(),
             };
-            let results =
-                search::hybrid_search(conn, &description, opts, &config.model_cache_dir)?;
+            let results = search::hybrid_search(conn, &description, opts, &config.model_cache_dir)?;
             let output = render_ranked_output(&results, boost_project, format, preview_chars);
             println!("{}", serde_json::to_string_pretty(&output)?);
         }
@@ -350,7 +349,8 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
                 limit,
             )?;
 
-            let output = render_memory_list(&memories, cwd_project.as_deref(), format, preview_chars);
+            let output =
+                render_memory_list(&memories, cwd_project.as_deref(), format, preview_chars);
             println!("{}", serde_json::to_string_pretty(&output)?);
         }
         Cli::Forget { id, query } => {
@@ -445,7 +445,8 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
                 memory_type.as_deref(),
                 limit,
             )?;
-            let output = render_memory_list(&memories, cwd_project.as_deref(), format, preview_chars);
+            let output =
+                render_memory_list(&memories, cwd_project.as_deref(), format, preview_chars);
             println!("{}", serde_json::to_string_pretty(&output)?);
         }
         Cli::Move {
