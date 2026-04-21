@@ -4,6 +4,7 @@ mod db;
 mod embedding;
 mod error;
 mod mcp;
+mod project;
 mod search;
 mod updater;
 

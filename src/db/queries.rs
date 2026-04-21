@@ -7,7 +7,7 @@ pub fn insert_memory(conn: &Connection, memory: &Memory) -> Result<(), MemoryErr
     let tags_json = memory
         .tags
         .as_ref()
-        .map(|t| serde_json::to_string(t))
+        .map(serde_json::to_string)
         .transpose()?;
 
     let embedding_blob = memory.embedding.as_ref().map(|e| embedding_to_blob(e));
