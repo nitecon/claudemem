@@ -177,6 +177,153 @@ pub fn increment_access(conn: &Connection, ids: &[String]) -> Result<(), MemoryE
     Ok(())
 }
 
+/// Reassign the `project` column on a single memory. Returns true if the row existed.
+pub fn move_memory_by_id(
+    conn: &Connection,
+    id: &str,
+    new_project: Option<&str>,
+) -> Result<bool, MemoryError> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let changed = conn.execute(
+        "UPDATE memories SET project = ?1, updated_at = ?2 WHERE id = ?3",
+        params![new_project, now, id],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Reassign the `project` column for every memory currently tagged with `from`.
+/// `from` may be `None` to match memories with a NULL project. Returns the
+/// number of rows updated.
+pub fn move_memories_by_project(
+    conn: &Connection,
+    from: Option<&str>,
+    new_project: Option<&str>,
+) -> Result<usize, MemoryError> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let changed = match from {
+        Some(f) => conn.execute(
+            "UPDATE memories SET project = ?1, updated_at = ?2 WHERE project = ?3",
+            params![new_project, now, f],
+        )?,
+        None => conn.execute(
+            "UPDATE memories SET project = ?1, updated_at = ?2 WHERE project IS NULL",
+            params![new_project, now],
+        )?,
+    };
+    Ok(changed)
+}
+
+/// Preview rows that `move_memories_by_project` would update.
+pub fn list_memories_by_project(
+    conn: &Connection,
+    project: Option<&str>,
+) -> Result<Vec<Memory>, MemoryError> {
+    let mut stmt = match project {
+        Some(_) => conn.prepare(
+            "SELECT id, content, tags, project, agent, source_file,
+             created_at, updated_at, access_count, embedding, memory_type
+             FROM memories WHERE project = ?1",
+        )?,
+        None => conn.prepare(
+            "SELECT id, content, tags, project, agent, source_file,
+             created_at, updated_at, access_count, embedding, memory_type
+             FROM memories WHERE project IS NULL",
+        )?,
+    };
+    let map_row = |row: &rusqlite::Row| -> rusqlite::Result<Memory> {
+        let tags_str: Option<String> = row.get(2)?;
+        let embedding_blob: Option<Vec<u8>> = row.get(9)?;
+        Ok(Memory {
+            id: row.get(0)?,
+            content: row.get(1)?,
+            tags: tags_str.and_then(|s| serde_json::from_str(&s).ok()),
+            project: row.get(3)?,
+            agent: row.get(4)?,
+            source_file: row.get(5)?,
+            created_at: row.get(6)?,
+            updated_at: row.get(7)?,
+            access_count: row.get(8)?,
+            embedding: embedding_blob.map(|b| blob_to_embedding(&b)),
+            memory_type: row.get(10)?,
+        })
+    };
+    let rows: Vec<Memory> = match project {
+        Some(p) => stmt
+            .query_map(params![p], map_row)?
+            .collect::<rusqlite::Result<_>>()?,
+        None => stmt
+            .query_map([], map_row)?
+            .collect::<rusqlite::Result<_>>()?,
+    };
+    Ok(rows)
+}
+
+/// Duplicate a memory under a new project ident. Preserves content, tags,
+/// agent, source_file, memory_type, and the embedding. A new UUID is minted
+/// and created_at/updated_at are set to now; access_count resets to 0.
+/// Returns the new memory ID.
+pub fn copy_memory_by_id(
+    conn: &Connection,
+    src_id: &str,
+    new_project: Option<&str>,
+) -> Result<String, MemoryError> {
+    let src = get_memory_by_id(conn, src_id)?;
+    let mut copy = Memory::new(
+        src.content,
+        src.tags,
+        new_project.map(|s| s.to_string()),
+        src.agent,
+        src.source_file,
+        src.memory_type,
+    );
+    copy.embedding = src.embedding;
+    insert_memory(conn, &copy)?;
+    Ok(copy.id)
+}
+
+/// Duplicate every memory tagged with `from` under `new_project`. Returns the
+/// newly-created memory IDs.
+pub fn copy_memories_by_project(
+    conn: &Connection,
+    from: Option<&str>,
+    new_project: Option<&str>,
+) -> Result<Vec<String>, MemoryError> {
+    let sources = list_memories_by_project(conn, from)?;
+    let mut new_ids = Vec::with_capacity(sources.len());
+    for src in sources {
+        let mut copy = Memory::new(
+            src.content,
+            src.tags,
+            new_project.map(|s| s.to_string()),
+            src.agent,
+            src.source_file,
+            src.memory_type,
+        );
+        copy.embedding = src.embedding;
+        insert_memory(conn, &copy)?;
+        new_ids.push(copy.id);
+    }
+    Ok(new_ids)
+}
+
+/// List distinct project idents with the number of memories tagged under each.
+/// A NULL project is reported as `None`. Ordered by count DESC.
+pub fn list_projects(conn: &Connection) -> Result<Vec<(Option<String>, i64)>, MemoryError> {
+    let mut stmt = conn.prepare(
+        "SELECT project, COUNT(*) as cnt FROM memories GROUP BY project ORDER BY cnt DESC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let project: Option<String> = row.get(0)?;
+        let count: i64 = row.get(1)?;
+        Ok((project, count))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 pub fn prune_memories(
     conn: &Connection,
     max_age_days: u64,

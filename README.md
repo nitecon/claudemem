@@ -122,7 +122,7 @@ Or add manually to `~/.claude.json`:
 }
 ```
 
-This gives Claude Code seven native tools: `memory_store`, `memory_search`, `memory_recall`, `memory_forget`, `memory_prune`, `memory_context`, `memory_get`.
+This gives Claude Code ten native tools: `memory_store`, `memory_search`, `memory_recall`, `memory_forget`, `memory_prune`, `memory_context`, `memory_get`, `memory_projects`, `memory_move`, `memory_copy`.
 
 ### Skills (optional)
 
@@ -172,6 +172,21 @@ memory prune --max-age-days 90
 # List all memories
 memory list -k 50 --project myapp
 
+# List distinct project idents (great for spotting alias mismatches)
+memory projects
+
+# Migrate memories from a legacy project name to the canonical git-remote ident
+memory move --from "trading-platform-sre" --to "github.com/nitecon/SRE.git" --dry-run
+memory move --from "trading-platform-sre" --to "github.com/nitecon/SRE.git"
+
+# Reassign a single memory by ID (pass --to "" to clear the project tag)
+memory move --id <uuid> --to "github.com/nitecon/SRE.git"
+memory move --id <uuid> --to ""
+
+# Duplicate memories under a new project ident (preserves content + embedding)
+memory copy --from "github.com/acme/mono.git" --to "github.com/acme/split.git"
+memory copy --id <uuid> --to "github.com/acme/mirror.git"
+
 # Check for updates and install the latest version
 memory update
 ```
@@ -188,6 +203,23 @@ At query time, memories tagged with the current project receive a 1.5× score bo
 | `-p <ident>` | Boost this project instead of cwd |
 | `--only <ident>` | Hard filter: only return memories with this project |
 | `--no-project-boost` | Flat ranking; no boost, no filter |
+
+## Migrating project idents
+
+If memories were stored under a legacy project name (e.g. a logical label like `trading-platform-sre`) but the cwd-resolver now returns the canonical git-remote ident (e.g. `github.com/nitecon/SRE.git`), search will treat them as cross-project and the `hint` field will undersell their relevance. Fix it by consolidating idents:
+
+```bash
+# 1. Inspect the distinct project idents in the database
+memory projects
+
+# 2. Preview the affected memories before writing
+memory move --from "trading-platform-sre" --to "github.com/nitecon/SRE.git" --dry-run
+
+# 3. Apply the rename
+memory move --from "trading-platform-sre" --to "github.com/nitecon/SRE.git"
+```
+
+Use `memory copy` instead of `memory move` when you want the memory available under *both* idents — for example, when a shared memory applies to two forks of the same codebase. Copies keep the original content, tags, and cached embedding; only the project ident, UUID, and timestamps differ.
 
 ## Output formats
 
@@ -227,6 +259,9 @@ You can also trigger an update manually at any time with `memory update`.
 | `memory_prune` | Decay stale/low-access memories |
 | `memory_context` | Return top-K relevant memories for a task description |
 | `memory_get` | Fetch full content for one or more memory IDs (pair with brief search) |
+| `memory_projects` | List distinct project idents with memory counts (spot alias mismatches) |
+| `memory_move` | Reassign the project ident on one memory (by id) or in bulk (by from/to) |
+| `memory_copy` | Duplicate memories under a new project ident; preserves content + embedding |
 
 ## Memory types
 

@@ -128,6 +128,33 @@ pub struct GetArgs {
     pub preview_chars: Option<usize>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MoveArgs {
+    /// Move a single memory by ID.
+    pub id: Option<String>,
+    /// Move all memories whose current project equals this value. Pass an
+    /// empty string ("") to target memories with no project.
+    pub from: Option<String>,
+    /// New project ident. Pass an empty string ("") to clear the project tag.
+    pub to: String,
+    /// If true, return the would-be-affected memories without writing.
+    pub dry_run: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CopyArgs {
+    /// Copy a single memory by ID.
+    pub id: Option<String>,
+    /// Copy all memories whose current project equals this value. Pass an
+    /// empty string ("") to target memories with no project.
+    pub from: Option<String>,
+    /// New project ident for the copies. Pass an empty string ("") to create
+    /// copies with no project tag.
+    pub to: String,
+    /// If true, return the would-be-affected memories without writing.
+    pub dry_run: Option<bool>,
+}
+
 #[derive(Copy, Clone)]
 enum OutputFormat {
     Brief,
@@ -404,6 +431,198 @@ impl MemoryServer {
         })
         .to_string()
     }
+
+    /// Reassign the project ident on one or more memories. Use this to migrate
+    /// memories that were tagged under a legacy project name (e.g.
+    /// "trading-platform-sre") to the canonical git-remote ident the cwd
+    /// resolver returns now (e.g. "github.com/nitecon/SRE.git"). Pass `id` for
+    /// a single memory or `from` to bulk-rename every memory currently tagged
+    /// with that project. Empty strings on `from`/`to` target or assign a NULL
+    /// project. Set `dry_run: true` to preview without writing.
+    #[tool(name = "memory_move")]
+    fn move_tool(&self, Parameters(args): Parameters<MoveArgs>) -> String {
+        let to = empty_to_none_owned(&args.to);
+        let dry_run = args.dry_run.unwrap_or(false);
+        let conn = self.conn.lock().unwrap();
+        match run_move(&conn, args.id.as_deref(), args.from.as_deref(), to.as_deref(), dry_run) {
+            Ok(v) => serde_json::to_string_pretty(&v)
+                .unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e)),
+            Err(e) => format!("{{\"error\": \"{}\"}}", Self::err_str(e)),
+        }
+    }
+
+    /// Duplicate one or more memories under a new project ident. Preserves
+    /// content, tags, agent, source_file, memory_type, and the cached
+    /// embedding; a new UUID is minted and timestamps reset. Pass `id` for a
+    /// single memory or `from` to bulk-copy every memory currently tagged with
+    /// that project. Empty strings on `from`/`to` target or assign a NULL
+    /// project. Set `dry_run: true` to preview without writing.
+    #[tool(name = "memory_copy")]
+    fn copy_tool(&self, Parameters(args): Parameters<CopyArgs>) -> String {
+        let to = empty_to_none_owned(&args.to);
+        let dry_run = args.dry_run.unwrap_or(false);
+        let conn = self.conn.lock().unwrap();
+        match run_copy(&conn, args.id.as_deref(), args.from.as_deref(), to.as_deref(), dry_run) {
+            Ok(v) => serde_json::to_string_pretty(&v)
+                .unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e)),
+            Err(e) => format!("{{\"error\": \"{}\"}}", Self::err_str(e)),
+        }
+    }
+
+    /// List distinct project idents with memory counts. Useful for spotting
+    /// alias mismatches (e.g. "trading-platform-sre" vs
+    /// "github.com/nitecon/SRE.git") before running memory_move. The current
+    /// cwd-derived project is marked with is_current_project: true.
+    #[tool(name = "memory_projects")]
+    fn projects(&self) -> String {
+        let cwd_project = project::project_ident_from_cwd().ok();
+        let conn = self.conn.lock().unwrap();
+        let rows = match queries::list_projects(&conn) {
+            Ok(r) => r,
+            Err(e) => return format!("{{\"error\": \"{}\"}}", Self::err_str(e)),
+        };
+        let items: Vec<Value> = rows
+            .iter()
+            .map(|(p, c)| {
+                let is_current = cwd_project
+                    .as_deref()
+                    .map(|cp| p.as_deref() == Some(cp))
+                    .unwrap_or(false);
+                json!({
+                    "project": p,
+                    "count": c,
+                    "is_current_project": is_current,
+                })
+            })
+            .collect();
+        let mut out = serde_json::Map::new();
+        out.insert("projects".into(), Value::Array(items));
+        if let Some(cp) = cwd_project.as_deref() {
+            out.insert("current_project".into(), Value::String(cp.to_string()));
+        }
+        serde_json::to_string_pretty(&Value::Object(out))
+            .unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e))
+    }
+}
+
+fn empty_to_none_owned(s: &str) -> Option<String> {
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+fn run_move(
+    conn: &Connection,
+    id: Option<&str>,
+    from: Option<&str>,
+    to: Option<&str>,
+    dry_run: bool,
+) -> Result<Value, MemoryError> {
+    match (id, from) {
+        (Some(id), _) => {
+            if dry_run {
+                let mem = queries::get_memory_by_id(conn, id)?;
+                Ok(json!({
+                    "status": "dry_run",
+                    "would_move": 1,
+                    "id": mem.id,
+                    "from_project": mem.project,
+                    "to_project": to,
+                }))
+            } else {
+                let changed = queries::move_memory_by_id(conn, id, to)?;
+                Ok(json!({
+                    "status": if changed { "moved" } else { "not_found" },
+                    "id": id,
+                    "to_project": to,
+                }))
+            }
+        }
+        (None, Some(from)) => {
+            let from_opt = if from.is_empty() { None } else { Some(from) };
+            if dry_run {
+                let mems = queries::list_memories_by_project(conn, from_opt)?;
+                Ok(json!({
+                    "status": "dry_run",
+                    "would_move": mems.len(),
+                    "from_project": from_opt,
+                    "to_project": to,
+                    "ids": mems.iter().map(|m| &m.id).collect::<Vec<_>>(),
+                }))
+            } else {
+                let count = queries::move_memories_by_project(conn, from_opt, to)?;
+                Ok(json!({
+                    "status": "moved",
+                    "count": count,
+                    "from_project": from_opt,
+                    "to_project": to,
+                }))
+            }
+        }
+        (None, None) => Ok(json!({
+            "status": "error",
+            "message": "Either 'id' or 'from' must be provided",
+        })),
+    }
+}
+
+fn run_copy(
+    conn: &Connection,
+    id: Option<&str>,
+    from: Option<&str>,
+    to: Option<&str>,
+    dry_run: bool,
+) -> Result<Value, MemoryError> {
+    match (id, from) {
+        (Some(id), _) => {
+            if dry_run {
+                let mem = queries::get_memory_by_id(conn, id)?;
+                Ok(json!({
+                    "status": "dry_run",
+                    "would_copy": 1,
+                    "source_id": mem.id,
+                    "from_project": mem.project,
+                    "to_project": to,
+                }))
+            } else {
+                let new_id = queries::copy_memory_by_id(conn, id, to)?;
+                Ok(json!({
+                    "status": "copied",
+                    "source_id": id,
+                    "new_id": new_id,
+                    "to_project": to,
+                }))
+            }
+        }
+        (None, Some(from)) => {
+            let from_opt = if from.is_empty() { None } else { Some(from) };
+            if dry_run {
+                let mems = queries::list_memories_by_project(conn, from_opt)?;
+                Ok(json!({
+                    "status": "dry_run",
+                    "would_copy": mems.len(),
+                    "from_project": from_opt,
+                    "to_project": to,
+                    "source_ids": mems.iter().map(|m| &m.id).collect::<Vec<_>>(),
+                }))
+            } else {
+                let new_ids = queries::copy_memories_by_project(conn, from_opt, to)?;
+                Ok(json!({
+                    "status": "copied",
+                    "count": new_ids.len(),
+                    "from_project": from_opt,
+                    "to_project": to,
+                    "new_ids": new_ids,
+                }))
+            }
+        }
+        (None, None) => Ok(json!({
+            "status": "error",
+            "message": "Either 'id' or 'from' must be provided",
+        })),
+    }
 }
 
 fn resolve_boost<'a>(
@@ -563,7 +782,10 @@ impl ServerHandler for MemoryServer {
                  memory_search and memory_context rank with a current-project boost and \
                  return brief previews by default; fetch full content via memory_get. \
                  memory_recall filters by project/agent/tags/type, \
-                 memory_forget deletes by id or query, memory_prune cleans stale memories.",
+                 memory_forget deletes by id or query, memory_prune cleans stale memories. \
+                 memory_projects lists distinct project idents (spot aliases), \
+                 memory_move reassigns the project ident on memories (single id or bulk --from/--to), \
+                 memory_copy duplicates memories under a new project ident.",
             )
     }
 }

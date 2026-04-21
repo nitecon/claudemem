@@ -181,6 +181,64 @@ pub enum Cli {
         #[arg(long, default_value_t = DEFAULT_PREVIEW_CHARS)]
         preview_chars: usize,
     },
+    /// Reassign the `project` ident on one or more memories.
+    ///
+    /// Common use: migrate memories that were tagged under a legacy project
+    /// name (e.g. `trading-platform-sre`) to the canonical git-remote ident
+    /// (e.g. `github.com/nitecon/SRE.git`) the cwd-resolver returns now.
+    ///
+    /// Selectors:
+    ///   --id <ID>        move a single memory
+    ///   --from <PROJ>    move every memory currently tagged with <PROJ>
+    ///                    (pass `--from ""` to target memories with no project)
+    ///
+    /// Target:
+    ///   --to <PROJ>      new project ident (pass `--to ""` to clear)
+    Move {
+        /// Move a single memory by ID.
+        #[arg(long, conflicts_with = "from")]
+        id: Option<String>,
+        /// Move all memories whose current project equals this value.
+        /// Use an empty string ("") to target memories with no project.
+        #[arg(long)]
+        from: Option<String>,
+        /// New project ident. Use an empty string ("") to clear the project tag.
+        #[arg(long)]
+        to: String,
+        /// Show the memories that would be moved without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Duplicate one or more memories under a new project ident.
+    ///
+    /// Content, tags, agent, source_file, memory_type, and the cached
+    /// embedding are all preserved on the copy. A new UUID is minted and
+    /// timestamps reset; the source row is left untouched.
+    ///
+    /// Selectors mirror `memory move`:
+    ///   --id <ID>        copy a single memory
+    ///   --from <PROJ>    copy every memory currently tagged with <PROJ>
+    Copy {
+        /// Copy a single memory by ID.
+        #[arg(long, conflicts_with = "from")]
+        id: Option<String>,
+        /// Copy all memories whose current project equals this value.
+        /// Use an empty string ("") to target memories with no project.
+        #[arg(long)]
+        from: Option<String>,
+        /// New project ident for the copies. Use an empty string ("") to
+        /// create copies with no project tag.
+        #[arg(long)]
+        to: String,
+        /// Show the memories that would be copied without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// List distinct project idents with memory counts.
+    ///
+    /// Useful for spotting alias mismatches (e.g. `trading-platform-sre` vs
+    /// `github.com/nitecon/SRE.git`) before running `memory move --from … --to …`.
+    Projects,
     /// Start MCP stdio server.
     Serve,
     /// Check for updates and install the latest version.
@@ -390,6 +448,49 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
             let output = render_memory_list(&memories, cwd_project.as_deref(), format, preview_chars);
             println!("{}", serde_json::to_string_pretty(&output)?);
         }
+        Cli::Move {
+            id,
+            from,
+            to,
+            dry_run,
+        } => {
+            let new_project = empty_to_none(&to);
+            let output = run_move(conn, id.as_deref(), from.as_deref(), new_project, dry_run)?;
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
+        Cli::Copy {
+            id,
+            from,
+            to,
+            dry_run,
+        } => {
+            let new_project = empty_to_none(&to);
+            let output = run_copy(conn, id.as_deref(), from.as_deref(), new_project, dry_run)?;
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
+        Cli::Projects => {
+            let rows = queries::list_projects(conn)?;
+            let items: Vec<Value> = rows
+                .iter()
+                .map(|(p, c)| {
+                    let is_current = cwd_project
+                        .as_deref()
+                        .map(|cp| p.as_deref() == Some(cp))
+                        .unwrap_or(false);
+                    json!({
+                        "project": p,
+                        "count": c,
+                        "is_current_project": is_current,
+                    })
+                })
+                .collect();
+            let mut out = serde_json::Map::new();
+            out.insert("projects".into(), Value::Array(items));
+            if let Some(cp) = cwd_project.as_deref() {
+                out.insert("current_project".into(), Value::String(cp.to_string()));
+            }
+            println!("{}", serde_json::to_string_pretty(&Value::Object(out))?);
+        }
         Cli::Serve => {
             unreachable!("Serve is handled in main.rs");
         }
@@ -545,4 +646,126 @@ fn preview(content: &str, n: usize) -> String {
         out.push('…');
     }
     out
+}
+
+/// Treat empty strings as "no project" for the move/copy `--from`/`--to` flags.
+/// Lets users explicitly target or assign a NULL project without a second flag.
+fn empty_to_none(s: &str) -> Option<&str> {
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+fn run_move(
+    conn: &Connection,
+    id: Option<&str>,
+    from: Option<&str>,
+    to: Option<&str>,
+    dry_run: bool,
+) -> Result<Value, MemoryError> {
+    match (id, from) {
+        (Some(id), _) => {
+            if dry_run {
+                let mem = queries::get_memory_by_id(conn, id)?;
+                Ok(json!({
+                    "status": "dry_run",
+                    "would_move": 1,
+                    "id": mem.id,
+                    "from_project": mem.project,
+                    "to_project": to,
+                }))
+            } else {
+                let changed = queries::move_memory_by_id(conn, id, to)?;
+                Ok(json!({
+                    "status": if changed { "moved" } else { "not_found" },
+                    "id": id,
+                    "to_project": to,
+                }))
+            }
+        }
+        (None, Some(from)) => {
+            let from_opt = empty_to_none(from);
+            if dry_run {
+                let mems = queries::list_memories_by_project(conn, from_opt)?;
+                Ok(json!({
+                    "status": "dry_run",
+                    "would_move": mems.len(),
+                    "from_project": from_opt,
+                    "to_project": to,
+                    "ids": mems.iter().map(|m| &m.id).collect::<Vec<_>>(),
+                }))
+            } else {
+                let count = queries::move_memories_by_project(conn, from_opt, to)?;
+                Ok(json!({
+                    "status": "moved",
+                    "count": count,
+                    "from_project": from_opt,
+                    "to_project": to,
+                }))
+            }
+        }
+        (None, None) => Ok(json!({
+            "status": "error",
+            "message": "Either --id or --from must be provided",
+        })),
+    }
+}
+
+fn run_copy(
+    conn: &Connection,
+    id: Option<&str>,
+    from: Option<&str>,
+    to: Option<&str>,
+    dry_run: bool,
+) -> Result<Value, MemoryError> {
+    match (id, from) {
+        (Some(id), _) => {
+            if dry_run {
+                let mem = queries::get_memory_by_id(conn, id)?;
+                Ok(json!({
+                    "status": "dry_run",
+                    "would_copy": 1,
+                    "source_id": mem.id,
+                    "from_project": mem.project,
+                    "to_project": to,
+                }))
+            } else {
+                let new_id = queries::copy_memory_by_id(conn, id, to)?;
+                Ok(json!({
+                    "status": "copied",
+                    "source_id": id,
+                    "new_id": new_id,
+                    "to_project": to,
+                }))
+            }
+        }
+        (None, Some(from)) => {
+            let from_opt = empty_to_none(from);
+            if dry_run {
+                let mems = queries::list_memories_by_project(conn, from_opt)?;
+                Ok(json!({
+                    "status": "dry_run",
+                    "would_copy": mems.len(),
+                    "from_project": from_opt,
+                    "to_project": to,
+                    "source_ids": mems.iter().map(|m| &m.id).collect::<Vec<_>>(),
+                }))
+            } else {
+                let new_ids = queries::copy_memories_by_project(conn, from_opt, to)?;
+                Ok(json!({
+                    "status": "copied",
+                    "count": new_ids.len(),
+                    "from_project": from_opt,
+                    "to_project": to,
+                    "new_ids": new_ids,
+                }))
+            }
+        }
+        (None, None) => Ok(json!({
+            "status": "error",
+            "message": "Either --id or --from must be provided",
+        })),
+    }
 }
