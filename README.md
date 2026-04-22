@@ -55,29 +55,43 @@ This means on a shared Linux/macOS machine, all agents share `/opt/agentic/memor
 
 ## Recommended usage: CLI-first
 
-Calling the `memory` binary directly is the recommended approach. It is just as fast as MCP mode and avoids the overhead of running a persistent server process. The fastest way to teach your agent to use it is the `memory setup` command — it detects your global agent rule files and injects an idempotent protocol block for you.
+Calling the `memory` binary directly is the recommended approach. It is just as fast as MCP mode and avoids the overhead of running a persistent server process. The fastest way to teach your agent to use it is the `memory setup` command — it bundles an interactive checklist that injects the rules block into your agent rule files and installs a Claude Code skill that auto-advertises the CLI to every session.
 
 ### Auto-install the agent protocol
 
+`memory setup` is now a small subcommand family:
+
+| Command | Behavior |
+|---------|----------|
+| `memory setup` | Interactive checklist: shows the install state of each component (rules, skill) and lets you pick which to (re)install |
+| `memory setup rules [flags]` | Inject the `<memory-rules>` block into known agent rule files (CLAUDE.md, GEMINI.md, AGENTS.md) |
+| `memory setup skill [flags]` | Install `~/.claude/skills/agent-memory/SKILL.md` so Claude Code auto-loads a ~100-token description that nudges the model toward the CLI |
+| `memory setup all [-y]` | Run rules → skill non-interactively (use `-y` / `--yes` to skip confirmation) |
+
 ```bash
-# Detect ~/.claude/CLAUDE.md, ~/.gemini/GEMINI.md, ~/.codex/AGENTS.md,
-# ~/.config/codex/AGENTS.md and prompt you to pick which to update.
+# Bare invocation: 2-item interactive checklist (rules + skill).
 memory setup
 
-# Update every detected file without prompting.
-memory setup --all
+# Rules only — detects ~/.claude/CLAUDE.md, ~/.gemini/GEMINI.md,
+# ~/.codex/AGENTS.md, ~/.config/codex/AGENTS.md.
+memory setup rules               # detect + prompt
+memory setup rules --all         # update every detected file
+memory setup rules --target ~/.claude/CLAUDE.md
+memory setup rules --dry-run     # preview, don't write
+memory setup rules --print       # emit just the <memory-rules> block
 
-# Target a specific file.
-memory setup --target ~/.claude/CLAUDE.md
+# Skill only — installs to ~/.claude/skills/agent-memory/SKILL.md.
+memory setup skill
+memory setup skill --dry-run
+memory setup skill --print
 
-# Preview the result without writing.
-memory setup --dry-run
-
-# Print just the protocol block (pipe into your own file).
-memory setup --print
+# Everything, scripted.
+memory setup all --yes
 ```
 
-The command writes a `<memory-rules>…</memory-rules>` block (loose-XML markers so it is easy to locate and update) and saves a `.bak` sibling before each modification. Re-running replaces the block in place — your agent rule files never accumulate duplicates. If the companion [`agent-tools setup rules`](https://github.com/nitecon/agent-tools) block (`<agent-tools-rules>…</agent-tools-rules>`) is already present in the file, the memory block is inserted directly after it so the two protocols stay grouped at the top; otherwise it is prepended.
+`memory setup rules` writes a `<memory-rules>…</memory-rules>` block (loose-XML markers so it is easy to locate and update) and saves a `.bak` sibling before each modification. Re-running replaces the block in place — your agent rule files never accumulate duplicates. If the companion [`agent-tools setup rules`](https://github.com/nitecon/agent-tools) block (`<agent-tools-rules>…</agent-tools-rules>`) is already present in the file, the memory block is inserted directly after it so the two protocols stay grouped at the top; otherwise it is prepended.
+
+`memory setup skill` writes a single SKILL.md whose frontmatter `description` is always loaded into Claude Code sessions (~100 tokens), pulling the model toward `memory context` at task start and `memory store` at task end. The full body only loads on demand when the skill is picked.
 
 ### Manual install (equivalent content)
 
@@ -220,12 +234,17 @@ memory copy --id <uuid> --to "github.com/acme/mirror.git"
 # Check for updates and install the latest version
 memory update
 
-# Inject the memory protocol into known agent rule files (idempotent)
-memory setup               # detect + prompt
-memory setup --all         # update every detected file without prompting
-memory setup --target ~/.claude/CLAUDE.md
-memory setup --dry-run     # preview, don't write
-memory setup --print       # print block only, no file IO
+# Setup family — interactive checklist + per-component subcommands
+memory setup                              # interactive: pick rules and/or skill
+memory setup rules                        # rules only: detect + prompt
+memory setup rules --all                  # rules: update every detected file
+memory setup rules --target ~/.claude/CLAUDE.md
+memory setup rules --dry-run              # rules: preview, don't write
+memory setup rules --print                # rules: print <memory-rules> block
+memory setup skill                        # install ~/.claude/skills/agent-memory/SKILL.md
+memory setup skill --dry-run              # skill: preview SKILL.md
+memory setup skill --print                # skill: print SKILL.md to stdout
+memory setup all --yes                    # rules → skill, non-interactive
 ```
 
 ## Project auto-detection and cross-project boost

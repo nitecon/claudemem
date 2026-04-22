@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 
@@ -11,7 +11,7 @@ use crate::embedding;
 use crate::error::MemoryError;
 use crate::project;
 use crate::search::{self, SearchOptions, SearchResult};
-use crate::setup;
+use crate::setup::{menu, rules, skill};
 
 /// Score multiplier applied to memories tagged with the current project.
 /// Strong cross-project matches can still out-rank weak current-project hits;
@@ -246,6 +246,16 @@ pub enum Cli {
     Serve,
     /// Check for updates and install the latest version.
     Update,
+    /// Setup and configuration commands (run with no subcommand for an
+    /// interactive checklist of available components).
+    Setup {
+        #[command(subcommand)]
+        command: Option<SetupCommands>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SetupCommands {
     /// Inject the memory usage protocols into known agent rule files.
     ///
     /// Detects `~/.claude/CLAUDE.md`, `~/.gemini/GEMINI.md`,
@@ -257,7 +267,7 @@ pub enum Cli {
     /// If an `<agent-tools-rules>` block is already present (written by the
     /// sibling `agent-tools setup rules` command), the memory block is
     /// inserted directly after it; otherwise it is prepended.
-    Setup {
+    Rules {
         /// Update a specific file instead of running detection.
         #[arg(long)]
         target: Option<PathBuf>,
@@ -270,6 +280,25 @@ pub enum Cli {
         /// Print the rules block to stdout and exit (no file IO).
         #[arg(long)]
         print: bool,
+    },
+
+    /// Install a Claude Code skill at `~/.claude/skills/agent-memory/SKILL.md`
+    /// so the `memory` CLI is auto-advertised to sessions via the always-loaded
+    /// skill description (~100 tokens). The full body only loads on demand.
+    Skill {
+        /// Show the resulting file content without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Print the SKILL.md to stdout and exit (no file IO).
+        #[arg(long)]
+        print: bool,
+    },
+
+    /// Run rules → skill non-interactively.
+    All {
+        /// Skip the confirmation prompt.
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 }
 
@@ -526,17 +555,28 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
         Cli::Update => {
             crate::updater::manual_update()?;
         }
-        Cli::Setup {
+        Cli::Setup { command } => {
+            execute_setup(command).map_err(|e| MemoryError::Config(format!("{e:#}")))?;
+        }
+    }
+    Ok(())
+}
+
+/// Dispatch the `memory setup` family. Returns `anyhow::Result` so the
+/// installer subcommands can use `anyhow::Context` freely; the caller wraps
+/// the error into `MemoryError::Config` for the unified CLI exit path.
+fn execute_setup(command: Option<SetupCommands>) -> anyhow::Result<()> {
+    match command {
+        None => menu::run_interactive(),
+        Some(SetupCommands::Rules {
             target,
             all,
             dry_run,
             print,
-        } => {
-            setup::run(target, all, dry_run, print)
-                .map_err(|e| MemoryError::Config(format!("{e:#}")))?;
-        }
+        }) => rules::run(target, all, dry_run, print),
+        Some(SetupCommands::Skill { dry_run, print }) => skill::run(dry_run, print),
+        Some(SetupCommands::All { yes }) => menu::run_all(yes),
     }
-    Ok(())
 }
 
 fn resolve_boost<'a>(

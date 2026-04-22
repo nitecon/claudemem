@@ -1,5 +1,5 @@
-//! `memory setup` — inject the agent-memory usage protocols into known agent
-//! rule files (e.g. `~/.claude/CLAUDE.md`, `~/.gemini/GEMINI.md`).
+//! `memory setup rules` — inject the agent-memory usage protocols into known
+//! agent rule files (e.g. `~/.claude/CLAUDE.md`, `~/.gemini/GEMINI.md`).
 //!
 //! Idempotent: uses `<memory-rules>...</memory-rules>` markers so re-runs
 //! replace the block in place rather than duplicating it. A `.bak` sibling is
@@ -97,7 +97,7 @@ memory update
    "why," not just the "what."
 "#;
 
-/// Entry point invoked from `cli.rs` for `memory setup`.
+/// Entry point invoked from `cli.rs` for `memory setup rules`.
 pub fn run(target: Option<PathBuf>, all: bool, dry_run: bool, print: bool) -> Result<()> {
     if print {
         print!("{}", build_block());
@@ -172,7 +172,7 @@ pub fn run(target: Option<PathBuf>, all: bool, dry_run: bool, print: bool) -> Re
 /// Built-in detection list. Only home-dir global rule files; project-local
 /// instruction files (e.g. `./CLAUDE.md`) are intentionally left alone since
 /// they're per-repo content the user should edit directly.
-fn detect_agent_files() -> Vec<PathBuf> {
+pub(crate) fn detect_agent_files() -> Vec<PathBuf> {
     let home = match dirs::home_dir() {
         Some(h) => h,
         None => return vec![],
@@ -184,6 +184,14 @@ fn detect_agent_files() -> Vec<PathBuf> {
         home.join(".config").join("codex").join("AGENTS.md"),
     ];
     candidates.into_iter().filter(|p| p.exists()).collect()
+}
+
+/// Probe helper exposed to the interactive menu: does the given file already
+/// contain the `<memory-rules>` block?
+pub(crate) fn file_has_rules_block(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .map(|s| s.contains(OPEN_MARKER) && s.contains(CLOSE_MARKER))
+        .unwrap_or(false)
 }
 
 fn build_block() -> String {
