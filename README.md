@@ -55,50 +55,80 @@ This means on a shared Linux/macOS machine, all agents share `/opt/agentic/memor
 
 ## Recommended usage: CLI-first
 
-Calling the `memory` binary directly is the recommended approach. It is just as fast as MCP mode and avoids the overhead of running a persistent server process. Add the following to your global `CLAUDE.md`, `GEMINI.md`, or equivalent agent instructions:
+Calling the `memory` binary directly is the recommended approach. It is just as fast as MCP mode and avoids the overhead of running a persistent server process. The fastest way to teach your agent to use it is the `memory setup` command — it detects your global agent rule files and injects an idempotent protocol block for you.
+
+### Auto-install the agent protocol
+
+```bash
+# Detect ~/.claude/CLAUDE.md, ~/.gemini/GEMINI.md, ~/.codex/AGENTS.md,
+# ~/.config/codex/AGENTS.md and prompt you to pick which to update.
+memory setup
+
+# Update every detected file without prompting.
+memory setup --all
+
+# Target a specific file.
+memory setup --target ~/.claude/CLAUDE.md
+
+# Preview the result without writing.
+memory setup --dry-run
+
+# Print just the protocol block (pipe into your own file).
+memory setup --print
+```
+
+The command writes a `<memory-rules>…</memory-rules>` block (loose-XML markers so it is easy to locate and update) and saves a `.bak` sibling before each modification. Re-running replaces the block in place — your agent rule files never accumulate duplicates. If the companion [`agent-tools setup rules`](https://github.com/nitecon/agent-tools) block (`<agent-tools-rules>…</agent-tools-rules>`) is already present in the file, the memory block is inserted directly after it so the two protocols stay grouped at the top; otherwise it is prepended.
+
+### Manual install (equivalent content)
+
+If you'd rather paste the block yourself, add the following to your global `CLAUDE.md`, `GEMINI.md`, or equivalent agent instructions:
 
 ````markdown
-<memory_protocol>
-## Memory Operations (MANDATORY)
+<memory-rules>
+## Agent Memory -- Mandatory Protocols
 
-**Binary:** `/opt/agentic/bin/memory` -- call directly via Bash (do NOT use MCP or skills for memory during normal workflow).
+### Memory Operations (MANDATORY)
+
+**Binary:** `memory` (installed at `/opt/agentic/bin/memory` on Linux/macOS, `%USERPROFILE%\.agentic\bin\memory.exe` on Windows) -- call directly via Bash. Do NOT use MCP or skills for memory during normal workflow.
 
 **The "Memory First/Last" Rule:** Every task must begin with a `context` or `search` call and end with a `store` call if functionality changed.
 
-### 1. Pre-Task: Context Retrieval
-Before writing a single line of code, run context or search.
-- **Goal**: Identify if a similar utility, pattern, or logic exists.
-- **Action**: Do not "re-invent." If a similar pattern exists, refactor or extend it.
-
-### 2. Post-Task: Knowledge Persistence
-Upon successful completion or refactor, run store.
-- **Content**: A concise summary of the functionality, the specific symbols (functions/classes) created, and the "why" behind architectural decisions.
-- **Audit-Ready**: Write descriptions that are clear for a future code audit.
-
-### CLI Commands (run via Bash):
-
 ```bash
-# Search -- semantic/hybrid search
-/opt/agentic/bin/memory search "<query>" -k <limit>
+# Context -- top-K relevant memories for a task (boost cwd project)
+memory context "<task description>" -k <limit>
 
-# Context -- top-K relevant memories for a task
-/opt/agentic/bin/memory context "<task description>" -k <limit> -p "<project>"
+# Search -- hybrid BM25 + vector search (boost cwd project)
+memory search "<query>" -k <limit>
 
-# Store -- save a new memory
-/opt/agentic/bin/memory store "<content>" -m <type> -t "<tags>" -p "<project>"
+# Store -- save a new memory (project auto-detected)
+memory store "<content>" -m <type> -t "<tags>"
 # types: user, feedback, project, reference
 
+# Get -- fetch full content for specific IDs (pair with brief search)
+memory get <uuid> [<uuid>...]
+
 # Recall -- filter by project/agent/tags/type
-/opt/agentic/bin/memory recall -m <type> -t "<tags>" -p "<project>" -k <limit>
+memory recall -m <type> -t "<tags>" -p "<project>" -k <limit>
+
+# Projects -- list distinct project idents (spot alias mismatches)
+memory projects
+
+# Move -- reassign the project ident on one or many memories
+memory move --from "<old>" --to "<new>" [--dry-run]
+
+# Copy -- duplicate memories under a new project ident
+memory copy --from "<old>" --to "<new>" [--dry-run]
+
+# Forget -- remove a memory by ID (or by search query)
+memory forget --id <uuid>
 
 # Prune -- decay stale/low-access memories
-/opt/agentic/bin/memory prune
-
-# Forget -- remove by ID
-/opt/agentic/bin/memory forget <id>
+memory prune --max-age-days 90 [--dry-run]
 ```
-</memory_protocol>
+</memory-rules>
 ````
+
+Prefer `memory setup` over hand-pasting — it keeps the block up-to-date with the latest CLI surface and guarantees the markers match what future re-runs look for.
 
 ## MCP server (optional)
 
@@ -189,6 +219,13 @@ memory copy --id <uuid> --to "github.com/acme/mirror.git"
 
 # Check for updates and install the latest version
 memory update
+
+# Inject the memory protocol into known agent rule files (idempotent)
+memory setup               # detect + prompt
+memory setup --all         # update every detected file without prompting
+memory setup --target ~/.claude/CLAUDE.md
+memory setup --dry-run     # preview, don't write
+memory setup --print       # print block only, no file IO
 ```
 
 ## Project auto-detection and cross-project boost

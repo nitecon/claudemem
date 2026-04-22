@@ -6,6 +6,7 @@ mod error;
 mod mcp;
 mod project;
 mod search;
+mod setup;
 mod updater;
 
 use clap::Parser;

@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{Parser, ValueEnum};
 use rusqlite::Connection;
 use serde_json::{json, Value};
@@ -9,6 +11,7 @@ use crate::embedding;
 use crate::error::MemoryError;
 use crate::project;
 use crate::search::{self, SearchOptions, SearchResult};
+use crate::setup;
 
 /// Score multiplier applied to memories tagged with the current project.
 /// Strong cross-project matches can still out-rank weak current-project hits;
@@ -243,6 +246,31 @@ pub enum Cli {
     Serve,
     /// Check for updates and install the latest version.
     Update,
+    /// Inject the memory usage protocols into known agent rule files.
+    ///
+    /// Detects `~/.claude/CLAUDE.md`, `~/.gemini/GEMINI.md`,
+    /// `~/.codex/AGENTS.md`, and `~/.config/codex/AGENTS.md`, then writes a
+    /// `<memory-rules>…</memory-rules>` block so the agent knows how to call
+    /// the `memory` CLI. Idempotent — re-runs replace the existing block in
+    /// place. A `.bak` sibling is written before each modification.
+    ///
+    /// If an `<agent-tools-rules>` block is already present (written by the
+    /// sibling `agent-tools setup rules` command), the memory block is
+    /// inserted directly after it; otherwise it is prepended.
+    Setup {
+        /// Update a specific file instead of running detection.
+        #[arg(long)]
+        target: Option<PathBuf>,
+        /// Update every detected file without prompting.
+        #[arg(long)]
+        all: bool,
+        /// Show the resulting file content without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Print the rules block to stdout and exit (no file IO).
+        #[arg(long)]
+        print: bool,
+    },
 }
 
 pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), MemoryError> {
@@ -497,6 +525,15 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
         }
         Cli::Update => {
             crate::updater::manual_update()?;
+        }
+        Cli::Setup {
+            target,
+            all,
+            dry_run,
+            print,
+        } => {
+            setup::run(target, all, dry_run, print)
+                .map_err(|e| MemoryError::Config(format!("{e:#}")))?;
         }
     }
     Ok(())
