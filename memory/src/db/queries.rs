@@ -462,10 +462,11 @@ pub fn prune_memories(
 // dream walks the entire table including already-processed rows. Regular CLI
 // paths should continue to use the filtered helpers above.
 //
-// `#[allow(dead_code)]` on each — the `memory` binary never calls these
-// itself (they're a library surface for `memory-dream`), but they live in
-// this crate so dream's cross-crate import doesn't need to reimplement the
-// row mapping and column list.
+// `#[allow(dead_code)]` lives on each — the `memory` binary target never
+// calls these directly (they're a library surface for `memory-dream`). The
+// lib crate exposes them; the bin's dead-code scan flags them when built
+// as a binary, so the annotation silences the bin's false-positive warning
+// without hiding any real dead code.
 
 /// Iterate every memory by `updated_at ASC` (oldest first). Used by the dream
 /// orchestrator so early memories are condensed / deduped before younger ones
