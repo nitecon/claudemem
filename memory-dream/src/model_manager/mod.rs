@@ -14,17 +14,22 @@
 //! * [`pull_model`] handles progress reporting, resume, retry, and
 //!   materializes the final layout under `<cache_root>/<short_name>/`.
 //! * Errors are shaped so the CLI can emit distinct light-XML status
-//!   attributes (`auth_required`, `not_found`, `network`, `disk_full`, …).
+//!   attributes (`auth_required`, `not_found`, `network`, `disk_full`,
+//!   `checksum_failed`, …).
 //!
-//! Checksum verification is an explicitly separate follow-up — this module
-//! emits a structured `Checksum` error variant but does not compute hashes
-//! itself yet.
+//! Each downloaded file is SHA-256-verified against the LFS-pointer hash
+//! advertised in the HF `x-linked-etag` header. Files without an
+//! advertised SHA (small text assets that only carry a git-blob etag)
+//! emit a `<result status="checksum_skipped"/>` event and the pull
+//! continues — there's nothing sensible to verify against.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 #[cfg(test)]
@@ -127,8 +132,10 @@ pub enum ModelManagerError {
     #[error("disk full while writing to {path}")]
     DiskFull { path: PathBuf },
 
-    /// Integrity check failure. Reserved for the follow-up that wires
-    /// SHA-256 verification against the hash advertised by the HF API.
+    /// SHA-256 of the downloaded file didn't match the hash advertised
+    /// by HuggingFace's LFS pointer. `pull_model` deletes the corrupt
+    /// file before surfacing this so the next `--pull` re-downloads
+    /// cleanly.
     #[error("checksum verification failed for {file}: expected {expected}, got {actual}")]
     Checksum {
         file: String,
@@ -158,10 +165,21 @@ impl ModelManagerError {
 }
 
 /// Metadata for a single remote file. Populated from HF's HEAD response
-/// so the pull flow knows the total byte count before streaming.
+/// so the pull flow knows the total byte count and, when available, the
+/// SHA-256 hash (for LFS-tracked files).
 #[derive(Debug, Clone)]
 pub struct FileMetadata {
     pub size: u64,
+    /// SHA-256 hash of the file content when HuggingFace advertised one,
+    /// otherwise `None`. LFS pointers always carry a SHA-256 — the hub
+    /// surfaces it via `x-linked-etag`. Plain text files (config.json,
+    /// tokenizer.json on some repos) often have only a weak git-blob
+    /// etag, which isn't a useful integrity check, so we ignore those.
+    ///
+    /// Callers use [`extract_expected_sha256`] to validate whatever the
+    /// hub returned actually looks like a SHA-256 hex digest before
+    /// running the comparison.
+    pub expected_sha256: Option<String>,
 }
 
 /// Progress callback hook. The pull loop invokes it once at the start
@@ -185,6 +203,20 @@ pub enum ProgressEvent {
     Done {
         file: String,
         bytes_total: u64,
+    },
+    /// Emitted once per file after the SHA-256 comparison succeeds.
+    /// Carries the hash so the operator can audit it against the HF repo
+    /// page if ever suspicious.
+    ChecksumOk {
+        file: String,
+        sha256: String,
+    },
+    /// Emitted when HF didn't advertise a SHA-256 etag for this file
+    /// (usually small JSON/text assets that only have a weak git etag).
+    /// The pull continues — there's nothing sensible to verify against.
+    ChecksumSkipped {
+        file: String,
+        reason: String,
     },
 }
 
@@ -265,6 +297,88 @@ pub fn hf_token_from_env() -> Option<String> {
 pub const MAX_ATTEMPTS: u32 = 3;
 pub const BACKOFF_BASE_MS: u64 = 1_000;
 
+/// Validate that `s` looks like a SHA-256 hex digest (exactly 64 lowercase
+/// hex chars). Returns the lowercased string when valid, `None` otherwise.
+///
+/// Used by both the HF header parser (where an etag might legitimately be a
+/// git-blob hash or a weak ETag) and the fake-client test harness. Keeping
+/// the check central means one place decides "is this a usable checksum",
+/// instead of scattering the 64-char/hex invariant across modules.
+pub fn extract_expected_sha256(s: &str) -> Option<String> {
+    let lower = s.trim().to_lowercase();
+    if lower.len() == 64 && lower.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(lower)
+    } else {
+        None
+    }
+}
+
+/// Compute the SHA-256 of the file at `path` and return it as a lowercase
+/// hex string. Reads in 64 KiB chunks so multi-GB safetensors files don't
+/// blow up memory usage.
+pub fn sha256_of_file(path: &Path) -> std::io::Result<String> {
+    let mut f = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Run the SHA-256 check against `file_path` using the expected hash
+/// advertised in `metadata`. Emits one checksum event via `progress` and
+/// returns Ok on both `verified` and `skipped` outcomes — the dream flow
+/// only halts when the hashes disagree. On mismatch the corrupt file is
+/// deleted (best-effort) so the next pull can re-fetch cleanly.
+fn verify_file_checksum(
+    file_path: &Path,
+    file_name: &str,
+    metadata: &FileMetadata,
+    progress: &ProgressFn,
+) -> Result<(), ModelManagerError> {
+    let Some(expected) = metadata
+        .expected_sha256
+        .as_deref()
+        .and_then(extract_expected_sha256)
+    else {
+        (progress)(ProgressEvent::ChecksumSkipped {
+            file: file_name.to_string(),
+            reason: "no SHA-256 etag advertised by HuggingFace".to_string(),
+        });
+        return Ok(());
+    };
+
+    let actual = sha256_of_file(file_path).map_err(ModelManagerError::Io)?;
+    if actual == expected {
+        (progress)(ProgressEvent::ChecksumOk {
+            file: file_name.to_string(),
+            sha256: actual,
+        });
+        Ok(())
+    } else {
+        // Delete the corrupt file so the next --pull re-downloads cleanly.
+        // Best-effort — if removal fails we still surface the checksum
+        // error to the caller, who owns the retry decision.
+        if let Err(e) = std::fs::remove_file(file_path) {
+            tracing::warn!(
+                file = file_name,
+                error = %e,
+                "failed to delete corrupt file after checksum mismatch"
+            );
+        }
+        Err(ModelManagerError::Checksum {
+            file: file_name.to_string(),
+            expected,
+            actual,
+        })
+    }
+}
+
 /// Download the configured model into `<cache_root>/<model_name>/`.
 ///
 /// Responsibilities:
@@ -324,6 +438,23 @@ pub async fn pull_model(
             continue;
         }
 
+        // Fetch metadata BEFORE the download so we have the advertised
+        // SHA-256 (when HF provides one) to verify against after the
+        // bytes land. Errors here are non-terminal for the pull itself
+        // — we treat "no metadata" as "no checksum" and continue without
+        // verification rather than halting on transient HEAD failures.
+        let metadata = match client.metadata(&repo_id, file).await {
+            Ok(md) => md,
+            Err(e) => {
+                tracing::warn!(file, error = %e, "metadata probe failed; \
+                    continuing without checksum verification");
+                FileMetadata {
+                    size: 0,
+                    expected_sha256: None,
+                }
+            }
+        };
+
         let resolved =
             download_with_retry(client, &repo_id, file, model_name, progress.clone()).await?;
 
@@ -338,6 +469,11 @@ pub async fn pull_model(
         if let Ok(md) = std::fs::metadata(&dest) {
             total_bytes = total_bytes.saturating_add(md.len());
         }
+
+        // Checksum verification. On mismatch the file at `dest` is deleted
+        // and the error propagates up — caller sees `status=checksum_failed`.
+        // Skipped (no etag) is a progress event, not an error.
+        verify_file_checksum(&dest, file, &metadata, &progress)?;
     }
 
     Ok(PullReport {
@@ -696,6 +832,194 @@ mod tests {
         // Pre-seeded content untouched.
         let body = std::fs::read(model_dir.join("config.json")).unwrap();
         assert_eq!(body, b"already-here");
+    }
+
+    // -----------------------------------------------------------------
+    // Checksum verification
+    // -----------------------------------------------------------------
+
+    /// Helper: compute the expected SHA-256 of a byte buffer so tests can
+    /// wire the fake client with the "correct" hash.
+    fn hash_bytes(bytes: &[u8]) -> String {
+        let mut h = Sha256::new();
+        h.update(bytes);
+        hex::encode(h.finalize())
+    }
+
+    #[test]
+    fn extract_expected_sha256_accepts_canonical_hex_digest() {
+        let good = "a".repeat(64);
+        assert_eq!(extract_expected_sha256(&good), Some(good.clone()));
+    }
+
+    #[test]
+    fn extract_expected_sha256_rejects_wrong_length() {
+        // Too short.
+        assert_eq!(extract_expected_sha256(&"a".repeat(63)), None);
+        // Too long.
+        assert_eq!(extract_expected_sha256(&"a".repeat(65)), None);
+    }
+
+    #[test]
+    fn extract_expected_sha256_rejects_non_hex() {
+        // 64 chars but contains a non-hex character.
+        let bad = format!("{}{}", "a".repeat(63), "Z");
+        assert_eq!(extract_expected_sha256(&bad), None);
+    }
+
+    #[test]
+    fn extract_expected_sha256_lowercases_uppercase_input() {
+        let upper = "A".repeat(64);
+        assert_eq!(extract_expected_sha256(&upper), Some("a".repeat(64)));
+    }
+
+    #[test]
+    fn sha256_of_file_hashes_content_deterministically() {
+        let dir = tmp_cache();
+        let path = dir.path().join("f.bin");
+        std::fs::write(&path, b"hello world").unwrap();
+        let actual = sha256_of_file(&path).unwrap();
+        // Pinned reference from `printf "hello world" | sha256sum`.
+        assert_eq!(
+            actual,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_model_checksum_happy_path_matches_and_emits_ok() {
+        let cache = tmp_cache();
+        let mut files = HashMap::new();
+        let mut client = FakeHubClient::new({
+            let mut m = HashMap::new();
+            for name in REQUIRED_FILES {
+                let body = vec![42u8; 16];
+                m.insert(name.to_string(), body.clone());
+                files.insert(name.to_string(), body);
+            }
+            m
+        });
+        // Attach the correct etag for every file so verification succeeds.
+        for (name, body) in &files {
+            client = client.with_etag(name, Some(hash_bytes(body)));
+        }
+
+        let (cb, events) = capturing_progress();
+        let rep = pull_model(&client, cache.path(), "gemma3", cb)
+            .await
+            .unwrap();
+        assert_eq!(rep.files, REQUIRED_FILES.len());
+
+        let ev = events.lock().unwrap();
+        let ok_count = ev
+            .iter()
+            .filter(|e| matches!(e, ProgressEvent::ChecksumOk { .. }))
+            .count();
+        assert_eq!(
+            ok_count,
+            REQUIRED_FILES.len(),
+            "every downloaded file must emit ChecksumOk"
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_model_checksum_mismatch_deletes_file_and_errors() {
+        let cache = tmp_cache();
+        let mut files = HashMap::new();
+        for name in REQUIRED_FILES {
+            files.insert(name.to_string(), vec![1u8; 8]);
+        }
+        let client = FakeHubClient::new(files).with_etag(
+            "config.json",
+            // Wrong hash — 64 hex chars so it passes the
+            // extract_expected_sha256 validation but won't match the real
+            // SHA-256 of the file contents.
+            Some("a".repeat(64)),
+        );
+
+        let err = pull_model(&client, cache.path(), "gemma3", null_progress())
+            .await
+            .unwrap_err();
+        match err {
+            ModelManagerError::Checksum { file, .. } => {
+                assert_eq!(file, "config.json");
+                // Corrupt file deleted so the next pull starts clean.
+                assert!(
+                    !cache.path().join("gemma3").join("config.json").exists(),
+                    "mismatched file must be removed from disk"
+                );
+            }
+            other => panic!("expected Checksum, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pull_model_checksum_skipped_when_no_etag_advertised() {
+        let cache = tmp_cache();
+        let mut files = HashMap::new();
+        for name in REQUIRED_FILES {
+            files.insert(name.to_string(), vec![5u8; 8]);
+        }
+        // Default FakeHubClient returns None for every etag → pull should
+        // succeed and emit ChecksumSkipped per file.
+        let client = FakeHubClient::new(files);
+
+        let (cb, events) = capturing_progress();
+        let rep = pull_model(&client, cache.path(), "gemma3", cb)
+            .await
+            .unwrap();
+        assert_eq!(rep.files, REQUIRED_FILES.len());
+
+        let ev = events.lock().unwrap();
+        let skipped = ev
+            .iter()
+            .filter(|e| matches!(e, ProgressEvent::ChecksumSkipped { .. }))
+            .count();
+        assert_eq!(skipped, REQUIRED_FILES.len());
+        // No `ChecksumOk` events fired because there was nothing to check.
+        assert_eq!(
+            ev.iter()
+                .filter(|e| matches!(e, ProgressEvent::ChecksumOk { .. }))
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_model_checksum_skipped_when_etag_is_not_a_hash() {
+        // Some HF assets surface weak git-blob etags like `W/"abc"`. Our
+        // header parser tries to strip those but occasionally a string
+        // that doesn't match our 64-hex rule lands in `expected_sha256`.
+        // Defense in depth: the module-level `extract_expected_sha256`
+        // filter must reject anything that isn't a proper SHA.
+        let cache = tmp_cache();
+        let mut files = HashMap::new();
+        for name in REQUIRED_FILES {
+            files.insert(name.to_string(), vec![9u8; 8]);
+        }
+        let mut client = FakeHubClient::new(files);
+        // 8-char git hash — not a SHA-256. Must be treated as "no etag".
+        client = client.with_etag("config.json", Some("deadbeef".to_string()));
+
+        let (cb, events) = capturing_progress();
+        let rep = pull_model(&client, cache.path(), "gemma3", cb)
+            .await
+            .unwrap();
+        assert_eq!(rep.files, REQUIRED_FILES.len());
+
+        // The malformed-etag file produced a ChecksumSkipped with a hint
+        // about the missing-SHA condition in the reason.
+        let ev = events.lock().unwrap();
+        let skipped_for_config: Vec<_> = ev
+            .iter()
+            .filter_map(|e| match e {
+                ProgressEvent::ChecksumSkipped { file, .. } if file == "config.json" => {
+                    Some(file.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(skipped_for_config.len(), 1);
     }
 
     #[test]

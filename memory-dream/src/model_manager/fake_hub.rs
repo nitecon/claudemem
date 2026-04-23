@@ -42,6 +42,11 @@ pub struct FakeHubClient {
     /// mode — for each file, the first `first_n_fail` calls return a
     /// transient NetworkError and the (N+1)th call succeeds.
     attempt_counters: Arc<Mutex<HashMap<String, u32>>>,
+    /// Per-file advertised SHA-256 hash. `None` means "no etag" (the hub
+    /// didn't return a usable hash for this file — skip verification).
+    /// `Some(hash)` means the hub advertised this hash; pull_model will
+    /// compare it to what it computes on the downloaded bytes.
+    etags: HashMap<String, Option<String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -68,7 +73,19 @@ impl FakeHubClient {
             staging: tempfile::tempdir().expect("staging tempdir"),
             call_counter: Arc::new(AtomicU32::new(0)),
             attempt_counters: Arc::new(Mutex::new(HashMap::new())),
+            etags: HashMap::new(),
         }
+    }
+
+    /// Attach a SHA-256 hex string (or `None` for "no etag available") to
+    /// `file`. Tests use this to drive the checksum verification paths:
+    ///   * happy path — set `Some(correct_hash)`.
+    ///   * mismatch  — set `Some(wrong_hash)`; pull should delete + error.
+    ///   * skipped   — set `None` (default); pull should emit skipped
+    ///     event and succeed.
+    pub fn with_etag(mut self, file: &str, etag: Option<String>) -> Self {
+        self.etags.insert(file.to_string(), etag);
+        self
     }
 
     pub fn with_auth_required(mut self) -> Self {
@@ -118,7 +135,11 @@ impl FakeHubClient {
 impl HubClient for FakeHubClient {
     async fn metadata(&self, _repo: &str, file: &str) -> Result<FileMetadata, ModelManagerError> {
         let size = self.files.get(file).map(|b| b.len() as u64).unwrap_or(0);
-        Ok(FileMetadata { size })
+        let expected_sha256 = self.etags.get(file).cloned().unwrap_or(None);
+        Ok(FileMetadata {
+            size,
+            expected_sha256,
+        })
     }
 
     async fn download_to(

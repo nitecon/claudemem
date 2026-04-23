@@ -203,6 +203,23 @@ fn build_progress_renderer() -> memory_dream::model_manager::ProgressFn {
                 )
             );
         }
+        ProgressEvent::ChecksumOk { file, sha256 } => {
+            // Print the full 64-char hash; operators auditing a release can
+            // grep for the exact value against HF's file page.
+            println!(
+                "{}",
+                render::render_action_result("checksum_ok", &[("file", file), ("sha256", sha256)])
+            );
+        }
+        ProgressEvent::ChecksumSkipped { file, reason } => {
+            println!(
+                "{}",
+                render::render_action_result(
+                    "checksum_skipped",
+                    &[("file", file), ("reason", reason)]
+                )
+            );
+        }
     })
 }
 
@@ -224,6 +241,15 @@ fn render_pull_error(model: &str, err: &model_manager::ModelManagerError) {
         }
         ModelManagerError::NetworkError { attempts, .. } => {
             attrs.push(("attempts", attempts.to_string()));
+        }
+        ModelManagerError::Checksum {
+            file,
+            expected,
+            actual,
+        } => {
+            attrs.push(("file", file.clone()));
+            attrs.push(("expected", expected.clone()));
+            attrs.push(("actual", actual.clone()));
         }
         _ => {}
     }

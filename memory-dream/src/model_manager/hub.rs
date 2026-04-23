@@ -90,6 +90,15 @@ impl HubClient for HfHubClient {
             return Err(classify_status(resp.status(), repo, file));
         }
 
+        // Capture the LFS-pointer SHA from the first hop BEFORE following
+        // the redirect. `x-linked-etag` is set by the hub on LFS-tracked
+        // files (.safetensors, .bin, .gguf, ...) and contains the
+        // canonical SHA-256. The plain `etag` field on small assets is a
+        // git-blob hash — useless for integrity — so we prefer the linked
+        // form and fall back to the regular one; the caller validates the
+        // format before trusting it as a checksum.
+        let expected_sha256 = extract_sha_from_headers(resp.headers());
+
         // Follow the redirect manually so we can read Content-Range on
         // the final hop without relying on hf-hub's Api internals.
         let resp = if resp.status().is_redirection() {
@@ -123,7 +132,10 @@ impl HubClient for HfHubClient {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
 
-        Ok(FileMetadata { size })
+        Ok(FileMetadata {
+            size,
+            expected_sha256,
+        })
     }
 
     async fn download_to(
@@ -205,6 +217,29 @@ fn classify_reqwest_error(e: reqwest::Error, repo: &str, file: &str) -> ModelMan
         attempts: 1,
         source: Box::new(e),
     }
+}
+
+/// Pull a SHA-256 out of the HF response headers. Prefers `x-linked-etag`
+/// (the LFS-pointer sha) over plain `etag` (git-blob sha). Strips
+/// surrounding quotes and the `W/` weak prefix before returning.
+///
+/// Returns None when neither header is present or when the value doesn't
+/// look like a 64-char hex string after cleanup — validation by the caller
+/// via [`super::extract_expected_sha256`] is defense in depth.
+fn extract_sha_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    const LINKED: &str = "x-linked-etag";
+    const PLAIN: &str = "etag";
+    let raw = headers
+        .get(LINKED)
+        .or_else(|| headers.get(PLAIN))
+        .and_then(|v| v.to_str().ok())?;
+    let cleaned = raw
+        .trim()
+        .trim_start_matches("W/")
+        .trim_start_matches("w/")
+        .trim_matches('"')
+        .to_string();
+    super::extract_expected_sha256(&cleaned).map(|s| s.to_string())
 }
 
 /// Classify a reqwest `StatusCode` into the typed error taxonomy.
