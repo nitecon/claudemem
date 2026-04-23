@@ -3,15 +3,21 @@
 .SYNOPSIS
     Install or upgrade agent-memory on Windows.
 .DESCRIPTION
-    Downloads the latest agent-memory release from GitHub and installs it
-    to %USERPROFILE%\.agentic\bin\memory.exe. Adds the directory to the
-    user's PATH if not already present.
+    Downloads the latest agent-memory release from GitHub and installs
+    both bundled binaries (memory.exe + memory-dream.exe) to
+    %USERPROFILE%\.agentic\bin\. Adds the directory to the user's PATH
+    if not already present.
+
+    Release 2 ships a single combined archive per platform that contains
+    both binaries. If the companion binary (memory-dream.exe) is missing
+    from a legacy archive this script warns and installs memory.exe
+    alone rather than failing hard.
 #>
 
 $ErrorActionPreference = "Stop"
 
 $Repo = "nitecon/agent-memory"
-$BinaryName = "memory.exe"
+$Binaries = @("memory.exe", "memory-dream.exe")
 $InstallDir = Join-Path $env:USERPROFILE ".agentic\bin"
 
 # --- Helpers ----------------------------------------------------------------
@@ -37,15 +43,16 @@ if (-not $LatestTag) {
 
 Info "Latest version: $LatestTag"
 
-$ArchiveName = "agent-memory-windows-x86_64.zip"
+# Release 2 asset name format: `agent-memory-<tag>-windows-x86_64.zip`.
+$ArchiveName = "agent-memory-$LatestTag-windows-x86_64.zip"
 $DownloadUrl = "https://github.com/$Repo/releases/download/$LatestTag/$ArchiveName"
 
 # --- Check existing installation --------------------------------------------
 
-$BinaryPath = Join-Path $InstallDir $BinaryName
-if (Test-Path $BinaryPath) {
+$MemoryPath = Join-Path $InstallDir "memory.exe"
+if (Test-Path $MemoryPath) {
     try {
-        $currentVersion = & $BinaryPath --version 2>$null
+        $currentVersion = & $MemoryPath --version 2>$null
         Info "Existing installation found: $currentVersion"
     } catch {
         Info "Existing installation found (version unknown)"
@@ -74,8 +81,19 @@ try {
         New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
     }
 
-    Copy-Item -Path (Join-Path $TmpDir $BinaryName) -Destination $BinaryPath -Force
-    Info "Installed $BinaryPath"
+    foreach ($bin in $Binaries) {
+        $src = Join-Path $TmpDir $bin
+        if (-not (Test-Path $src)) {
+            if ($bin -eq "memory.exe") {
+                Fail "Archive did not contain 'memory.exe'"
+            }
+            Warn "Archive did not contain '$bin' — skipping (older release?)"
+            continue
+        }
+        $dest = Join-Path $InstallDir $bin
+        Copy-Item -Path $src -Destination $dest -Force
+        Info "Installed $dest"
+    }
 
 } finally {
     Remove-Item -Path $TmpDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -97,13 +115,19 @@ if ($userPath -notlike "*$InstallDir*") {
 Write-Host ""
 Info "Installation complete!"
 Write-Host ""
-Write-Host "  Binary:  $BinaryPath"
-Write-Host "  Version: $LatestTag"
+Write-Host "  memory:       $InstallDir\memory.exe"
+Write-Host "  memory-dream: $InstallDir\memory-dream.exe"
+Write-Host "  Version:      $LatestTag"
 Write-Host ""
 Write-Host "Quick start:"
 Write-Host "  memory store `"my first memory`" -m user -t `"test`""
 Write-Host "  memory search `"first memory`""
 Write-Host ""
+Write-Host "Compact the DB on a schedule (optional — run manually or via scheduled task):"
+Write-Host "  memory-dream --pull          # one-time, fetch gemma3 weights"
+Write-Host "  memory-dream --dry-run       # preview condensations + dedup"
+Write-Host "  memory-dream                 # apply condensation + dedup"
+Write-Host ""
 Write-Host "Register as MCP server for Claude Code:"
-Write-Host "  claude mcp add agent-memory -- `"$BinaryPath`" serve"
+Write-Host "  claude mcp add agent-memory -- `"$InstallDir\memory.exe`" serve"
 Write-Host ""

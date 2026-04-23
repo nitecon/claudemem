@@ -13,26 +13,35 @@ jobs:
     strategy:
       matrix:
         include:
+          # Release 2: each platform ships a single combined archive
+          # containing both `memory` and `memory-dream`. The asset name
+          # embeds the tag so the updater + install scripts can resolve
+          # a specific release deterministically.
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            artifact: memory.exe
-            archive: agent-memory-windows-x86_64.zip
+            memory_bin: memory.exe
+            dream_bin: memory-dream.exe
+            archive_suffix: windows-x86_64.zip
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact: memory
-            archive: agent-memory-linux-x86_64.tar.gz
+            memory_bin: memory
+            dream_bin: memory-dream
+            archive_suffix: linux-x86_64.tar.gz
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
-            artifact: memory
-            archive: agent-memory-linux-aarch64.tar.gz
+            memory_bin: memory
+            dream_bin: memory-dream
+            archive_suffix: linux-aarch64.tar.gz
           - target: x86_64-apple-darwin
             os: macos-latest
-            artifact: memory
-            archive: agent-memory-macos-x86_64.tar.gz
+            memory_bin: memory
+            dream_bin: memory-dream
+            archive_suffix: macos-x86_64.tar.gz
           - target: aarch64-apple-darwin
             os: macos-latest
-            artifact: memory
-            archive: agent-memory-macos-aarch64.tar.gz
+            memory_bin: memory
+            dream_bin: memory-dream
+            archive_suffix: macos-aarch64.tar.gz
 
     runs-on: ${{ matrix.os }}
 
@@ -48,27 +57,39 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+      # Workspace build produces both binaries under
+      # target/<triple>/release/{memory,memory-dream}.
+      - name: Build workspace
+        run: cargo build --release --target ${{ matrix.target }} --workspace
         env:
           AGENT_MEMORY_VERSION: ${{ github.ref_name }}
 
-      - name: Package (Windows)
+      - name: Compute archive name
+        id: archive
+        shell: bash
+        run: |
+          echo "name=agent-memory-${{ github.ref_name }}-${{ matrix.archive_suffix }}" >> $GITHUB_OUTPUT
+
+      - name: Package (Windows — combined .zip)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.artifact }}" -DestinationPath "${{ matrix.archive }}"
+          $src = "target/${{ matrix.target }}/release"
+          Compress-Archive -Path "$src/${{ matrix.memory_bin }}","$src/${{ matrix.dream_bin }}" `
+            -DestinationPath "${{ steps.archive.outputs.name }}"
 
-      - name: Package (Unix)
+      - name: Package (Unix — combined .tar.gz)
         if: runner.os != 'Windows'
         run: |
-          tar czf ${{ matrix.archive }} -C target/${{ matrix.target }}/release ${{ matrix.artifact }}
+          tar czf ${{ steps.archive.outputs.name }} \
+            -C target/${{ matrix.target }}/release \
+            ${{ matrix.memory_bin }} ${{ matrix.dream_bin }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5
         with:
-          name: ${{ matrix.archive }}
-          path: ${{ matrix.archive }}
+          name: ${{ steps.archive.outputs.name }}
+          path: ${{ steps.archive.outputs.name }}
 
   release:
     needs: build

@@ -3,8 +3,11 @@ set -euo pipefail
 
 REPO="nitecon/agent-memory"
 INSTALL_DIR="/opt/agentic/bin"
-BINARY_NAME="memory"
-SYMLINK="/usr/local/bin/memory"
+# Release 2 ships two binaries per archive: `memory` (the main CLI/MCP
+# binary) and `memory-dream` (the offline batch compactor). Both are
+# force-bundled — installing one always installs the other.
+BINARIES=("memory" "memory-dream")
+SYMLINKS=("/usr/local/bin/memory" "/usr/local/bin/memory-dream")
 
 # --- Helpers ----------------------------------------------------------------
 
@@ -54,13 +57,16 @@ fi
 
 info "Latest version: ${LATEST_TAG}"
 
-ARCHIVE_NAME="agent-memory-${PLATFORM}-${ARCH}.tar.gz"
+# Release 2 asset name format: `agent-memory-<tag>-<platform>.tar.gz`.
+# The tag embedded in the name lets the updater and install scripts
+# deterministically resolve a specific release without a second API call.
+ARCHIVE_NAME="agent-memory-${LATEST_TAG}-${PLATFORM}-${ARCH}.tar.gz"
 DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${LATEST_TAG}/${ARCHIVE_NAME}"
 
 # --- Check existing installation --------------------------------------------
 
-if [ -f "${INSTALL_DIR}/${BINARY_NAME}" ]; then
-  CURRENT_VERSION=$(${INSTALL_DIR}/${BINARY_NAME} --version 2>/dev/null || echo "unknown")
+if [ -f "${INSTALL_DIR}/memory" ]; then
+  CURRENT_VERSION=$(${INSTALL_DIR}/memory --version 2>/dev/null || echo "unknown")
   info "Existing installation found: ${CURRENT_VERSION}"
   info "Upgrading to ${LATEST_TAG}..."
 else
@@ -81,28 +87,51 @@ tar xzf "${TMPDIR}/${ARCHIVE_NAME}" -C "$TMPDIR"
 # --- Install ----------------------------------------------------------------
 
 mkdir -p "$INSTALL_DIR"
-mv "${TMPDIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
-chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
-info "Installed ${INSTALL_DIR}/${BINARY_NAME}"
+for bin in "${BINARIES[@]}"; do
+  if [ ! -f "${TMPDIR}/${bin}" ]; then
+    # Pre-R2 archives only contain `memory`. Treat the companion binary as
+    # soft-missing so legacy installs don't fail, but surface a warning so
+    # the user knows memory-dream isn't available.
+    if [ "$bin" = "memory" ]; then
+      error "Archive did not contain 'memory' binary"
+    fi
+    warn "Archive did not contain '${bin}' — skipping (older release?)"
+    continue
+  fi
+  mv "${TMPDIR}/${bin}" "${INSTALL_DIR}/${bin}"
+  chmod +x "${INSTALL_DIR}/${bin}"
+  info "Installed ${INSTALL_DIR}/${bin}"
+done
 
-# --- Symlink ----------------------------------------------------------------
+# --- Symlinks ---------------------------------------------------------------
 
-ln -sf "${INSTALL_DIR}/${BINARY_NAME}" "$SYMLINK"
-info "Symlinked ${SYMLINK} -> ${INSTALL_DIR}/${BINARY_NAME}"
+for i in "${!BINARIES[@]}"; do
+  bin="${BINARIES[$i]}"
+  link="${SYMLINKS[$i]}"
+  if [ -f "${INSTALL_DIR}/${bin}" ]; then
+    ln -sf "${INSTALL_DIR}/${bin}" "$link"
+    info "Symlinked ${link} -> ${INSTALL_DIR}/${bin}"
+  fi
+done
 
 # --- Done -------------------------------------------------------------------
 
 echo ""
 info "Installation complete!"
 echo ""
-echo "  Binary:  ${INSTALL_DIR}/${BINARY_NAME}"
-echo "  Symlink: ${SYMLINK}"
-echo "  Version: ${LATEST_TAG}"
+echo "  memory:       ${INSTALL_DIR}/memory"
+echo "  memory-dream: ${INSTALL_DIR}/memory-dream"
+echo "  Version:      ${LATEST_TAG}"
 echo ""
 echo "Quick start:"
 echo "  memory store \"my first memory\" -m user -t \"test\""
 echo "  memory search \"first memory\""
 echo ""
+echo "Compact the DB on a schedule (optional — run manually or via cron):"
+echo "  memory-dream --pull          # one-time, fetch gemma3 weights"
+echo "  memory-dream --dry-run       # preview condensations + dedup"
+echo "  memory-dream                 # apply condensation + dedup"
+echo ""
 echo "Register as MCP server for Claude Code:"
-echo "  claude mcp add agent-memory -- ${INSTALL_DIR}/${BINARY_NAME} serve"
+echo "  claude mcp add agent-memory -- ${INSTALL_DIR}/memory serve"
 echo ""
