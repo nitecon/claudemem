@@ -364,6 +364,7 @@ pub fn render_projects(rows: &[(Option<String>, i64)], cwd_project: Option<&str>
 /// context. (Currently unused at the render layer because whoami lives in the
 /// `agent-tools` binary, not in this crate — kept here for symmetry if the
 /// subcommand is added later.)
+#[allow(dead_code)]
 pub fn render_whoami(project: Option<&str>, agent_id: Option<&str>) -> String {
     let mut out = String::new();
     out.push_str(&format!("project: {}\n", project.unwrap_or("(unknown)")));
