@@ -128,7 +128,7 @@ fn is_newer(latest: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Per-platform suffix for the combined release archive. The full asset
-/// name is `agent-memory-<tag>-<suffix>` (see [`get_asset_name`]).
+/// name is `agent-memory-<suffix>` (see [`get_asset_name`]).
 fn get_platform_suffix() -> Result<&'static str, MemoryError> {
     let suffix = match (
         cfg!(target_os = "linux"),
@@ -167,13 +167,14 @@ fn get_platform_suffix() -> Result<&'static str, MemoryError> {
     Ok(suffix)
 }
 
-/// Determines the correct release asset filename for a given tag and the
-/// running platform. Release 2 switched to combined archives that include
-/// both `memory` and `memory-dream`, so the asset name now embeds the tag:
-/// `agent-memory-<tag>-<platform>.{tar.gz|zip}`.
-fn get_asset_name(tag: &str) -> Result<String, MemoryError> {
+/// Determines the correct release asset filename for the running platform.
+/// Combined archives include both `memory` and `memory-dream` binaries:
+/// `agent-memory-<platform>.{tar.gz|zip}`. No tag embedded — older
+/// binaries must be able to resolve this name for any future tag so
+/// `memory update` works across version jumps.
+fn get_asset_name() -> Result<String, MemoryError> {
     let suffix = get_platform_suffix()?;
-    Ok(format!("agent-memory-{tag}-{suffix}"))
+    Ok(format!("agent-memory-{suffix}"))
 }
 
 /// Resolves the real path of the currently running executable, following
@@ -213,7 +214,7 @@ fn bundled_binary_names() -> &'static [&'static str] {
 /// invoke the compactor pay ~28MB of disk but gain zero cognitive overhead;
 /// install and updater logic become symmetric per the Release 2 plan.
 fn download_and_replace(tag: &str) -> Result<(), MemoryError> {
-    let asset_name = get_asset_name(tag)?;
+    let asset_name = get_asset_name()?;
     let url = format!("https://github.com/{REPO}/releases/download/{tag}/{asset_name}");
 
     let client = http_client()?;
@@ -527,10 +528,12 @@ mod tests {
     }
 
     #[test]
-    fn test_get_asset_name_embeds_tag() {
-        // Release 2: asset name embeds the tag — `agent-memory-<tag>-<suffix>`.
-        let name = get_asset_name("v1.2.0").unwrap();
-        assert!(name.starts_with("agent-memory-v1.2.0-"), "got: {name}");
+    fn test_get_asset_name_has_no_tag() {
+        // Asset name must NOT embed the tag so older binaries can resolve
+        // the URL for any future release.
+        let name = get_asset_name().unwrap();
+        assert!(name.starts_with("agent-memory-"), "got: {name}");
+        assert!(!name.contains("v1."), "tag leaked into asset name: {name}");
     }
 
     #[test]

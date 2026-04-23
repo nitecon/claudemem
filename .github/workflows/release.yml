@@ -68,7 +68,7 @@ jobs:
         id: archive
         shell: bash
         run: |
-          echo "name=agent-memory-${{ github.ref_name }}-${{ matrix.archive_suffix }}" >> $GITHUB_OUTPUT
+          echo "name=agent-memory-${{ matrix.archive_suffix }}" >> $GITHUB_OUTPUT
 
       - name: Package (Windows — combined .zip)
         if: runner.os == 'Windows'
