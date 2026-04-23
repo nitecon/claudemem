@@ -223,7 +223,9 @@ fn tail(s: &str, max: usize) -> String {
         let start = s.len() - max;
         // Walk forward to the nearest char boundary so we don't slice a
         // UTF-8 sequence in half.
-        let boundary = (start..s.len()).find(|i| s.is_char_boundary(*i)).unwrap_or(start);
+        let boundary = (start..s.len())
+            .find(|i| s.is_char_boundary(*i))
+            .unwrap_or(start);
         format!("…{}", &s[boundary..])
     }
 }

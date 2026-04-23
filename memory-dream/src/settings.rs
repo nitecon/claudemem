@@ -331,12 +331,7 @@ impl Settings {
     /// Append a short model name to `local.downloaded_models` if not already
     /// present. Call sites: `--pull` success path. Preserves insertion order.
     pub fn add_downloaded_model(&mut self, short_name: &str) {
-        if !self
-            .local
-            .downloaded_models
-            .iter()
-            .any(|m| m == short_name)
-        {
+        if !self.local.downloaded_models.iter().any(|m| m == short_name) {
             self.local.downloaded_models.push(short_name.to_string());
         }
     }
@@ -585,7 +580,8 @@ timeout_ms = 30000
         let mut s = Settings::default_local();
         s.apply_dotted_set("backend.mode", "headless").unwrap();
         assert_eq!(s.backend.mode, BackendMode::Headless);
-        s.apply_dotted_set("local.active_model", "tinyllama").unwrap();
+        s.apply_dotted_set("local.active_model", "tinyllama")
+            .unwrap();
         assert_eq!(s.local.active_model, "tinyllama");
         s.apply_dotted_set("headless.command", "claude -p '{prompt}'")
             .unwrap();
@@ -597,7 +593,9 @@ timeout_ms = 30000
     #[test]
     fn apply_dotted_set_rejects_unknown_key() {
         let mut s = Settings::default_local();
-        let err = s.apply_dotted_set("backend.temperature", "0.7").unwrap_err();
+        let err = s
+            .apply_dotted_set("backend.temperature", "0.7")
+            .unwrap_err();
         assert!(err.contains("backend.mode"));
     }
 
