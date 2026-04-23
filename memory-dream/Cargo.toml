@@ -1,0 +1,52 @@
+[package]
+name = "memory-dream"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Offline batch compactor for agent-memory: condense, dedup, archive"
+
+[[bin]]
+name = "memory-dream"
+path = "src/main.rs"
+
+[dependencies]
+# Library reuse from the sibling memory crate — DB schema, query helpers,
+# embedding pipeline, cosine similarity, light-XML renderer.
+agent-memory = { path = "../memory" }
+
+# CLI
+clap = { workspace = true }
+
+# Async (for hf-hub download in --pull)
+tokio = { workspace = true }
+
+# Database (dream opens the same SQLite DB as `memory`)
+rusqlite = { workspace = true }
+
+# Embedding (re-embed condensed content via fastembed)
+fastembed = { workspace = true }
+
+# Serialization (parse JSON responses from the condenser LLM)
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Utilities
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+sha2 = "0.10"
+hex = "0.4"
+
+# Candle — pure-Rust in-process inference backend for gemma3.
+# The feature flags pull in the gemma model definition, tokenizers, and
+# metal/accelerate backends where available (falling back to CPU).
+candle-core = "0.9"
+candle-nn = "0.9"
+candle-transformers = "0.9"
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+
+# HuggingFace Hub client (used by --pull to download gemma3 weights).
+hf-hub = { version = "0.4", default-features = false, features = ["tokio", "rustls-tls"] }
