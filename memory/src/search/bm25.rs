@@ -14,11 +14,16 @@ pub fn search_bm25(
         return Ok(Vec::new());
     }
 
+    // The JOIN filters `m.superseded_by IS NULL` so lexical hits against a
+    // dream-obsoleted memory don't pollute the ranked results. FTS5 indexes
+    // every row (superseded or not) via the content-triggered virtual table;
+    // the filter lives on the `memories` side where the `superseded_by`
+    // column actually lives.
     let mut stmt = conn.prepare(
         "SELECT m.id, bm25(memories_fts) as score
          FROM memories_fts
          JOIN memories m ON m.rowid = memories_fts.rowid
-         WHERE memories_fts MATCH ?1
+         WHERE memories_fts MATCH ?1 AND m.superseded_by IS NULL
          ORDER BY score
          LIMIT ?2",
     )?;
