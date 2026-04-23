@@ -5,4 +5,5 @@
 //! the bin).
 
 pub mod condense;
+pub mod dedup;
 pub mod prompt;
