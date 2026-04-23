@@ -127,34 +127,35 @@ fn is_newer(latest: &str) -> bool {
 // Platform helpers
 // ---------------------------------------------------------------------------
 
-/// Determines the correct release asset filename for the running platform.
-fn get_asset_name() -> Result<String, MemoryError> {
-    let name = match (
+/// Per-platform suffix for the combined release archive. The full asset
+/// name is `agent-memory-<tag>-<suffix>` (see [`get_asset_name`]).
+fn get_platform_suffix() -> Result<&'static str, MemoryError> {
+    let suffix = match (
         cfg!(target_os = "linux"),
         cfg!(target_os = "macos"),
         cfg!(target_os = "windows"),
     ) {
         (true, _, _) => {
             if cfg!(target_arch = "x86_64") {
-                "agent-memory-linux-x86_64.tar.gz"
+                "linux-x86_64.tar.gz"
             } else if cfg!(target_arch = "aarch64") {
-                "agent-memory-linux-aarch64.tar.gz"
+                "linux-aarch64.tar.gz"
             } else {
                 return Err(MemoryError::Update("unsupported Linux architecture".into()));
             }
         }
         (_, true, _) => {
             if cfg!(target_arch = "x86_64") {
-                "agent-memory-macos-x86_64.tar.gz"
+                "macos-x86_64.tar.gz"
             } else if cfg!(target_arch = "aarch64") {
-                "agent-memory-macos-aarch64.tar.gz"
+                "macos-aarch64.tar.gz"
             } else {
                 return Err(MemoryError::Update("unsupported macOS architecture".into()));
             }
         }
         (_, _, true) => {
             if cfg!(target_arch = "x86_64") {
-                "agent-memory-windows-x86_64.zip"
+                "windows-x86_64.zip"
             } else {
                 return Err(MemoryError::Update(
                     "unsupported Windows architecture".into(),
@@ -163,7 +164,16 @@ fn get_asset_name() -> Result<String, MemoryError> {
         }
         _ => return Err(MemoryError::Update("unsupported operating system".into())),
     };
-    Ok(name.to_string())
+    Ok(suffix)
+}
+
+/// Determines the correct release asset filename for a given tag and the
+/// running platform. Release 2 switched to combined archives that include
+/// both `memory` and `memory-dream`, so the asset name now embeds the tag:
+/// `agent-memory-<tag>-<platform>.{tar.gz|zip}`.
+fn get_asset_name(tag: &str) -> Result<String, MemoryError> {
+    let suffix = get_platform_suffix()?;
+    Ok(format!("agent-memory-{tag}-{suffix}"))
 }
 
 /// Resolves the real path of the currently running executable, following
@@ -179,10 +189,31 @@ fn get_current_exe_path() -> Result<PathBuf, MemoryError> {
 // Download & replace
 // ---------------------------------------------------------------------------
 
-/// Downloads the release asset for `tag`, extracts the binary, and replaces
-/// the currently running executable in-place.
+/// Names of every binary packaged in the combined release archive.
+///
+/// Release 2 ships both `memory` and `memory-dream` together per platform
+/// (one archive, two binaries). The updater atomically swaps each binary
+/// next to `memory`'s own install location so users who never invoked
+/// `memory-dream` still get it force-bundled on the next `memory update`.
+fn bundled_binary_names() -> &'static [&'static str] {
+    if cfg!(target_os = "windows") {
+        &["memory.exe", "memory-dream.exe"]
+    } else {
+        &["memory", "memory-dream"]
+    }
+}
+
+/// Downloads the combined release archive for `tag`, extracts every bundled
+/// binary, and atomically replaces each next to the currently running
+/// `memory` executable. The running `memory` binary is replaced LAST so a
+/// crash mid-update still leaves a functional pair.
+///
+/// Force-bundle semantics: if `memory-dream` is not currently installed
+/// alongside `memory`, this function creates it anyway. Users who never
+/// invoke the compactor pay ~28MB of disk but gain zero cognitive overhead;
+/// install and updater logic become symmetric per the Release 2 plan.
 fn download_and_replace(tag: &str) -> Result<(), MemoryError> {
-    let asset_name = get_asset_name()?;
+    let asset_name = get_asset_name(tag)?;
     let url = format!("https://github.com/{REPO}/releases/download/{tag}/{asset_name}");
 
     let client = http_client()?;
@@ -202,25 +233,69 @@ fn download_and_replace(tag: &str) -> Result<(), MemoryError> {
         .bytes()
         .map_err(|e| MemoryError::Update(format!("failed to read download body: {e}")))?;
 
-    // Determine the binary name we are looking for inside the archive.
-    let binary_name = if cfg!(target_os = "windows") {
+    // The install dir is derived from the running memory executable's
+    // location so side-by-side binaries land in the same directory as the
+    // one the user installed originally.
+    let memory_exe = get_current_exe_path()?;
+    let install_dir = memory_exe
+        .parent()
+        .ok_or_else(|| MemoryError::Update("cannot locate install directory".into()))?
+        .to_path_buf();
+
+    // Pull every bundled binary out of the archive. We defer the actual
+    // replace() calls until all extractions succeed — avoids leaving the
+    // install dir in a half-updated state if extraction of the later
+    // binary fails.
+    let mut staged: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+    for bin_name in bundled_binary_names() {
+        let data = if asset_name.ends_with(".tar.gz") {
+            extract_from_tar_gz(&bytes, bin_name)
+        } else if asset_name.ends_with(".zip") {
+            extract_from_zip(&bytes, bin_name)
+        } else {
+            return Err(MemoryError::Update("unknown archive format".into()));
+        };
+
+        match data {
+            Ok(bytes) => staged.push((install_dir.join(bin_name), bytes)),
+            Err(e) => {
+                // `memory-dream` has been in the archive since the Release 2
+                // cutover. If a pre-R2 archive tag ever gets served by
+                // mistake it won't contain `memory-dream`; treat that as
+                // a soft-failure for the companion binary — still update
+                // `memory` itself, just warn about the missing companion.
+                if *bin_name != memory_binary_name() {
+                    eprintln!(
+                        "[WARN] {bin_name} not found in {asset_name}; skipping \
+                         companion binary update: {e}"
+                    );
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    // Replace in order: every companion first, memory itself last. That
+    // way a crash during replacement leaves a mismatched-version pair at
+    // worst, never an empty install dir.
+    staged.sort_by_key(|(path, _)| {
+        path.file_name() == Some(std::ffi::OsStr::new(memory_binary_name()))
+    });
+    for (path, data) in &staged {
+        replace_binary(path, data)?;
+    }
+
+    Ok(())
+}
+
+/// Name of the main `memory` binary on the current platform.
+fn memory_binary_name() -> &'static str {
+    if cfg!(target_os = "windows") {
         "memory.exe"
     } else {
         "memory"
-    };
-
-    let new_binary = if asset_name.ends_with(".tar.gz") {
-        extract_from_tar_gz(&bytes, binary_name)?
-    } else if asset_name.ends_with(".zip") {
-        extract_from_zip(&bytes, binary_name)?
-    } else {
-        return Err(MemoryError::Update("unknown archive format".into()));
-    };
-
-    let exe_path = get_current_exe_path()?;
-    replace_binary(&exe_path, &new_binary)?;
-
-    Ok(())
+    }
 }
 
 /// Extracts the target binary from a `.tar.gz` archive held in memory.
@@ -284,12 +359,18 @@ fn extract_from_zip(data: &[u8], binary_name: &str) -> Result<Vec<u8>, MemoryErr
     )))
 }
 
-/// Atomically replaces the binary at `exe_path` with `new_binary`.
+/// Atomically replaces (or creates) the binary at `exe_path` with
+/// `new_binary`. Handles both in-place upgrades and force-bundle cases
+/// where the target doesn't exist yet (Release 2: `memory-dream` may not
+/// be installed when a user runs `memory update` for the first time).
 ///
-/// - Unix: writes to `{exe_path}.new`, sets permissions, then renames over
-///   the original (atomic on the same filesystem).
-/// - Windows: renames current to `.old`, writes new binary, then attempts to
-///   remove `.old`.
+/// - Unix: writes to `{exe_path}.new`, sets executable permissions, then
+///   renames over the target. Atomic on the same filesystem; works when
+///   `exe_path` is missing because `fs::rename` handles both overwrite
+///   and create-new.
+/// - Windows: when the target exists, renames it to `.old` first so the
+///   currently-running executable isn't held-open during the write; when
+///   the target doesn't exist (force-bundle), the rename step is skipped.
 fn replace_binary(exe_path: &Path, new_binary: &[u8]) -> Result<(), MemoryError> {
     #[cfg(unix)]
     {
@@ -306,17 +387,28 @@ fn replace_binary(exe_path: &Path, new_binary: &[u8]) -> Result<(), MemoryError>
 
     #[cfg(windows)]
     {
+        // Only rename the current binary out of the way if it actually
+        // exists — for the Release 2 force-bundle case `memory-dream.exe`
+        // may be absent on first upgrade.
         let old_path = exe_path.with_extension("old");
-        fs::rename(exe_path, &old_path)
-            .map_err(|e| MemoryError::Update(format!("failed to rename current binary: {e}")))?;
+        let had_prior = exe_path.exists();
+        if had_prior {
+            fs::rename(exe_path, &old_path).map_err(|e| {
+                MemoryError::Update(format!("failed to rename current binary: {e}"))
+            })?;
+        }
         if let Err(e) = fs::write(exe_path, new_binary) {
             // Attempt to restore the original on failure.
-            let _ = fs::rename(&old_path, exe_path);
+            if had_prior {
+                let _ = fs::rename(&old_path, exe_path);
+            }
             return Err(MemoryError::Update(format!(
                 "failed to write new binary: {e}"
             )));
         }
-        let _ = fs::remove_file(&old_path);
+        if had_prior {
+            let _ = fs::remove_file(&old_path);
+        }
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -435,9 +527,31 @@ mod tests {
     }
 
     #[test]
-    fn test_get_asset_name() {
+    fn test_get_asset_name_embeds_tag() {
+        // Release 2: asset name embeds the tag — `agent-memory-<tag>-<suffix>`.
+        let name = get_asset_name("v1.2.0").unwrap();
+        assert!(name.starts_with("agent-memory-v1.2.0-"), "got: {name}");
+    }
+
+    #[test]
+    fn test_get_platform_suffix_is_nonempty() {
         // Should not error on the platform running the test suite.
-        let name = get_asset_name().unwrap();
-        assert!(name.starts_with("agent-memory-"));
+        let suffix = get_platform_suffix().unwrap();
+        assert!(!suffix.is_empty());
+        assert!(suffix.ends_with(".tar.gz") || suffix.ends_with(".zip"));
+    }
+
+    #[test]
+    fn test_bundled_binary_names_includes_both() {
+        // Force-bundle contract: every release ships both memory and
+        // memory-dream; the updater must know to extract both.
+        let names = bundled_binary_names();
+        assert!(names.contains(&memory_binary_name()));
+        let companion = if cfg!(target_os = "windows") {
+            "memory-dream.exe"
+        } else {
+            "memory-dream"
+        };
+        assert!(names.contains(&companion));
     }
 }
