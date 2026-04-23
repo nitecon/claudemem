@@ -313,7 +313,10 @@ fn compute_new_content(
     } else if existing.is_empty() {
         (block.to_string(), InjectMode::Prepended)
     } else if has_sibling {
-        (insert_after_sibling(existing, block), InjectMode::InsertedAfterSibling)
+        (
+            insert_after_sibling(existing, block),
+            InjectMode::InsertedAfterSibling,
+        )
     } else {
         (format!("{block}\n{existing}"), InjectMode::Prepended)
     }
@@ -363,7 +366,10 @@ fn prompt_user_for_selection(candidates: &[PathBuf]) -> Result<Vec<PathBuf>> {
     for (i, p) in candidates.iter().enumerate() {
         println!("  {}) {}", i + 1, p.display());
     }
-    print!("Update [a]ll, [1-{}] specific, [c]ancel: ", candidates.len());
+    print!(
+        "Update [a]ll, [1-{}] specific, [c]ancel: ",
+        candidates.len()
+    );
     io::stdout().flush().context("flush stdout")?;
 
     let mut input = String::new();
@@ -421,11 +427,20 @@ mod tests {
             "block must show the --scope global CLI example"
         );
         // Scope tier table references both boost values.
-        assert!(b.contains("1.5×"), "block must reference the 1.5× project boost");
-        assert!(b.contains("1.25×"), "block must reference the 1.25× global boost");
+        assert!(
+            b.contains("1.5×"),
+            "block must reference the 1.5× project boost"
+        );
+        assert!(
+            b.contains("1.25×"),
+            "block must reference the 1.25× global boost"
+        );
         // The sentinel must be named so users inspecting the DB aren't
         // confused by stray `__global__` rows.
-        assert!(b.contains("__global__"), "block must name the sentinel project ident");
+        assert!(
+            b.contains("__global__"),
+            "block must name the sentinel project ident"
+        );
         // Rule headings — exact strings the agent learns to look for.
         assert!(
             b.contains("Pre-action behavior recall"),
@@ -458,9 +473,8 @@ mod tests {
     #[test]
     fn compute_new_content_inserts_after_sibling_when_present() {
         let block = build_block();
-        let existing = format!(
-            "{SIBLING_OPEN}\nagent-tools stuff\n{SIBLING_CLOSE}\n\n# Rest of file\n"
-        );
+        let existing =
+            format!("{SIBLING_OPEN}\nagent-tools stuff\n{SIBLING_CLOSE}\n\n# Rest of file\n");
         let (out, mode) = compute_new_content(&existing, &block, false, true);
         assert_eq!(mode, InjectMode::InsertedAfterSibling);
         // Sibling block still first.
@@ -514,8 +528,7 @@ mod tests {
         // replaces in place, *not* re-inserting after the sibling.
         let block = build_block();
         let (first, _) = compute_new_content("# Header\n", &block, false, false);
-        let with_sibling =
-            format!("{SIBLING_OPEN}\nfoo\n{SIBLING_CLOSE}\n\n{first}");
+        let with_sibling = format!("{SIBLING_OPEN}\nfoo\n{SIBLING_CLOSE}\n\n{first}");
         let (after_refresh, mode) = compute_new_content(&with_sibling, &block, true, true);
         assert_eq!(mode, InjectMode::Replaced);
         assert_eq!(after_refresh.matches(OPEN_MARKER).count(), 1);

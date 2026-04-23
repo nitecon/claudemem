@@ -253,10 +253,7 @@ mod tests {
             "memory prune",
             "memory update",
         ] {
-            assert!(
-                SKILL_BODY.contains(cmd),
-                "skill body must document `{cmd}`"
-            );
+            assert!(SKILL_BODY.contains(cmd), "skill body must document `{cmd}`");
         }
     }
 
@@ -340,10 +337,8 @@ mod tests {
     /// `tempfile` crate (not in this project's deps). Each test gets a unique
     /// directory based on a UUID v4 — the existing `uuid` dep is sufficient.
     fn tempdir_in_target() -> PathBuf {
-        let base = std::env::temp_dir().join(format!(
-            "agent-memory-skill-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("agent-memory-skill-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&base).unwrap();
         base
     }

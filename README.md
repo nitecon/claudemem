@@ -133,8 +133,8 @@ memory store "<content>" -m <type> -t "<tags>"
 memory store "<content>" -m <type> --scope global -t "<tags>"
 # types: user, feedback, project, reference
 
-# Get -- fetch full content for specific IDs (pair with brief search)
-memory get <uuid> [<uuid>...]
+# Get -- fetch full content for specific IDs (pair with search for two-stage flow)
+memory get <id> [<id>...]                 # 8-char short prefix OK
 
 # Recall -- filter by project/agent/tags/type
 memory recall -m <type> -t "<tags>" -p "<project>" -k <limit>
@@ -223,10 +223,12 @@ memory store "User prefers terse responses" --tags "preference" -m feedback
 memory store "User never wants PRs opened unless explicitly asked" \
   -m feedback --scope global --tags "workflow,pr"
 
-# Hybrid search (BM25 + vector); brief output is the default, cwd project is boosted
+# Hybrid search (BM25 + vector); cwd project is boosted
 memory search "how does testing work"
 
 # Fetch full content for specific hits (two-stage retrieval)
+# Short 8-char prefix is fine — resolves via `resolve_id_prefix`.
+memory get 4c82c482
 memory get <uuid> <uuid>
 
 # Filter by project/agent/tags
@@ -239,11 +241,8 @@ memory context "refactoring the auth middleware" -k 5
 memory search "storage" --only "github.com/acme/infra.git"   # only this project
 memory search "storage" --no-project-boost                    # flat ranking, no boost
 
-# Full content instead of preview
-memory search "storage" --format full
-
-# Delete by ID or search
-memory forget --id <uuid>
+# Delete by ID (short prefix supported) or by search
+memory forget --id 4c82c482
 memory forget --query "outdated preference"
 
 # Clean up stale memories
@@ -347,23 +346,93 @@ memory move --from "trading-platform-sre" --to "github.com/nitecon/SRE.git"
 
 Use `memory copy` instead of `memory move` when you want the memory available under *both* idents — for example, when a shared memory applies to two forks of the same codebase. Copies keep the original content, tags, and cached embedding; only the project ident, UUID, and timestamps differ.
 
-## Output formats
+## Output format (light-XML)
 
-`search` and `context` return a wrapper object with scope counts and a reflection `hint` whenever it would be informative:
+All commands emit **light-XML** — grouped section tags with numbered content lines. No JSON. The shape is compact on purpose: tags give the agent a structural signal while the payload stays plain lines so token overhead is minimal.
 
-```json
-{
-  "results": [ ... ],
-  "current_project": "github.com/acme/myapp.git",
-  "cross_project_count": 2,
-  "global_scope_count": 1,
-  "hint": "2 of 5 results are cross-project (is_current_project=false). Use those as prior-art or general guidance, not direct context for 'github.com/acme/myapp.git'. Use `memory get <id>` for full content. 1 of 5 results are global-scope preferences (apply across all projects). Treat them as directives, not suggestions."
-}
+### `context` / `search` / `recall`
+
+```
+<project_memories>
+1. PRs required by CodingGuidelines.md [git,standards] (ID:4c82c482)
+2. Follow docs/CodingGuidelines.md for PRs [git,standards] (ID:772fd580)
+</project_memories>
+<general_knowledge>
+1. User avoids PRs unless required [git,standards] (ID:372bd79d)
+</general_knowledge>
+<other_projects>
+1. colorithmic: k-means Euclidean beats OKLab on OPT [quantization] (ID:23d0142a)
+</other_projects>
+<hint>2 of 4 results are global-scope preferences (apply across all projects). Treat them as directives, not suggestions.</hint>
 ```
 
-When `global_scope_count` is 0 during a scoped retrieval, the `hint` adds a reflection prompt asking the agent to confirm no universal preference applies before acting. `memory store` responses always include a `scope` field (`"project"` or `"global"`) and emit a `hint` when the memory type is `user` or `feedback` AND no explicit `--scope` was passed — so an ambiguous classification gets one soft nudge before the memory is locked in.
+- `<project_memories>` — hits tagged with the current (cwd-derived) project.
+- `<general_knowledge>` — hits tagged with the `__global__` sentinel (universal preferences, 1.25× boost).
+- `<other_projects>` — hits from other projects, prefixed with the originating project ident. Treat as prior art.
+- `<hint>` — reflection / directive prompt. Only emitted when it has something to say.
 
-Default format (`--format brief`) returns `id`, `tags`, `project`, `memory_type`, `match_quality` (high/medium/low), `is_current_project`, a `preview` (160 chars), and `content_len`. Use `--format full` when you need the full content, or pair `search --brief` with `memory get <id>` for a cheap two-stage retrieval.
+Empty sections are elided. A query with zero global-scope hits during a scoped retrieval triggers a reflection-style `<hint>` nudging the agent to confirm no universal preference applies before acting.
+
+### Mutations (`store` / `move` / `copy` / `forget` / `prune`)
+
+Single self-closing `<result>` line:
+
+```
+<result status="stored" id="a4936eff" scope="global" project="__global__"/>
+<result status="forgot" id="a4936eff"/>
+<result status="forgot" count="3"/>
+<result status="no_matches"/>
+<result status="pruned" count="7"/>
+<result status="dry_run" count="7"/>
+<result status="moved" id="a4936eff" to_project="github.com/acme/split.git"/>
+```
+
+`memory store` with memory type `user` or `feedback` and no explicit `--scope` gets one additional `<hint>…</hint>` line reminding the caller to reclassify to global if the memory applies across repos.
+
+### `memory get`
+
+```
+<memory id="a4936eff" project="agent-memory" type="feedback" tags="workflow,pr">
+User never wants PRs opened unless they explicitly ask.
+</memory>
+```
+
+Full content is emitted verbatim as element text (XML-escaped). IDs are shown as 8-char short prefixes everywhere — full UUIDs still work as input.
+
+### Short-ID resolution
+
+Every command that takes an `<id>` accepts any prefix of 4 or more hex characters. `memory get 4c82c482` expands to the full UUID when unique. When two memories share the same prefix, an `<ambiguous>` block lists the candidates:
+
+```
+<ambiguous prefix="4c82c482">
+1. 4c82c482-c081-4937... [colorithmic,milestone]: colorithmic v1.0.0 milestone 2026-04-20...
+2. 4c82c482-d7f2-4a18... [agent-memory,schema]: Schema v3 migration design notes...
+Reply with 1..2, or re-run with a longer prefix.
+</ambiguous>
+```
+
+The fast-path full-UUID lookup still works — prefix resolution is additive.
+
+### `memory list` / `memory projects`
+
+Plain light-XML blocks optimized for readability:
+
+```
+<memories count="2">
+1.*(feedback) agent-memory [workflow,pr] (ID:a4936eff): User never wants PRs opened unless they explicitly ask.
+2. (user) colorithmic [setup] (ID:b12c3d4e): Prefer k-means Euclidean over OKLab for OPT quantization.
+</memories>
+```
+
+```
+<projects count="3">
+*agent-memory (42)
+ colorithmic (7)
+ __global__ (3)
+</projects>
+```
+
+A leading `*` marks the current cwd-derived project. An empty list collapses to a self-closing `<memories count="0"/>` or `<projects count="0"/>`.
 
 ## Auto-update
 
@@ -387,7 +456,7 @@ You can also trigger an update manually at any time with `memory update`.
 | `memory_forget` | Remove specific memories |
 | `memory_prune` | Decay stale/low-access memories |
 | `memory_context` | Return top-K relevant memories for a task description |
-| `memory_get` | Fetch full content for one or more memory IDs (pair with brief search) |
+| `memory_get` | Fetch full content for one or more memory IDs (full UUID or 4+ char short prefix) |
 | `memory_projects` | List distinct project idents with memory counts (spot alias mismatches) |
 | `memory_move` | Reassign the project ident on one memory (by id) or in bulk (by from/to) |
 | `memory_copy` | Duplicate memories under a new project ident; preserves content + embedding |
@@ -416,5 +485,5 @@ Results are combined via **Reciprocal Rank Fusion** (k=60), which merges ranked 
 - **Embeddings are brute-force cosine.** For a personal memory system (<100K memories), this is fast enough and avoids ANN index complexity.
 - **Model loads lazily.** Commands that don't need embeddings (e.g., `recall`, `forget --id`) skip the ~200ms model load.
 - **Access counts track usage.** Every retrieval increments `access_count`, enabling `prune` to identify stale memories.
-- **All logging goes to stderr.** Stdout is reserved for JSON results (CLI) or JSON-RPC (MCP), so logging never pollutes the transport.
+- **All logging goes to stderr.** Stdout is reserved for light-XML results (CLI) or JSON-RPC transport (MCP), so logging never pollutes either channel. MCP tool responses themselves are light-XML strings delivered as a single text content block.
 - **Global-first storage.** `/opt/agentic/memory.db` is shared across all users/agents by default, with `~/.agentic/` as a user-local override.

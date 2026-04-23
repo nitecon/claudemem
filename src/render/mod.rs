@@ -413,7 +413,12 @@ mod tests {
     use crate::search::fusion::RankedResult;
     use crate::search::MatchQuality;
 
-    fn mk_memory(id: &str, content: &str, project: Option<&str>, tags: Option<Vec<&str>>) -> Memory {
+    fn mk_memory(
+        id: &str,
+        content: &str,
+        project: Option<&str>,
+        tags: Option<Vec<&str>>,
+    ) -> Memory {
         Memory {
             id: id.to_string(),
             content: content.to_string(),
@@ -463,7 +468,10 @@ mod tests {
                 ("scope", "global".to_string()),
             ],
         );
-        assert_eq!(s, r#"<result status="stored" id="a4936eff" scope="global"/>"#);
+        assert_eq!(
+            s,
+            r#"<result status="stored" id="a4936eff" scope="global"/>"#
+        );
     }
 
     #[test]
@@ -542,12 +550,7 @@ mod tests {
 
     #[test]
     fn render_search_results_elides_empty_sections() {
-        let only_global = mk_memory(
-            "dddddddd-1111",
-            "only global",
-            Some("__global__"),
-            None,
-        );
+        let only_global = mk_memory("dddddddd-1111", "only global", Some("__global__"), None);
         let results = vec![mk_result(only_global, false, true)];
         let out = render_search_results(&results, Some("agent-memory"), None);
         assert!(!out.contains("<project_memories>"));

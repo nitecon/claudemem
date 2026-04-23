@@ -466,8 +466,7 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
                 global_project: boosts.global_project,
                 global_boost_factor: boosts.global_boost,
             };
-            let results =
-                search::hybrid_search(conn, &description, opts, &config.model_cache_dir)?;
+            let results = search::hybrid_search(conn, &description, opts, &config.model_cache_dir)?;
             print_ranked(&results, &boosts);
         }
         Cli::Recall {
@@ -503,10 +502,7 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
                         let deleted = queries::delete_memory(conn, &full_id)?;
                         let status = if deleted { "forgot" } else { "not_found" };
                         let short = render::short_id(&full_id).to_string();
-                        println!(
-                            "{}",
-                            render::render_action_result(status, &[("id", short)])
-                        );
+                        println!("{}", render::render_action_result(status, &[("id", short)]));
                     }
                     ResolvedId::Ambiguous(cands) => {
                         println!("{}", render::render_ambiguous(&id, &cands));
@@ -532,10 +528,7 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
                     }
                     println!(
                         "{}",
-                        render::render_action_result(
-                            "forgot",
-                            &[("count", deleted.to_string())]
-                        )
+                        render::render_action_result("forgot", &[("count", deleted.to_string())])
                     );
                 }
             } else {
@@ -551,10 +544,7 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
             let status = if dry_run { "dry_run" } else { "pruned" };
             println!(
                 "{}",
-                render::render_action_result(
-                    status,
-                    &[("count", pruned.len().to_string())]
-                )
+                render::render_action_result(status, &[("count", pruned.len().to_string())])
             );
         }
         Cli::Get {
@@ -641,7 +631,13 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
             }
             let new_project = empty_to_none(&to);
             let resolved_id = resolve_id_arg(conn, id.as_deref())?;
-            run_move(conn, resolved_id.as_deref(), from.as_deref(), new_project, dry_run)?;
+            run_move(
+                conn,
+                resolved_id.as_deref(),
+                from.as_deref(),
+                new_project,
+                dry_run,
+            )?;
         }
         Cli::Copy {
             id,
@@ -651,14 +647,17 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
         } => {
             let new_project = empty_to_none(&to);
             let resolved_id = resolve_id_arg(conn, id.as_deref())?;
-            run_copy(conn, resolved_id.as_deref(), from.as_deref(), new_project, dry_run)?;
+            run_copy(
+                conn,
+                resolved_id.as_deref(),
+                from.as_deref(),
+                new_project,
+                dry_run,
+            )?;
         }
         Cli::Projects => {
             let rows = queries::list_projects(conn)?;
-            println!(
-                "{}",
-                render::render_projects(&rows, cwd_project.as_deref())
-            );
+            println!("{}", render::render_projects(&rows, cwd_project.as_deref()));
         }
         Cli::Serve => {
             unreachable!("Serve is handled in main.rs");
@@ -684,8 +683,7 @@ fn print_ranked(results: &[SearchResult], boosts: &BoostConfig<'_>) {
         0
     };
     let hint = results_hint(cross, globals, total, boosts.current_project);
-    let rendered =
-        render::render_search_results(results, boosts.current_project, hint.as_deref());
+    let rendered = render::render_search_results(results, boosts.current_project, hint.as_deref());
     // Empty input yields an empty render; emit an explicit empty marker so
     // callers can tell "query ran, zero hits" from a silent failure.
     if rendered.is_empty() {
@@ -700,10 +698,7 @@ fn print_ranked(results: &[SearchResult], boosts: &BoostConfig<'_>) {
 /// and return `Ok(None)` so the caller skips the mutation; missing IDs return
 /// a `not_found` result line. Full UUIDs and unique prefixes return the full
 /// UUID wrapped in `Some`.
-fn resolve_id_arg(
-    conn: &Connection,
-    id: Option<&str>,
-) -> Result<Option<String>, MemoryError> {
+fn resolve_id_arg(conn: &Connection, id: Option<&str>) -> Result<Option<String>, MemoryError> {
     match id {
         None => Ok(None),
         Some(raw) => match queries::resolve_id_prefix(conn, raw)? {
@@ -899,8 +894,7 @@ fn run_move(
             } else {
                 let changed = queries::move_memory_by_id(conn, id, to)?;
                 let status = if changed { "moved" } else { "not_found" };
-                let mut attrs: Vec<(&str, String)> =
-                    vec![("id", render::short_id(id).to_string())];
+                let mut attrs: Vec<(&str, String)> = vec![("id", render::short_id(id).to_string())];
                 if let Some(t) = to {
                     attrs.push(("to_project", t.to_string()));
                 }
@@ -938,7 +932,10 @@ fn run_move(
                 "{}",
                 render::render_action_result(
                     "error",
-                    &[("message", "Either --id or --from must be provided".to_string())]
+                    &[(
+                        "message",
+                        "Either --id or --from must be provided".to_string()
+                    )]
                 )
             );
             Ok(())
@@ -1014,7 +1011,10 @@ fn run_copy(
                 "{}",
                 render::render_action_result(
                     "error",
-                    &[("message", "Either --id or --from must be provided".to_string())]
+                    &[(
+                        "message",
+                        "Either --id or --from must be provided".to_string()
+                    )]
                 )
             );
             Ok(())
@@ -1058,8 +1058,7 @@ mod tests {
     /// suppresses the reflection hint.
     #[test]
     fn parse_store_scope_project_explicit() {
-        let cli =
-            Cli::try_parse_from(["memory", "store", "hi", "--scope", "project"]).unwrap();
+        let cli = Cli::try_parse_from(["memory", "store", "hi", "--scope", "project"]).unwrap();
         match cli {
             Cli::Store { scope, .. } => assert_eq!(scope, Some(MemoryScope::Project)),
             _ => panic!("expected Store variant"),
@@ -1206,8 +1205,7 @@ mod tests {
         let s_ok = render::render_action_result("forgot", &[("id", "a4936eff".to_string())]);
         assert_eq!(s_ok, r#"<result status="forgot" id="a4936eff"/>"#);
 
-        let s_miss =
-            render::render_action_result("not_found", &[("id", "deadbeef".to_string())]);
+        let s_miss = render::render_action_result("not_found", &[("id", "deadbeef".to_string())]);
         assert_eq!(s_miss, r#"<result status="not_found" id="deadbeef"/>"#);
     }
 

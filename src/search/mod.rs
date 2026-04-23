@@ -146,7 +146,9 @@ pub fn hybrid_search(
     apply_scope_boosts(
         &mut results,
         opts.current_project.is_some().then_some(opts.boost_factor),
-        opts.global_project.is_some().then_some(opts.global_boost_factor),
+        opts.global_project
+            .is_some()
+            .then_some(opts.global_boost_factor),
     );
 
     if let Some(op) = opts.only_project {
@@ -216,7 +218,13 @@ mod tests {
     /// Build a test-only `SearchResult` with a fixed RRF score and scope
     /// flags. Avoids constructing full embeddings — the boost logic only
     /// reads score + scope flags.
-    fn mk_result(id: &str, project: Option<&str>, score: f32, cwd: &str, global: &str) -> SearchResult {
+    fn mk_result(
+        id: &str,
+        project: Option<&str>,
+        score: f32,
+        cwd: &str,
+        global: &str,
+    ) -> SearchResult {
         let memory = Memory::new(
             format!("content-{id}"),
             None,
@@ -246,14 +254,35 @@ mod tests {
     #[test]
     fn apply_scope_boosts_orders_current_then_global_then_other() {
         let mut results = vec![
-            mk_result("other", Some("github.com/other/repo"), 0.1, "agent-memory", "__global__"),
-            mk_result("global", Some("__global__"), 0.1, "agent-memory", "__global__"),
-            mk_result("current", Some("agent-memory"), 0.1, "agent-memory", "__global__"),
+            mk_result(
+                "other",
+                Some("github.com/other/repo"),
+                0.1,
+                "agent-memory",
+                "__global__",
+            ),
+            mk_result(
+                "global",
+                Some("__global__"),
+                0.1,
+                "agent-memory",
+                "__global__",
+            ),
+            mk_result(
+                "current",
+                Some("agent-memory"),
+                0.1,
+                "agent-memory",
+                "__global__",
+            ),
         ];
         apply_scope_boosts(&mut results, Some(1.5), Some(1.25));
         assert_eq!(results[0].memory.project.as_deref(), Some("agent-memory"));
         assert_eq!(results[1].memory.project.as_deref(), Some("__global__"));
-        assert_eq!(results[2].memory.project.as_deref(), Some("github.com/other/repo"));
+        assert_eq!(
+            results[2].memory.project.as_deref(),
+            Some("github.com/other/repo")
+        );
     }
 
     /// A strong cross-project hit (base score well above the tied trio) still
@@ -261,8 +290,20 @@ mod tests {
     #[test]
     fn strong_cross_project_can_still_out_rank_current_after_boost() {
         let mut results = vec![
-            mk_result("strong-other", Some("github.com/other/repo"), 1.0, "agent-memory", "__global__"),
-            mk_result("weak-current", Some("agent-memory"), 0.5, "agent-memory", "__global__"),
+            mk_result(
+                "strong-other",
+                Some("github.com/other/repo"),
+                1.0,
+                "agent-memory",
+                "__global__",
+            ),
+            mk_result(
+                "weak-current",
+                Some("agent-memory"),
+                0.5,
+                "agent-memory",
+                "__global__",
+            ),
         ];
         apply_scope_boosts(&mut results, Some(1.5), Some(1.25));
         // weak-current boosted to 0.75; strong-other stays at 1.0 → other wins.
@@ -292,8 +333,20 @@ mod tests {
     #[test]
     fn apply_scope_boosts_global_only_elevates_global_memories() {
         let mut results = vec![
-            mk_result("other", Some("github.com/other/repo"), 0.2, "agent-memory", "__global__"),
-            mk_result("global", Some("__global__"), 0.2, "agent-memory", "__global__"),
+            mk_result(
+                "other",
+                Some("github.com/other/repo"),
+                0.2,
+                "agent-memory",
+                "__global__",
+            ),
+            mk_result(
+                "global",
+                Some("__global__"),
+                0.2,
+                "agent-memory",
+                "__global__",
+            ),
         ];
         apply_scope_boosts(&mut results, None, Some(1.25));
         assert_eq!(results[0].memory.project.as_deref(), Some("__global__"));

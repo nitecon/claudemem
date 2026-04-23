@@ -222,8 +222,7 @@ impl MemoryServer {
             return Self::err_xml(e);
         }
 
-        let mut attrs: Vec<(&str, String)> =
-            vec![("id", render::short_id(&memory.id).to_string())];
+        let mut attrs: Vec<(&str, String)> = vec![("id", render::short_id(&memory.id).to_string())];
         if let Some(p) = memory.project.as_deref() {
             attrs.push(("project", p.to_string()));
         }
@@ -340,7 +339,10 @@ impl MemoryServer {
         } else {
             render::render_action_result(
                 "error",
-                &[("message", "Either 'id' or 'query' must be provided".to_string())],
+                &[(
+                    "message",
+                    "Either 'id' or 'query' must be provided".to_string(),
+                )],
             )
         }
     }
@@ -486,10 +488,7 @@ impl MemoryServer {
                     return render::render_ambiguous(raw, &cands);
                 }
                 Ok(ResolvedId::NotFound) => {
-                    return render::render_action_result(
-                        "not_found",
-                        &[("id", raw.to_string())],
-                    );
+                    return render::render_action_result("not_found", &[("id", raw.to_string())]);
                 }
                 Err(e) => return Self::err_xml(e),
             },
@@ -523,10 +522,7 @@ impl MemoryServer {
                     return render::render_ambiguous(raw, &cands);
                 }
                 Ok(ResolvedId::NotFound) => {
-                    return render::render_action_result(
-                        "not_found",
-                        &[("id", raw.to_string())],
-                    );
+                    return render::render_action_result("not_found", &[("id", raw.to_string())]);
                 }
                 Err(e) => return Self::err_xml(e),
             },
@@ -642,7 +638,10 @@ fn run_move(
         }
         (None, None) => render::render_action_result(
             "error",
-            &[("message", "Either 'id' or 'from' must be provided".to_string())],
+            &[(
+                "message",
+                "Either 'id' or 'from' must be provided".to_string(),
+            )],
         ),
     }
 }
@@ -725,7 +724,10 @@ fn run_copy(
         }
         (None, None) => render::render_action_result(
             "error",
-            &[("message", "Either 'id' or 'from' must be provided".to_string())],
+            &[(
+                "message",
+                "Either 'id' or 'from' must be provided".to_string(),
+            )],
         ),
     }
 }
@@ -825,9 +827,8 @@ fn results_hint(
 #[tool_handler]
 impl ServerHandler for MemoryServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(
-                "Persistent memory system for AI coding agents. All tools return light-XML \
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+            "Persistent memory system for AI coding agents. All tools return light-XML \
                  text (sectioned tags with numbered content lines — no JSON). \
                  memory_store saves context (auto-tagged with cwd project), \
                  memory_search and memory_context rank with a current-project boost and \
@@ -838,6 +839,6 @@ impl ServerHandler for MemoryServer {
                  memory_prune cleans stale memories. memory_projects lists distinct project \
                  idents (spot aliases), memory_move reassigns the project ident on memories \
                  (single id or bulk from/to), memory_copy duplicates memories under a new ident.",
-            )
+        )
     }
 }
