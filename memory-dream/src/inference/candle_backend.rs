@@ -111,12 +111,9 @@ pub(crate) fn detect_architecture(config_path: &Path) -> Result<Architecture, In
         .model_type
         .clone()
         .or_else(|| c.architectures.first().cloned())
-        .ok_or_else(|| {
-            InferenceError::LoadFailed {
-                file: config_path.to_path_buf(),
-                reason: "config.json has neither `model_type` nor `architectures[]`"
-                    .to_string(),
-            }
+        .ok_or_else(|| InferenceError::LoadFailed {
+            file: config_path.to_path_buf(),
+            reason: "config.json has neither `model_type` nor `architectures[]`".to_string(),
         })?;
 
     // Normalize: lowercase, strip trailing "forcausallm" if present.
@@ -227,13 +224,12 @@ impl CandleInference {
         // under the mapping. The dream flow treats the cache directory as
         // read-only — no concurrent writer. The perf win (avoiding a full
         // multi-GB read into RAM) is worth the contract.
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[&weights_path], DType::F32, &device)
-        }
-        .map_err(|e| InferenceError::LoadFailed {
-            file: weights_path.clone(),
-            reason: format!("load safetensors: {e}"),
-        })?;
+        let vb =
+            unsafe { VarBuilder::from_mmaped_safetensors(&[&weights_path], DType::F32, &device) }
+                .map_err(|e| InferenceError::LoadFailed {
+                file: weights_path.clone(),
+                reason: format!("load safetensors: {e}"),
+            })?;
 
         let config_path = model_dir.join("config.json");
         let (backend, bos_token_id, arch_label) = match arch {
@@ -279,23 +275,21 @@ fn load_gemma3(
     vb: VarBuilder,
     _device: &Device,
 ) -> Result<(Backend, Option<u32>, &'static str), InferenceError> {
-    let body =
-        std::fs::read_to_string(config_path).map_err(|e| InferenceError::LoadFailed {
-            file: config_path.to_path_buf(),
-            reason: format!("read gemma3 config: {e}"),
-        })?;
+    let body = std::fs::read_to_string(config_path).map_err(|e| InferenceError::LoadFailed {
+        file: config_path.to_path_buf(),
+        reason: format!("read gemma3 config: {e}"),
+    })?;
     let cfg: gemma3_mod::Config =
         serde_json::from_str(&body).map_err(|e| InferenceError::LoadFailed {
             file: config_path.to_path_buf(),
             reason: format!("parse gemma3 config: {e}"),
         })?;
 
-    let model = gemma3_mod::Model::new(false, &cfg, vb).map_err(|e| {
-        InferenceError::LoadFailed {
+    let model =
+        gemma3_mod::Model::new(false, &cfg, vb).map_err(|e| InferenceError::LoadFailed {
             file: config_path.to_path_buf(),
             reason: format!("gemma3 model load: {e}"),
-        }
-    })?;
+        })?;
 
     let eos_token_id = lookup_eos_from_config(config_path).ok().flatten();
     let bos_token_id = lookup_bos_from_config(config_path).ok().flatten();
@@ -317,11 +311,10 @@ fn load_llama(
     vb: VarBuilder,
     device: &Device,
 ) -> Result<(Backend, Option<u32>, &'static str), InferenceError> {
-    let body =
-        std::fs::read_to_string(config_path).map_err(|e| InferenceError::LoadFailed {
-            file: config_path.to_path_buf(),
-            reason: format!("read llama config: {e}"),
-        })?;
+    let body = std::fs::read_to_string(config_path).map_err(|e| InferenceError::LoadFailed {
+        file: config_path.to_path_buf(),
+        reason: format!("read llama config: {e}"),
+    })?;
     let llama_config: LlamaConfig =
         serde_json::from_str(&body).map_err(|e| InferenceError::LoadFailed {
             file: config_path.to_path_buf(),
@@ -398,9 +391,7 @@ fn lookup_bos_from_config(config_path: &Path) -> Result<Option<u32>, InferenceEr
 fn extract_u32(v: Option<serde_json::Value>) -> Option<u32> {
     match v? {
         serde_json::Value::Number(n) => n.as_u64().map(|v| v as u32),
-        serde_json::Value::Array(arr) => arr
-            .into_iter()
-            .find_map(|x| x.as_u64().map(|v| v as u32)),
+        serde_json::Value::Array(arr) => arr.into_iter().find_map(|x| x.as_u64().map(|v| v as u32)),
         _ => None,
     }
 }
@@ -461,12 +452,7 @@ impl Inference for CandleInference {
                 .and_then(|t| t.unsqueeze(0))
                 .map_err(|e| InferenceError::GenerationFailed(format!("build input: {e}")))?;
 
-            let logits = forward(
-                &mut state.backend,
-                &input,
-                pos_offset,
-                llama_cache.as_mut(),
-            )?;
+            let logits = forward(&mut state.backend, &input, pos_offset, llama_cache.as_mut())?;
 
             // After normalization below, logits are (vocab,). The LogitsProcessor
             // API wants a 1-D tensor of per-token scores.

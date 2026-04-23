@@ -59,9 +59,7 @@ pub enum InferenceError {
     /// The config's `model_type` is recognized by HuggingFace but not yet
     /// wired into our dispatch table. Surfacing this cleanly lets us land
     /// architectures one at a time without forking the CLI.
-    #[error(
-        "unsupported model architecture '{0}'; supported: gemma3, llama (TinyLlama, SmolLM)"
-    )]
+    #[error("unsupported model architecture '{0}'; supported: gemma3, llama (TinyLlama, SmolLM)")]
     ArchUnsupported(String),
 
     /// The caller asked for a device (Metal/CUDA) that isn't usable on this
@@ -187,11 +185,9 @@ mod tests {
         // Smoke: construction against a non-existent path surfaces a clean
         // ModelMissing (no candle load is attempted). Detailed load-failure
         // tests live in `candle_backend::tests`.
-        let err = CandleInference::new(
-            "/tmp/definitely-not-a-real-path-xyz",
-            DevicePreference::Cpu,
-        )
-        .unwrap_err();
+        let err =
+            CandleInference::new("/tmp/definitely-not-a-real-path-xyz", DevicePreference::Cpu)
+                .unwrap_err();
         match err {
             InferenceError::ModelMissing { .. } => {}
             other => panic!("expected ModelMissing, got {other:?}"),
