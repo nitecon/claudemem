@@ -350,6 +350,8 @@ Use `memory copy` instead of `memory move` when you want the memory available un
 
 All commands emit **light-XML** — grouped section tags with numbered content lines. No JSON. The shape is compact on purpose: tags give the agent a structural signal while the payload stays plain lines so token overhead is minimal.
 
+Content bodies are **not** entity-escaped. Angle brackets, ampersands, and quotes pass through raw so guidance text like `` `memory get <id>` `` renders readably instead of as `&lt;id&gt;`. The only escape is `"` → `&quot;` inside attribute values (needed so the `"..."` delimiter isn't broken).
+
 ### `context` / `search` / `recall`
 
 ```
@@ -364,12 +366,14 @@ All commands emit **light-XML** — grouped section tags with numbered content l
 1. colorithmic: k-means Euclidean beats OKLab on OPT [quantization] (ID:23d0142a)
 </other_projects>
 <hint>2 of 4 results are global-scope preferences (apply across all projects). Treat them as directives, not suggestions.</hint>
+<usage>IDs are 8-char prefixes. Use `memory get <id>` for full content. Sections: project_memories=current repo, general_knowledge=user-wide directives, other_projects=prior art.</usage>
 ```
 
 - `<project_memories>` — hits tagged with the current (cwd-derived) project.
 - `<general_knowledge>` — hits tagged with the `__global__` sentinel (universal preferences, 1.25× boost).
 - `<other_projects>` — hits from other projects, prefixed with the originating project ident. Treat as prior art.
 - `<hint>` — reflection / directive prompt. Only emitted when it has something to say.
+- `<usage>` — static legend documenting short-ID semantics and section meanings. Emitted unconditionally on every multi-memory read (`context`, `search`, `recall`, `list`) — including zero-result runs — so cold callers always have the key in reach. Positioned at the bottom so structured data comes first.
 
 Empty sections are elided. A query with zero global-scope hits during a scoped retrieval triggers a reflection-style `<hint>` nudging the agent to confirm no universal preference applies before acting.
 
@@ -422,6 +426,7 @@ Plain light-XML blocks optimized for readability:
 1.*(feedback) agent-memory [workflow,pr] (ID:a4936eff): User never wants PRs opened unless they explicitly ask.
 2. (user) colorithmic [setup] (ID:b12c3d4e): Prefer k-means Euclidean over OKLab for OPT quantization.
 </memories>
+<usage>IDs are 8-char prefixes. Use `memory get <id>` for full content. Sections: project_memories=current repo, general_knowledge=user-wide directives, other_projects=prior art.</usage>
 ```
 
 ```
@@ -432,7 +437,7 @@ Plain light-XML blocks optimized for readability:
 </projects>
 ```
 
-A leading `*` marks the current cwd-derived project. An empty list collapses to a self-closing `<memories count="0"/>` or `<projects count="0"/>`.
+A leading `*` marks the current cwd-derived project. An empty list collapses to a self-closing `<memories count="0"/>` or `<projects count="0"/>`. `memory list` also emits the `<usage>` legend (it's a multi-memory read); `memory projects` does not (it's a utility listing of idents, not a memory read).
 
 ## Auto-update
 

@@ -30,11 +30,14 @@
 //! 1. colorithmic: preview text [tag1] (ID:23d0142a)
 //! </other_projects>
 //! <hint>Optional reflection prompt.</hint>
+//! <usage>IDs are 8-char prefixes. Use `memory get <id>` for full content. ...</usage>
 //! ```
 //!
 //! Sections are elided when empty. Mutation commands use a single self-closing
 //! `<result .../>` line. `memory get` uses a `<memory>` wrapper. Ambiguous
 //! short-ID resolution produces an `<ambiguous>` block with numbered candidates.
+//! Multi-memory reads (context/search/recall/list) append a `<usage>` legend
+//! so a cold agent knows how to interpret the short IDs and section tags.
 
 use crate::db::models::Memory;
 use crate::search::SearchResult;
@@ -281,6 +284,21 @@ pub fn render_hint(text: &str) -> String {
     } else {
         format!("<hint>{text}</hint>")
     }
+}
+
+/// Static legend emitted on every multi-memory read (`context`, `search`,
+/// `recall`, `list`). A cold agent hitting one of those commands for the
+/// first time needs to know: (a) the displayed IDs are 8-char prefixes,
+/// (b) how to pull full content, (c) what the section tags mean. This
+/// ships on every call so the copy is deliberately terse.
+///
+/// Positioned at the bottom of the output (after `<hint>` if present) so
+/// the structured data comes first and the legend acts as a safety net
+/// for new callers rather than noise for experienced ones.
+pub fn render_usage_legend() -> &'static str {
+    "<usage>IDs are 8-char prefixes. Use `memory get <id>` for full content. \
+Sections: project_memories=current repo, general_knowledge=user-wide directives, \
+other_projects=prior art.</usage>"
 }
 
 /// Render an ambiguous short-ID lookup as an `<ambiguous>` block with
@@ -547,6 +565,18 @@ mod tests {
         assert_eq!(escape_attr("plain"), "plain");
         assert_eq!(escape_attr("a<b>&c"), "a<b>&c");
         assert_eq!(escape_attr("a\"b"), "a&quot;b");
+    }
+
+    #[test]
+    fn render_usage_legend_mentions_get_and_sections() {
+        let u = render_usage_legend();
+        assert!(u.starts_with("<usage>") && u.ends_with("</usage>"));
+        assert!(u.contains("memory get <id>"));
+        assert!(u.contains("project_memories"));
+        assert!(u.contains("general_knowledge"));
+        assert!(u.contains("other_projects"));
+        // Legend itself must not be entity-escaped — it contains `<id>`.
+        assert!(!u.contains("&lt;"));
     }
 
     #[test]

@@ -494,6 +494,7 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
                 "{}",
                 render::render_memory_list(&memories, cwd_project.as_deref())
             );
+            println!("{}", render::render_usage_legend());
         }
         Cli::Forget { id, query } => {
             if let Some(id) = id {
@@ -610,6 +611,7 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
                 "{}",
                 render::render_memory_list(&memories, cwd_project.as_deref())
             );
+            println!("{}", render::render_usage_legend());
         }
         Cli::Move {
             id,
@@ -673,7 +675,11 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
 }
 
 /// Print a ranked result set (`search`/`context`) as grouped light-XML.
-/// Delegates to the `render` module and appends the reflection hint inline.
+/// Delegates to the `render` module, appends the reflection hint, and emits
+/// the `<usage>` legend at the bottom so a cold agent knows how to consume
+/// the output (short-ID semantics, section meanings, how to fetch full
+/// content). The legend ships unconditionally — even on zero-result runs —
+/// because that's when a new caller most needs the guidance.
 fn print_ranked(results: &[SearchResult], boosts: &BoostConfig<'_>) {
     let total = results.len();
     let globals = results.iter().filter(|r| r.is_global).count();
@@ -691,6 +697,7 @@ fn print_ranked(results: &[SearchResult], boosts: &BoostConfig<'_>) {
     } else {
         println!("{rendered}");
     }
+    println!("{}", render::render_usage_legend());
 }
 
 /// Resolve a user-supplied `--id` argument for move/copy subcommands through

@@ -288,7 +288,11 @@ impl MemoryServer {
             Err(e) => return Self::err_xml(e),
         };
 
-        render::render_memory_list(&memories, cwd_project.as_deref())
+        format!(
+            "{}\n{}",
+            render::render_memory_list(&memories, cwd_project.as_deref()),
+            render::render_usage_legend()
+        )
     }
 
     /// Remove memories by ID or by search query. Use with an ID (full UUID or short prefix)
@@ -766,6 +770,9 @@ fn resolve_boosts<'a>(
 
 /// Render a ranked result set as light-XML with the same reflection hint the
 /// CLI emits. Factored out so `search` and `context` share the rendering path.
+/// Also appends the `<usage>` legend at the bottom so MCP callers get the
+/// same short-ID / section-tag guidance the CLI emits — ships unconditionally
+/// (even on zero-result runs) because that's when new callers need it most.
 fn render_ranked_xml(results: &[SearchResult], current_project: Option<&str>) -> String {
     let total = results.len();
     let globals = results.iter().filter(|r| r.is_global).count();
@@ -776,11 +783,12 @@ fn render_ranked_xml(results: &[SearchResult], current_project: Option<&str>) ->
     };
     let hint = results_hint(cross, globals, total, current_project);
     let rendered = render::render_search_results(results, current_project, hint.as_deref());
-    if rendered.is_empty() {
+    let body = if rendered.is_empty() {
         "<results count=\"0\"/>".to_string()
     } else {
         rendered
-    }
+    };
+    format!("{body}\n{}", render::render_usage_legend())
 }
 
 /// See `crate::cli::results_hint` for the full doc; kept in sync verbatim.
