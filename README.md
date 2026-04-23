@@ -86,6 +86,7 @@ Calling the `memory` binary directly is the recommended approach. It is just as 
 |---------|----------|
 | `memory setup` | Interactive checklist: shows the install state of each component (rules, skill) and lets you pick which to (re)install |
 | `memory setup rules [flags]` | Inject the `<memory-rules>` block into known agent rule files (CLAUDE.md, GEMINI.md, AGENTS.md) |
+| `memory setup rules --remove` | Strip the `<memory-rules>` block and remove the paired `autoMemoryEnabled` key from Claude `settings.json` |
 | `memory setup skill [flags]` | Install `~/.claude/skills/agent-memory/SKILL.md` so Claude Code auto-loads a ~100-token description that nudges the model toward the CLI |
 | `memory setup all [-y]` | Run rules → skill non-interactively (use `-y` / `--yes` to skip confirmation) |
 
@@ -100,6 +101,7 @@ memory setup rules --all         # update every detected file
 memory setup rules --target ~/.claude/CLAUDE.md
 memory setup rules --dry-run     # preview, don't write
 memory setup rules --print       # emit just the <memory-rules> block
+memory setup rules --all --remove  # uninstall: strip block + settings.json key
 
 # Skill only — installs to ~/.claude/skills/agent-memory/SKILL.md.
 memory setup skill
@@ -111,6 +113,8 @@ memory setup all --yes
 ```
 
 `memory setup rules` writes a `<memory-rules>…</memory-rules>` block (loose-XML markers so it is easy to locate and update) and saves a `.bak` sibling before each modification. Re-running replaces the block in place — your agent rule files never accumulate duplicates. If the companion [`agent-tools setup rules`](https://github.com/nitecon/agent-tools) block (`<agent-tools-rules>…</agent-tools-rules>`) is already present in the file, the memory block is inserted directly after it so the two protocols stay grouped at the top; otherwise it is prepended.
+
+**Interaction with Claude Code auto-memory.** When the target is a Claude `CLAUDE.md`, `memory setup rules` also merges `"autoMemoryEnabled": false` into the matching `settings.json` (`~/.claude/settings.json` for user scope, `./.claude/settings.json` for project scope). The installed rules block directs the agent to route every memory operation through the `memory` CLI, so leaving Claude Code's native auto-memory enabled would cause the agent to write into both Claude's own `MEMORY.md` and this tool's SQLite store simultaneously — silent duplication the rules block is specifically designed to avoid. The merge is conservative: existing keys (`theme`, `model`, `hooks`, permissions, etc.) are preserved, corrupt JSON fails loudly instead of being overwritten, and re-runs are no-ops once the key is already at `false`. `memory setup rules --remove` strips the block from CLAUDE.md and deletes the key from `settings.json` — deletion rather than forcing `true` so the user's prior state is restored rather than overwritten.
 
 `memory setup skill` writes a single SKILL.md whose frontmatter `description` is always loaded into Claude Code sessions (~100 tokens), pulling the model toward `memory context` at task start and `memory store` at task end. The full body only loads on demand when the skill is picked.
 
@@ -298,6 +302,7 @@ memory setup rules --all                  # rules: update every detected file
 memory setup rules --target ~/.claude/CLAUDE.md
 memory setup rules --dry-run              # rules: preview, don't write
 memory setup rules --print                # rules: print <memory-rules> block
+memory setup rules --all --remove         # rules: strip block + clear settings.json key
 memory setup skill                        # install ~/.claude/skills/agent-memory/SKILL.md
 memory setup skill --dry-run              # skill: preview SKILL.md
 memory setup skill --print                # skill: print SKILL.md to stdout
