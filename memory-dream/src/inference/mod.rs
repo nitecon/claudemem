@@ -134,6 +134,33 @@ impl CandleInference {
     }
 }
 
+/// Always returns [`InferenceError::ModelMissing`] — used by the CLI when
+/// the candle backend couldn't initialize (e.g. no model pulled yet) so the
+/// dream orchestrator can still run a dedup-only fallback pass. Every
+/// `generate` call surfaces the same error, which the condense module
+/// converts into "keep the raw content" per its fallback contract.
+#[derive(Debug)]
+pub struct NoopInference {
+    reason: String,
+}
+
+impl NoopInference {
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
+
+impl Inference for NoopInference {
+    fn generate(&self, _prompt: &str, _max_tokens: u32) -> Result<String, InferenceError> {
+        Err(InferenceError::ModelMissing {
+            path: std::path::PathBuf::new(),
+            detail: self.reason.clone(),
+        })
+    }
+}
+
 impl Inference for CandleInference {
     fn generate(&self, _prompt: &str, _max_tokens: u32) -> Result<String, InferenceError> {
         // Honest stub: the real sampling loop is a follow-up user action
