@@ -1,20 +1,17 @@
-[package]
-name = "agent-memory"
+[workspace]
+resolver = "2"
+members = ["memory"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+repository = "https://github.com/nitecon/agent-memory"
 description = "Persistent hybrid-search memory system for AI coding agents"
 
-[[bin]]
-name = "memory"
-path = "src/main.rs"
-
-[dependencies]
+[workspace.dependencies]
 # CLI
 clap = { version = "4", features = ["derive"] }
-
-# MCP server
-rmcp = { version = "1", features = ["server", "transport-io"] }
-schemars = "1"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -38,7 +35,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 dirs = "6"
 
-# Auto-updater
+# HTTP + archive handling (updater + model pull)
 reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-features = false }
 semver = "1"
 flate2 = "1"

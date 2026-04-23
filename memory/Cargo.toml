@@ -1,0 +1,52 @@
+[package]
+name = "agent-memory"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "agent_memory"
+path = "src/lib.rs"
+
+[[bin]]
+name = "memory"
+path = "src/main.rs"
+
+[dependencies]
+# CLI
+clap = { workspace = true }
+
+# MCP server
+rmcp = { version = "1", features = ["server", "transport-io"] }
+schemars = "1"
+
+# Async runtime
+tokio = { workspace = true }
+
+# Database
+rusqlite = { workspace = true }
+
+# Embeddings
+fastembed = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Utilities
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+dirs = { workspace = true }
+
+# Auto-updater
+reqwest = { workspace = true }
+semver = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
+zip = { workspace = true }
