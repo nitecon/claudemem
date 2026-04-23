@@ -5,6 +5,7 @@ mod embedding;
 mod error;
 mod mcp;
 mod project;
+mod render;
 mod search;
 mod setup;
 mod updater;

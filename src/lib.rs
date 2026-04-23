@@ -3,4 +3,5 @@ pub mod db;
 pub mod embedding;
 pub mod error;
 pub mod project;
+pub mod render;
 pub mod search;
