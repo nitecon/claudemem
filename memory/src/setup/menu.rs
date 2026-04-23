@@ -181,7 +181,7 @@ fn run_components(components: &[Component]) -> Result<()> {
             // Rules: pass `all=true` so detected files are updated without a
             // second interactive prompt — the menu's selection step already
             // got user consent for *which components* to install.
-            Component::Rules => rules::run(None, true, false, false),
+            Component::Rules => rules::run(None, true, false, false, false),
             Component::Skill => skill::run(false, false),
         };
         if let Err(e) = result {

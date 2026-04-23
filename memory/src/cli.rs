@@ -312,6 +312,11 @@ pub enum SetupCommands {
         /// Print the rules block to stdout and exit (no file IO).
         #[arg(long)]
         print: bool,
+        /// Strip the `<memory-rules>` block from detected rule files and
+        /// remove the paired `autoMemoryEnabled` key from any Claude
+        /// `settings.json`. Inverse of the default install.
+        #[arg(long)]
+        remove: bool,
     },
 
     /// Install a Claude Code skill at `~/.claude/skills/agent-memory/SKILL.md`
@@ -741,7 +746,8 @@ fn execute_setup(command: Option<SetupCommands>) -> anyhow::Result<()> {
             all,
             dry_run,
             print,
-        }) => rules::run(target, all, dry_run, print),
+            remove,
+        }) => rules::run(target, all, dry_run, print, remove),
         Some(SetupCommands::Skill { dry_run, print }) => skill::run(dry_run, print),
         Some(SetupCommands::All { yes }) => menu::run_all(yes),
     }

@@ -9,7 +9,17 @@
 //! sibling `agent-tools setup rules` command writes one), the memory block is
 //! inserted directly after it so the two protocols stay grouped at the top of
 //! the file. Otherwise, the memory block is prepended.
+//!
+//! Claude Code coupling: when the target rule file is a Claude `CLAUDE.md`
+//! (user or project scope), we also merge `"autoMemoryEnabled": false` into
+//! the matching `settings.json`. The installed rules block redirects the
+//! agent to route ALL memory operations through the `memory` CLI, so leaving
+//! Claude Code's native auto-memory on would cause the agent to write into
+//! two stores in parallel (Claude's own `MEMORY.md` and this tool's SQLite
+//! DB), producing silent duplication and drift. The `--remove` path reverses
+//! the merge by deleting the key rather than forcing it to `true`.
 
+use crate::setup::settings_json::{self, SettingsOutcome};
 use anyhow::{Context, Result};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -154,7 +164,22 @@ memory store "User never wants PRs opened unless they explicitly ask" \
 "#;
 
 /// Entry point invoked from `cli.rs` for `memory setup rules`.
-pub fn run(target: Option<PathBuf>, all: bool, dry_run: bool, print: bool) -> Result<()> {
+///
+/// Arguments:
+/// - `target` — explicit file path (bypasses auto-detection).
+/// - `all` — install to every detected rule file without prompting.
+/// - `dry_run` — print the would-be output and exit without writing.
+/// - `print` — emit the rules block to stdout and exit (no filesystem IO).
+/// - `remove` — inverse of install: strip the `<memory-rules>` block from
+///   each target and restore the prior state by also removing the
+///   `autoMemoryEnabled` key from any paired Claude `settings.json`.
+pub fn run(
+    target: Option<PathBuf>,
+    all: bool,
+    dry_run: bool,
+    print: bool,
+    remove: bool,
+) -> Result<()> {
     if print {
         print!("{}", build_block());
         return Ok(());
@@ -190,26 +215,53 @@ pub fn run(target: Option<PathBuf>, all: bool, dry_run: bool, print: bool) -> Re
     let block = build_block();
     let mut any_failed = false;
     for path in &chosen {
-        match inject(path, &block, dry_run) {
-            Ok(InjectOutcome::DryRun(preview)) => {
+        let result = if remove {
+            uninstall(path, dry_run).map(OperationOutcome::Remove)
+        } else {
+            inject(path, &block, dry_run).map(OperationOutcome::Install)
+        };
+        match result {
+            Ok(OperationOutcome::Install(InjectOutcome::DryRun(preview))) => {
                 println!("--- DRY RUN: {} ---", path.display());
                 print!("{preview}");
                 println!("--- end preview ---");
             }
-            Ok(InjectOutcome::Replaced { backup }) => {
+            Ok(OperationOutcome::Install(InjectOutcome::Replaced { backup })) => {
                 println!("Updated existing block in {}", path.display());
                 println!("  backup: {}", backup.display());
+                sync_auto_memory(path, AutoMemoryAction::Disable, dry_run, &mut any_failed);
             }
-            Ok(InjectOutcome::InsertedAfterSibling { backup }) => {
+            Ok(OperationOutcome::Install(InjectOutcome::InsertedAfterSibling { backup })) => {
                 println!(
                     "Inserted new block after <agent-tools-rules> in {}",
                     path.display()
                 );
                 println!("  backup: {}", backup.display());
+                sync_auto_memory(path, AutoMemoryAction::Disable, dry_run, &mut any_failed);
             }
-            Ok(InjectOutcome::Prepended { backup }) => {
+            Ok(OperationOutcome::Install(InjectOutcome::Prepended { backup })) => {
                 println!("Prepended new block to {}", path.display());
                 println!("  backup: {}", backup.display());
+                sync_auto_memory(path, AutoMemoryAction::Disable, dry_run, &mut any_failed);
+            }
+            Ok(OperationOutcome::Remove(RemoveOutcome::DryRun(preview))) => {
+                println!("--- DRY RUN (remove): {} ---", path.display());
+                print!("{preview}");
+                println!("--- end preview ---");
+            }
+            Ok(OperationOutcome::Remove(RemoveOutcome::Removed { backup })) => {
+                println!("Removed block from {}", path.display());
+                println!("  backup: {}", backup.display());
+                sync_auto_memory(path, AutoMemoryAction::Remove, dry_run, &mut any_failed);
+            }
+            Ok(OperationOutcome::Remove(RemoveOutcome::NotPresent)) => {
+                println!(
+                    "No <memory-rules> block in {} (nothing to remove)",
+                    path.display()
+                );
+                // Still attempt the settings.json key removal — a user who
+                // manually stripped the block may still have the key lingering.
+                sync_auto_memory(path, AutoMemoryAction::Remove, dry_run, &mut any_failed);
             }
             Err(e) => {
                 eprintln!("Failed to update {}: {e:#}", path.display());
@@ -264,6 +316,35 @@ enum InjectOutcome {
     Prepended { backup: PathBuf },
 }
 
+/// Result of an uninstall pass. Parallel to [`InjectOutcome`] but narrower:
+/// uninstall either emits a dry-run preview, a successful removal with a
+/// `.bak` sibling, or reports the block wasn't present to begin with.
+enum RemoveOutcome {
+    DryRun(String),
+    Removed {
+        backup: PathBuf,
+    },
+    /// Block markers not found. The caller still runs the paired
+    /// `settings.json` cleanup in case only the block was manually
+    /// stripped but the setting remained.
+    NotPresent,
+}
+
+/// Unifies install + uninstall so the dispatch loop in `run()` has one
+/// match to drive status output from.
+enum OperationOutcome {
+    Install(InjectOutcome),
+    Remove(RemoveOutcome),
+}
+
+/// Direction for the `settings.json` sync that pairs with each rule-file
+/// mutation. Install disables native auto-memory; remove strips the key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoMemoryAction {
+    Disable,
+    Remove,
+}
+
 fn inject(path: &Path, block: &str, dry_run: bool) -> Result<InjectOutcome> {
     let existing = std::fs::read_to_string(path).unwrap_or_default();
     let already_present = existing.contains(OPEN_MARKER) && existing.contains(CLOSE_MARKER);
@@ -297,6 +378,141 @@ enum InjectMode {
     Replaced,
     InsertedAfterSibling,
     Prepended,
+}
+
+/// Strip the `<memory-rules>` block from `path`, writing a `.bak` sibling
+/// first. Matches the semantics of [`inject`]: dry-run returns the computed
+/// output without touching the disk; real runs write atomically after backing
+/// up the original.
+///
+/// When the block markers are absent we short-circuit to `NotPresent` without
+/// writing a backup — the file is already in the desired post-remove state
+/// and creating a redundant `.bak` would only confuse the user.
+fn uninstall(path: &Path, dry_run: bool) -> Result<RemoveOutcome> {
+    let existing = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(RemoveOutcome::NotPresent),
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!("read rule file {}", path.display())))
+        }
+    };
+
+    let has_block = existing.contains(OPEN_MARKER) && existing.contains(CLOSE_MARKER);
+    if !has_block {
+        return Ok(RemoveOutcome::NotPresent);
+    }
+
+    let new_content = strip_block(&existing);
+    if dry_run {
+        return Ok(RemoveOutcome::DryRun(new_content));
+    }
+
+    let backup = backup_path(path);
+    std::fs::write(&backup, &existing)
+        .with_context(|| format!("write backup to {}", backup.display()))?;
+    std::fs::write(path, &new_content)
+        .with_context(|| format!("write updated file {}", path.display()))?;
+    Ok(RemoveOutcome::Removed { backup })
+}
+
+/// Remove the first `<memory-rules>…</memory-rules>` span from `existing`,
+/// along with at most one trailing newline so the file doesn't end up with
+/// a stray blank line where the block used to be. Pure helper so unit tests
+/// can verify the stripped output byte-for-byte.
+fn strip_block(existing: &str) -> String {
+    let open_idx = match existing.find(OPEN_MARKER) {
+        Some(i) => i,
+        None => return existing.to_string(),
+    };
+    let close_idx = match existing.find(CLOSE_MARKER) {
+        Some(i) => i,
+        None => return existing.to_string(),
+    };
+    let close_end = close_idx + CLOSE_MARKER.len();
+    let after_start = if existing[close_end..].starts_with('\n') {
+        close_end + 1
+    } else {
+        close_end
+    };
+    let before = &existing[..open_idx];
+    let after = &existing[after_start..];
+
+    // If the block was followed by a blank separator line (i.e. the
+    // install helpers inserted an extra `\n` between it and the next
+    // content), consume that too.
+    let trimmed_after = after.strip_prefix('\n').unwrap_or(after);
+
+    format!("{before}{trimmed_after}")
+}
+
+/// Drive the paired `settings.json` mutation after a successful rule-file
+/// change. Silent no-op for non-Claude rule files (GEMINI/AGENTS). Status
+/// is emitted as a light-XML `<setup .../>` line matching the existing
+/// installer output vocabulary.
+///
+/// Failures here do NOT unwind the rule-file mutation — the `.bak` sibling
+/// lets the user recover from that if needed. Instead we flag `any_failed`
+/// so the caller still exits non-zero, while the successfully-mutated rule
+/// file stays in place. This trade-off matches the existing loop semantics
+/// (per-target failures don't abort the whole batch).
+fn sync_auto_memory(
+    rule_file: &Path,
+    action: AutoMemoryAction,
+    dry_run: bool,
+    any_failed: &mut bool,
+) {
+    let Some(settings_path) = settings_json::settings_path_for_rule_file(rule_file) else {
+        // Non-Claude rule files have no matching settings.json — silent skip.
+        return;
+    };
+
+    if dry_run {
+        println!(
+            r#"<setup status="settings_dry_run" path="{}" key="{}" action="{}"/>"#,
+            settings_path.display(),
+            settings_json::AUTO_MEMORY_KEY,
+            match action {
+                AutoMemoryAction::Disable => "disable",
+                AutoMemoryAction::Remove => "remove",
+            }
+        );
+        return;
+    }
+
+    let outcome = match action {
+        AutoMemoryAction::Disable => settings_json::disable_auto_memory(&settings_path),
+        AutoMemoryAction::Remove => settings_json::remove_auto_memory(&settings_path),
+    };
+
+    match outcome {
+        Ok(state) => {
+            let status = match state {
+                SettingsOutcome::Created => "settings_created",
+                SettingsOutcome::Updated => "settings_updated",
+                SettingsOutcome::AlreadyCorrect => "settings_already_correct",
+                SettingsOutcome::Removed => "settings_key_removed",
+                SettingsOutcome::AlreadyAbsent => "settings_key_already_absent",
+            };
+            let value = match action {
+                AutoMemoryAction::Disable => "false",
+                AutoMemoryAction::Remove => "(removed)",
+            };
+            println!(
+                r#"<setup status="{}" path="{}" key="{}" value="{}"/>"#,
+                status,
+                settings_path.display(),
+                settings_json::AUTO_MEMORY_KEY,
+                value,
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "Failed to update settings.json at {}: {e:#}",
+                settings_path.display()
+            );
+            *any_failed = true;
+        }
+    }
 }
 
 /// Pure helper: build the new file body from existing content + the rules
@@ -539,5 +755,40 @@ mod tests {
     fn backup_path_appends_bak() {
         let p = PathBuf::from("/tmp/foo/CLAUDE.md");
         assert_eq!(backup_path(&p), PathBuf::from("/tmp/foo/CLAUDE.md.bak"));
+    }
+
+    /// `strip_block` must remove the markers AND one trailing newline so the
+    /// file doesn't accumulate blank lines after repeated install/remove
+    /// cycles. This is the inverse round-trip of `compute_new_content`.
+    #[test]
+    fn strip_block_removes_block_and_trailing_newline() {
+        let block = build_block();
+        let before_block = "# Header\n\n";
+        let after_block = "# Footer\n";
+        let installed = format!("{before_block}{block}\n{after_block}");
+        let stripped = strip_block(&installed);
+        assert_eq!(stripped, format!("{before_block}{after_block}"));
+        assert!(!stripped.contains(OPEN_MARKER));
+        assert!(!stripped.contains(CLOSE_MARKER));
+    }
+
+    /// Install → strip must return to the original content byte-for-byte
+    /// so users can cleanly back out of a rules install.
+    #[test]
+    fn install_then_strip_is_lossless() {
+        let block = build_block();
+        let original = "# Existing instructions\n\nfoo bar\n";
+        let (installed, _) = compute_new_content(original, &block, false, false);
+        let stripped = strip_block(&installed);
+        assert_eq!(stripped, original);
+    }
+
+    /// Stripping a file that never had the block must be a no-op rather than
+    /// a panic — `uninstall` short-circuits before calling `strip_block`,
+    /// but the pure helper still needs to behave sanely for defense in depth.
+    #[test]
+    fn strip_block_no_markers_returns_unchanged() {
+        let input = "# Just a header\n\nno markers here\n";
+        assert_eq!(strip_block(input), input);
     }
 }
