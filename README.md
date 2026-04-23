@@ -107,15 +107,30 @@ If you'd rather paste the block yourself, add the following to your global `CLAU
 
 **The "Memory First/Last" Rule:** Every task must begin with a `context` or `search` call and end with a `store` call if functionality changed.
 
+### Scope tiers
+
+Every memory is stored under one of two scopes; retrieval boosts both:
+
+| Scope                      | Boost  | When to use                                    |
+|----------------------------|--------|------------------------------------------------|
+| **Current project** (cwd)  | 1.5×   | Repo-specific decisions, patterns, bugs        |
+| **Global** (`__global__`)  | 1.25×  | Universal user preferences / directives        |
+| Other project              | 1.0×   | Surfaces only as prior art via the `hint` field |
+
+`store`, `search`, and `context` auto-detect the current project from the cwd's git remote. A single `context` call returns both current-project and global hits — no second query needed.
+
 ```bash
-# Context -- top-K relevant memories for a task (boost cwd project)
+# Context -- top-K relevant memories for a task (boost cwd + global)
 memory context "<task description>" -k <limit>
 
-# Search -- hybrid BM25 + vector search (boost cwd project)
+# Search -- hybrid BM25 + vector search (boost cwd + global)
 memory search "<query>" -k <limit>
 
-# Store -- save a new memory (project auto-detected)
+# Store -- save a new project-scoped memory (cwd auto-detected)
 memory store "<content>" -m <type> -t "<tags>"
+
+# Store -- save a universal preference (applies across every repo)
+memory store "<content>" -m <type> --scope global -t "<tags>"
 # types: user, feedback, project, reference
 
 # Get -- fetch full content for specific IDs (pair with brief search)
@@ -138,6 +153,24 @@ memory forget --id <uuid>
 
 # Prune -- decay stale/low-access memories
 memory prune --max-age-days 90 [--dry-run]
+```
+
+### Rule A -- Pre-action behavior recall (MANDATORY)
+
+Before starting any user-requested task, run one `memory context "<task>"` call first. A single call returns both global directives (1.25× boost) and project-specific directives (1.5× boost). Do not skip for "quick" tasks: directives the user has already stated must never need to be re-stated. If the `hint` field flags zero global-scope matches, pause and reflect — or ask before acting.
+
+### Rule B -- Post-action scope classification (MANDATORY)
+
+After completing an action, if the user stated or implied any directive, preference, or corrective rule during the session, you MUST store it and MUST classify its scope:
+
+- **Global** (`--scope global`) -- universal preference. Signals: "I always", "I never", "from now on", "I prefer", "don't ever", "whenever we", "in general".
+- **Project** (`--scope project`, the default) -- specific to this repo, service, or codebase. Signals: "in this repo", "for this service", "here we".
+- **Ambiguous** -- phrasing could reasonably apply either way. You MUST ask the user before storing. Do not silently default.
+
+Example:
+```bash
+memory store "User never wants PRs opened unless they explicitly ask" \
+  -m feedback --scope global -t "workflow,pr"
 ```
 </memory-rules>
 ````
@@ -185,6 +218,10 @@ This enables `/remember` and `/recall` slash commands.
 ```bash
 # Store a memory (project auto-detected from cwd's git remote)
 memory store "User prefers terse responses" --tags "preference" -m feedback
+
+# Store a universal preference (applies across every repo, 1.25× retrieval boost)
+memory store "User never wants PRs opened unless explicitly asked" \
+  -m feedback --scope global --tags "workflow,pr"
 
 # Hybrid search (BM25 + vector); brief output is the default, cwd project is boosted
 memory search "how does testing work"
@@ -247,20 +284,51 @@ memory setup skill --print                # skill: print SKILL.md to stdout
 memory setup all --yes                    # rules → skill, non-interactive
 ```
 
-## Project auto-detection and cross-project boost
+## Project & global scope tiers
 
-`store`, `search`, and `context` derive the current project identifier from the working directory's git remote and reduce it to the repository shortname (e.g. `git@github.com:nitecon/eventic.git` → `eventic`). SSH and HTTPS for the same repo produce the same ident. Non-git directories fall back to the directory basename. New memories are auto-tagged with this project unless you pass `--project` explicitly or `--no-project`.
+`store`, `search`, and `context` derive the current project identifier from the working directory's git remote and reduce it to the repository shortname (e.g. `git@github.com:nitecon/eventic.git` → `eventic`). SSH and HTTPS for the same repo produce the same ident. Non-git directories fall back to the directory basename. New memories are auto-tagged with this project unless you pass `--project` explicitly, `--no-project`, or `--scope global`.
 
 Shortname is deliberate so auto-derived idents match the hand-written shortnames most agents already use. The trade-off is that two repos with the same basename across different orgs will collide; in that case, tag them explicitly with `--project`.
 
-At query time, memories tagged with the current project receive a 1.5× score boost before re-sorting. The goal is to surface local context first while letting strong cross-project matches still appear as prior art. When the top-K contains cross-project results, the response includes a `hint` field that flags them so models treat those memories as general guidance rather than direct context.
+Retrieval applies two independent score boosts:
+
+| Scope | Boost | Meaning |
+|-------|-------|---------|
+| Current project (`project == cwd`) | **1.5×** | Local context — highest priority |
+| Global (`project == "__global__"`) | **1.25×** | Universal user preferences — surface in every repo |
+| Other project | 1.0× | Cross-project prior art; flagged via the `hint` field |
+
+A single `context` or `search` call returns hits from all three tiers; the response's `cross_project_count`, `global_scope_count`, and `hint` fields tell models how to weigh them. Strong cross-project matches can still out-rank weak current-project hits — the boosts tilt ties without hard-filtering prior art.
+
+### Global scope
+
+Global-scoped memories are stored under the reserved sentinel project ident `__global__`. Users opt in with `--scope global` on `memory store`:
+
+```bash
+memory store "Never open a PR unless explicitly asked" \
+  -m feedback --scope global --tags "workflow,pr"
+```
+
+The sentinel is reserved: passing `--project __global__` directly (or `memory move --to __global__`) is rejected with a clear error pointing users to `--scope global`. This keeps the sentinel load-bearing for retrieval behavior rather than a string users can accidentally collide into. When you run `memory projects`, `__global__` shows up as its own row so you can see how many universal preferences are on file.
+
+### Search flags
 
 | Flag | Behavior |
 |------|----------|
-| (none) | Boost cwd-derived project; cross-project results can still surface |
-| `-p <ident>` | Boost this project instead of cwd |
+| (none) | Boost cwd project (1.5×) **and** global sentinel (1.25×); cross-project results still surface |
+| `-p <ident>` | Boost this project (1.5×) instead of cwd; global boost unchanged |
 | `--only <ident>` | Hard filter: only return memories with this project |
-| `--no-project-boost` | Flat ranking; no boost, no filter |
+| `--no-project-boost` | Flat ranking; disables **both** boosts |
+
+### Store flags
+
+| Flag | Behavior |
+|------|----------|
+| (none) | Project scope; `project` auto-detected from cwd |
+| `--scope project` | Explicit project scope; suppresses the reflection hint even on `user`/`feedback` stores |
+| `--scope global` | Global scope; stores under the `__global__` sentinel |
+| `--project <ident>` | Override the project ident (must NOT equal `__global__`) |
+| `--no-project` | Store with no project tag (skips cwd auto-detect) |
 
 ## Migrating project idents
 
@@ -281,16 +349,19 @@ Use `memory copy` instead of `memory move` when you want the memory available un
 
 ## Output formats
 
-`search` and `context` return a wrapper object with a `hint` when cross-project results are present:
+`search` and `context` return a wrapper object with scope counts and a reflection `hint` whenever it would be informative:
 
 ```json
 {
   "results": [ ... ],
   "current_project": "github.com/acme/myapp.git",
   "cross_project_count": 2,
-  "hint": "2 of 5 results are cross-project (is_current_project=false). Use those as prior-art or general guidance, not direct context for 'github.com/acme/myapp.git'. Use `memory get <id>` for full content."
+  "global_scope_count": 1,
+  "hint": "2 of 5 results are cross-project (is_current_project=false). Use those as prior-art or general guidance, not direct context for 'github.com/acme/myapp.git'. Use `memory get <id>` for full content. 1 of 5 results are global-scope preferences (apply across all projects). Treat them as directives, not suggestions."
 }
 ```
+
+When `global_scope_count` is 0 during a scoped retrieval, the `hint` adds a reflection prompt asking the agent to confirm no universal preference applies before acting. `memory store` responses always include a `scope` field (`"project"` or `"global"`) and emit a `hint` when the memory type is `user` or `feedback` AND no explicit `--scope` was passed — so an ambiguous classification gets one soft nudge before the memory is locked in.
 
 Default format (`--format brief`) returns `id`, `tags`, `project`, `memory_type`, `match_quality` (high/medium/low), `is_current_project`, a `preview` (160 chars), and `content_len`. Use `--format full` when you need the full content, or pair `search --brief` with `memory get <id>` for a cheap two-stage retrieval.
 

@@ -7,9 +7,9 @@
 //!
 //! Components:
 //!   - `rules` — injects the `<memory-rules>…</memory-rules>` block into
-//!              known agent rule files (CLAUDE.md, GEMINI.md, AGENTS.md).
+//!     known agent rule files (CLAUDE.md, GEMINI.md, AGENTS.md).
 //!   - `skill` — installs `~/.claude/skills/agent-memory/SKILL.md` so
-//!              Claude Code sessions are nudged toward using the CLI.
+//!     Claude Code sessions are nudged toward using the CLI.
 //!
 //! The module only re-exports the public entry points used by `cli.rs`; the
 //! implementation details (markers, body templates, probe helpers) stay

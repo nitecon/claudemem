@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 /// surface in one screen.
 const SKILL_BODY: &str = r#"---
 name: agent-memory
-description: Persistent hybrid-search memory for AI coding agents via the `memory` CLI — semantic + BM25 search, current-project boost, cross-session recall. Apply the Memory First/Last rule: every task MUST begin with `memory context "<task>"` (pre-task recall) and end with `memory store` (post-task save) when functionality changed. Use for storing user preferences, project decisions, debugging insights, and reusable patterns; recalling prior context before reading code; and migrating/pruning memories across project idents.
+description: Persistent hybrid-search memory for AI coding agents via the `memory` CLI — semantic + BM25 search with project (1.5×) and global (1.25×) scope tiers, cross-session recall. Apply the Memory First/Last rule: every task MUST begin with `memory context "<task>"` (pre-task recall, returns both scopes in one call) and end with `memory store` (post-task save) when functionality changed, classifying scope as project or `--scope global` for universal preferences. Use for storing user directives, project decisions, debugging insights, and reusable patterns.
 allowed-tools: Bash(memory *)
 ---
 
@@ -37,12 +37,39 @@ Every task must begin with a `context` or `search` call and end with a `store`
 call if functionality changed. This is non-negotiable — it is how prior work
 informs the current session and how the current session informs future ones.
 
-## Project auto-detection
+## Project auto-detection and scope tiers
 
 `store`, `search`, and `context` derive the current project from the cwd's git
-remote (reduced to the repo shortname, e.g. `eventic`). Memories tagged with
-the current project receive a 1.5× retrieval boost; strong cross-project hits
-still surface as prior art (flagged via the `hint` field in JSON output).
+remote (reduced to the repo shortname, e.g. `eventic`). Retrieval applies two
+independent boosts:
+
+- **Current project** (cwd-derived ident): **1.5×** — local context wins ties.
+- **Global scope** (reserved `__global__` ident): **1.25×** — universal user
+  preferences surface in every repo, but still lose ties to strong local
+  context.
+- Other projects (`1.0×`) surface only as prior art, flagged via the `hint`
+  field in JSON output.
+
+A single `context` call returns both scopes at once — no second query.
+
+## Global vs project scope
+
+When saving a memory, classify its scope:
+
+- **Project** (default) — specific to this repo, service, or codebase. Stored
+  under the cwd-derived ident.
+- **Global** (`--scope global`) — universal preference. Stored under the
+  reserved sentinel `__global__` so retrieval boosts it across every repo.
+
+Signals for global: "I always / never", "from now on", "I prefer", "whenever
+we", "in general" — any phrasing that reads like a personal policy. Signals
+for project: "in this repo", "for this service", "here we". When the phrasing
+is ambiguous, **MUST ask** the user before storing — don't silently default.
+
+```bash
+memory store "User never wants PRs opened unless they explicitly ask" \
+  -m feedback --scope global -t "workflow,pr"
+```
 
 ## Pre-task recall
 
@@ -59,7 +86,8 @@ content for the handful you actually need.
 ## Post-task save
 
 ```bash
-memory store "<content>" -m <type> -t "<tags>"   # auto-detects project
+memory store "<content>" -m <type> -t "<tags>"                  # project-scoped (default)
+memory store "<content>" -m <type> --scope global -t "<tags>"   # universal preference
 # types: user, feedback, project, reference
 ```
 
@@ -242,6 +270,34 @@ mod tests {
                 "skill body must document the `{ty}` memory type"
             );
         }
+    }
+
+    /// Global-scope surfaces were added to steer the model toward the
+    /// reflection-friendly behavior. Lock in the load-bearing substrings
+    /// so a future body rewrite can't silently drop them.
+    #[test]
+    fn body_documents_global_scope_and_boosts() {
+        // The `--scope global` CLI flag is the user-visible API — must be
+        // documented both as a concept and in a ready-to-copy example.
+        assert!(
+            SKILL_BODY.contains("--scope global"),
+            "skill body must document the --scope global flag"
+        );
+        // Both boost multipliers must appear so the model understands the
+        // relative priority of current-project vs global vs other.
+        assert!(
+            SKILL_BODY.contains("1.5×"),
+            "skill body must reference the 1.5× current-project boost"
+        );
+        assert!(
+            SKILL_BODY.contains("1.25×"),
+            "skill body must reference the 1.25× global boost"
+        );
+        // The mandatory-ask clause is the teeth behind Rule B.
+        assert!(
+            SKILL_BODY.contains("MUST ask"),
+            "skill body must carry the mandatory-ask clause for ambiguous scope"
+        );
     }
 
     #[test]

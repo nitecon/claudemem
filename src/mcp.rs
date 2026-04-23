@@ -19,6 +19,15 @@ use crate::search::{self, SearchOptions, SearchResult};
 
 /// Score multiplier applied to memories tagged with the current project.
 const PROJECT_BOOST: f32 = 1.5;
+/// Score multiplier applied to memories tagged with the global-scope
+/// sentinel project. Intentionally smaller than `PROJECT_BOOST` — see the
+/// CLI module for the full tradeoff rationale.
+const GLOBAL_BOOST: f32 = 1.25;
+/// Reserved `project` ident for global-scoped memories. Kept in sync with
+/// `crate::cli::GLOBAL_PROJECT_IDENT`. Re-declared here rather than
+/// cross-imported so the MCP surface stays independent of the CLI module's
+/// public API shape.
+const GLOBAL_PROJECT_IDENT: &str = "__global__";
 const DEFAULT_PREVIEW_CHARS: usize = 160;
 
 #[derive(Clone)]
@@ -194,6 +203,17 @@ impl MemoryServer {
             .tags
             .map(|t| t.split(',').map(|s| s.trim().to_string()).collect());
 
+        // Guard: the MCP surface does not yet expose a `scope` parameter,
+        // so the only way to land in the global sentinel from MCP would be
+        // to pass `project: "__global__"` explicitly — which we reject.
+        // When MCP scope support ships this guard moves to "unless the
+        // scope argument was `global`" identical to the CLI path.
+        if args.project.as_deref() == Some(GLOBAL_PROJECT_IDENT) {
+            return format!(
+                "{{\"error\": \"`{GLOBAL_PROJECT_IDENT}` is reserved for global-scoped memories. Use the CLI `memory store --scope global` until MCP exposes a scope argument.\"}}"
+            );
+        }
+
         let resolved_project = if args.no_project.unwrap_or(false) {
             None
         } else {
@@ -240,18 +260,20 @@ impl MemoryServer {
         let preview_chars = args.preview_chars.unwrap_or(DEFAULT_PREVIEW_CHARS);
 
         let cwd_project = project::project_ident_from_cwd().ok();
-        let (boost_project, boost_factor) = resolve_boost(
+        let boosts = resolve_boosts(
             args.project.as_deref(),
             cwd_project.as_deref(),
             args.no_project_boost.unwrap_or(false),
         );
-        let boost_project_owned = boost_project.map(|s| s.to_string());
+        let boost_project_owned = boosts.current_project.map(|s| s.to_string());
 
         let opts = SearchOptions {
             limit,
-            current_project: boost_project,
-            boost_factor,
+            current_project: boosts.current_project,
+            boost_factor: boosts.project_boost,
             only_project: args.only.as_deref(),
+            global_project: boosts.global_project,
+            global_boost_factor: boosts.global_boost,
         };
 
         let conn = self.conn.lock().unwrap();
@@ -375,18 +397,20 @@ impl MemoryServer {
         let preview_chars = args.preview_chars.unwrap_or(DEFAULT_PREVIEW_CHARS);
 
         let cwd_project = project::project_ident_from_cwd().ok();
-        let (boost_project, boost_factor) = resolve_boost(
+        let boosts = resolve_boosts(
             args.project.as_deref(),
             cwd_project.as_deref(),
             args.no_project_boost.unwrap_or(false),
         );
-        let boost_project_owned = boost_project.map(|s| s.to_string());
+        let boost_project_owned = boosts.current_project.map(|s| s.to_string());
 
         let opts = SearchOptions {
             limit,
-            current_project: boost_project,
-            boost_factor,
+            current_project: boosts.current_project,
+            boost_factor: boosts.project_boost,
             only_project: args.only.as_deref(),
+            global_project: boosts.global_project,
+            global_boost_factor: boosts.global_boost,
         };
 
         let conn = self.conn.lock().unwrap();
@@ -455,6 +479,13 @@ impl MemoryServer {
     /// project. Set `dry_run: true` to preview without writing.
     #[tool(name = "memory_move")]
     fn move_tool(&self, Parameters(args): Parameters<MoveArgs>) -> String {
+        // Mirror the CLI guard: reassigning into the global sentinel via
+        // `--to __global__` would bypass the `--scope global` contract.
+        if args.to == GLOBAL_PROJECT_IDENT {
+            return format!(
+                "{{\"error\": \"`{GLOBAL_PROJECT_IDENT}` is reserved for global-scoped memories. Use the CLI `memory store --scope global` for new globals, or re-run with a different `to` value.\"}}"
+            );
+        }
         let to = empty_to_none_owned(&args.to);
         let dry_run = args.dry_run.unwrap_or(false);
         let conn = self.conn.lock().unwrap();
@@ -651,15 +682,35 @@ fn run_copy(
     }
 }
 
-fn resolve_boost<'a>(
+/// Mirror of `crate::cli::BoostConfig`. The two modules compute boosts
+/// the same way; duplicating the struct keeps each surface self-contained
+/// without introducing a cross-module coupling that serves nothing else.
+struct BoostConfig<'a> {
+    current_project: Option<&'a str>,
+    global_project: Option<&'a str>,
+    project_boost: f32,
+    global_boost: f32,
+}
+
+fn resolve_boosts<'a>(
     explicit: Option<&'a str>,
     cwd: Option<&'a str>,
     disable: bool,
-) -> (Option<&'a str>, f32) {
+) -> BoostConfig<'a> {
     if disable {
-        (None, 1.0)
+        BoostConfig {
+            current_project: None,
+            global_project: None,
+            project_boost: 1.0,
+            global_boost: 1.0,
+        }
     } else {
-        (explicit.or(cwd), PROJECT_BOOST)
+        BoostConfig {
+            current_project: explicit.or(cwd),
+            global_project: Some(GLOBAL_PROJECT_IDENT),
+            project_boost: PROJECT_BOOST,
+            global_boost: GLOBAL_BOOST,
+        }
     }
 }
 
@@ -670,6 +721,7 @@ fn render_ranked_output(
     preview_chars: usize,
 ) -> Value {
     let total = results.len();
+    let global_scope_count = results.iter().filter(|r| r.is_global).count();
     let cross_project_count = if current_project.is_some() {
         results.iter().filter(|r| !r.is_current_project).count()
     } else {
@@ -689,25 +741,56 @@ fn render_ranked_output(
             "cross_project_count".into(),
             Value::Number(cross_project_count.into()),
         );
-        if cross_project_count > 0 {
-            out.insert(
-                "hint".into(),
-                Value::String(cross_project_hint(cross_project_count, total, cp)),
-            );
-        }
+    }
+    out.insert(
+        "global_scope_count".into(),
+        Value::Number(global_scope_count.into()),
+    );
+    if let Some(hint) = results_hint(cross_project_count, global_scope_count, total, current_project)
+    {
+        out.insert("hint".into(), Value::String(hint));
     }
     Value::Object(out)
 }
 
-fn cross_project_hint(cross: usize, total: usize, current: &str) -> String {
-    if cross == total {
-        format!(
-            "All {total} results are from other projects (no memories tagged '{current}' matched). Treat as prior-art or general guidance, not direct context for the current project."
-        )
+/// See `crate::cli::results_hint` for the full doc; kept in sync verbatim.
+fn results_hint(
+    cross: usize,
+    globals: usize,
+    total: usize,
+    current: Option<&str>,
+) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+
+    if let Some(cp) = current {
+        if cross > 0 {
+            parts.push(if cross == total && globals == 0 {
+                format!(
+                    "All {total} results are from other projects (no memories tagged '{cp}' matched). Treat as prior-art or general guidance, not direct context for the current project."
+                )
+            } else {
+                format!(
+                    "{cross} of {total} results are cross-project (is_current_project=false). Use those as prior-art or general guidance, not direct context for '{cp}'. Use memory_get for full content."
+                )
+            });
+        }
+    }
+
+    if globals > 0 {
+        parts.push(format!(
+            "{globals} of {total} results are global-scope preferences (apply across all projects). Treat them as directives, not suggestions."
+        ));
+    } else if current.is_some() {
+        parts.push(
+            "No global-scope preferences matched this task. If the user has stated a general rule relevant to this domain, it did not surface — consider asking before acting if you suspect one exists."
+                .to_string(),
+        );
+    }
+
+    if parts.is_empty() {
+        None
     } else {
-        format!(
-            "{cross} of {total} results are cross-project (is_current_project=false). Use those as prior-art or general guidance, not direct context for '{current}'. Use memory_get for full content."
-        )
+        Some(parts.join(" "))
     }
 }
 

@@ -37,20 +37,32 @@ Do NOT use MCP or skills for memory during normal workflow.
 **The "Memory First/Last" Rule:** Every task must begin with a `context` or
 `search` call and end with a `store` call if functionality changed.
 
-The `store`, `search`, and `context` commands auto-detect the current project
-from the cwd's git remote (reduced to the repo shortname). Memories tagged with
-the current project receive a 1.5× score boost during retrieval; strong
-cross-project hits can still surface as prior art.
+### Scope tiers
+
+Every memory is stored under one of two scopes; retrieval boosts both:
+
+| Scope                      | Boost  | When to use                                    |
+|----------------------------|--------|------------------------------------------------|
+| **Current project** (cwd)  | 1.5×   | Repo-specific decisions, patterns, bugs        |
+| **Global** (`__global__`)  | 1.25×  | Universal user preferences / directives        |
+| Other project              | 1.0×   | Surfaces only as prior art via the `hint` field |
+
+`store`, `search`, and `context` auto-detect the current project from the
+cwd's git remote (reduced to the repo shortname). A single `context` call
+returns both current-project and global hits — no second query needed.
 
 ```bash
-# Context — top-K relevant memories for a task (boost cwd project)
+# Context — top-K relevant memories for a task (boost cwd + global)
 memory context "<task description>" -k <limit>
 
-# Search — hybrid BM25 + vector search (boost cwd project)
+# Search — hybrid BM25 + vector search (boost cwd + global)
 memory search "<query>" -k <limit>
 
-# Store — save a new memory (project auto-detected)
+# Store — save a new project-scoped memory (cwd auto-detected)
 memory store "<content>" -m <type> -t "<tags>"
+
+# Store — save a universal preference (applies across every repo)
+memory store "<content>" -m <type> --scope global -t "<tags>"
 # types: user, feedback, project, reference
 
 # Get — fetch full content for specific IDs (pair with brief search)
@@ -92,9 +104,53 @@ memory update
    `memory get <id>` for the handful you actually want to read in full.
 3. **Cross-project hits**: when the response includes a `hint` field, treat
    those memories as prior-art or general guidance, not direct context.
-4. **Post-Task**: run `memory store` for any non-obvious decisions, user
+4. **Global-scope hits**: the `hint` field also surfaces the count of
+   global-scope preferences in your top-K. Treat them as directives, not
+   suggestions — they encode rules the user has already stated once.
+5. **Post-Task**: run `memory store` for any non-obvious decisions, user
    preferences, or reusable patterns. Audit-ready descriptions — explain the
    "why," not just the "what."
+
+### Rule A — Pre-action behavior recall (MANDATORY)
+
+Before starting **any** user-requested task — development, SRE, writing,
+design, research, any domain — run **one** `memory context "<task>"` call
+first. A single call returns both general directives (global scope, 1.25×
+boost) and project-specific directives (current-project, 1.5× boost). Do
+not skip this step for "quick" tasks: directives the user has already
+stated must never need to be re-stated.
+
+If the response's `hint` field flags zero global-scope matches, pause and
+reflect: has the user stated a preference relevant to this task's domain
+that you simply aren't finding? If unsure, ask them directly before acting.
+
+### Rule B — Post-action scope classification (MANDATORY)
+
+After completing an action, if the user stated or implied any directive,
+preference, or corrective rule during the session, you **MUST** store it —
+and you **MUST** classify its scope.
+
+Classification rules:
+
+- **Global** (`--scope global`) — universal preference. Signals include:
+  "I always", "I never", "from now on", "I prefer", "don't ever",
+  "whenever we", "in general", any phrasing that sounds like a personal
+  policy or work style.
+- **Project** (`--scope project`, the default) — specific to this repo,
+  service, or codebase. Signals include: "in this repo", "for this
+  service", "on this project", "here we", any phrasing tied to the
+  current codebase or stack.
+- **Ambiguous** — phrasing could reasonably apply either way. You
+  **MUST ask** the user before storing: *"Is this a general preference
+  (applies across all projects) or specific to this project?"* Do
+  **not** silently default to either scope. Do **not** skip the ask to
+  save tokens — a silent mis-classification costs more than one question.
+
+Example:
+```bash
+memory store "User never wants PRs opened unless they explicitly ask" \
+  -m feedback --scope global -t "workflow,pr"
+```
 "#;
 
 /// Entry point invoked from `cli.rs` for `memory setup rules`.
@@ -351,6 +407,41 @@ mod tests {
         // Markers appear exactly once each.
         assert_eq!(b.matches(OPEN_MARKER).count(), 1);
         assert_eq!(b.matches(CLOSE_MARKER).count(), 1);
+    }
+
+    /// The new scope/rules additions must appear verbatim so a regression
+    /// that drops the mandatory-ask clause is caught at build time rather
+    /// than discovered in the wild.
+    #[test]
+    fn build_block_documents_scope_and_new_rules() {
+        let b = build_block();
+        // CLI example with the scope flag.
+        assert!(
+            b.contains("--scope global"),
+            "block must show the --scope global CLI example"
+        );
+        // Scope tier table references both boost values.
+        assert!(b.contains("1.5×"), "block must reference the 1.5× project boost");
+        assert!(b.contains("1.25×"), "block must reference the 1.25× global boost");
+        // The sentinel must be named so users inspecting the DB aren't
+        // confused by stray `__global__` rows.
+        assert!(b.contains("__global__"), "block must name the sentinel project ident");
+        // Rule headings — exact strings the agent learns to look for.
+        assert!(
+            b.contains("Pre-action behavior recall"),
+            "Rule A heading must be present"
+        );
+        assert!(
+            b.contains("Post-action scope classification"),
+            "Rule B heading must be present"
+        );
+        // The MUST-ask clause is the load-bearing one. Spelled "MUST ask"
+        // (two tokens) so the assertion is forgiving about the surrounding
+        // Markdown emphasis.
+        assert!(
+            b.contains("MUST ask"),
+            "Rule B must include the mandatory-ask clause for ambiguous phrasing"
+        );
     }
 
     #[test]
