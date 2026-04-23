@@ -3,6 +3,101 @@ use rusqlite::{params, Connection};
 use crate::db::models::{blob_to_embedding, embedding_to_blob, Memory};
 use crate::error::MemoryError;
 
+/// Minimum length accepted by [`resolve_id_prefix`].
+///
+/// 4 hex characters gives 65,536 distinct prefixes — short enough for humans
+/// to type but long enough that ambiguity with a typical memory DB is still
+/// rare. Shorter prefixes are rejected with `MemoryError::Config` so callers
+/// don't accidentally trigger massive candidate-list returns on 2-char input.
+pub const MIN_ID_PREFIX_LEN: usize = 4;
+
+/// Result of a short-ID prefix lookup.
+///
+/// Emitted by [`resolve_id_prefix`] so every CLI subcommand that takes an `id`
+/// argument can use a uniform short-prefix flow. The `Ambiguous` variant
+/// carries the candidate list so the caller can render a disambiguation
+/// prompt without re-querying.
+#[derive(Debug)]
+pub enum ResolvedId {
+    /// Prefix or full UUID uniquely matched exactly one memory. The full UUID
+    /// is carried so callers can pass it straight to the other query helpers.
+    Exact(String),
+    /// Multiple memories share the prefix. The vec holds enough metadata to
+    /// render a human-pickable list (no embeddings — we don't need them to
+    /// disambiguate).
+    Ambiguous(Vec<Memory>),
+    /// No memory in the DB starts with the given prefix.
+    NotFound,
+}
+
+/// Expand a short ID prefix to a full UUID.
+///
+/// Accepts any prefix of length ≥ [`MIN_ID_PREFIX_LEN`]; a full UUID still
+/// returns `Exact` (fast path below). If the prefix is shorter than the
+/// minimum the function returns `MemoryError::Config` rather than trying to
+/// resolve it — very short prefixes can match arbitrarily many rows.
+///
+/// Implementation: first try an exact-match lookup (hot path for callers that
+/// already have a full UUID, and cheap enough to be worth the extra roundtrip).
+/// On miss, fall back to `WHERE id LIKE prefix || '%'` bounded to a small
+/// candidate window so accidental 4-char prefixes don't spill thousands of
+/// rows into memory.
+pub fn resolve_id_prefix(conn: &Connection, prefix: &str) -> Result<ResolvedId, MemoryError> {
+    if prefix.len() < MIN_ID_PREFIX_LEN {
+        return Err(MemoryError::Config(format!(
+            "ID prefix must be at least {MIN_ID_PREFIX_LEN} characters (got {})",
+            prefix.len()
+        )));
+    }
+
+    // Fast path: the caller might already have the full UUID.
+    if let Ok(m) = get_memory_by_id(conn, prefix) {
+        return Ok(ResolvedId::Exact(m.id));
+    }
+
+    // Prefix match. Use a bounded LIMIT so a very short accidental prefix
+    // cannot blow the heap; `MAX_PREFIX_CANDIDATES` + 1 so we can detect
+    // "more candidates exist than we're willing to list" and keep the
+    // disambiguation output short.
+    const MAX_PREFIX_CANDIDATES: usize = 16;
+    let like_pattern = format!("{prefix}%");
+    let mut stmt = conn.prepare(
+        "SELECT id, content, tags, project, agent, source_file,
+         created_at, updated_at, access_count, embedding, memory_type
+         FROM memories WHERE id LIKE ?1 LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(
+        params![like_pattern, (MAX_PREFIX_CANDIDATES + 1) as i64],
+        |row| {
+            let tags_str: Option<String> = row.get(2)?;
+            let embedding_blob: Option<Vec<u8>> = row.get(9)?;
+            Ok(Memory {
+                id: row.get(0)?,
+                content: row.get(1)?,
+                tags: tags_str.and_then(|s| serde_json::from_str(&s).ok()),
+                project: row.get(3)?,
+                agent: row.get(4)?,
+                source_file: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+                access_count: row.get(8)?,
+                embedding: embedding_blob.map(|b| blob_to_embedding(&b)),
+                memory_type: row.get(10)?,
+            })
+        },
+    )?;
+    let mut candidates: Vec<Memory> = Vec::new();
+    for row in rows {
+        candidates.push(row?);
+    }
+
+    match candidates.len() {
+        0 => Ok(ResolvedId::NotFound),
+        1 => Ok(ResolvedId::Exact(candidates.remove(0).id)),
+        _ => Ok(ResolvedId::Ambiguous(candidates)),
+    }
+}
+
 pub fn insert_memory(conn: &Connection, memory: &Memory) -> Result<(), MemoryError> {
     let tags_json = memory
         .tags
@@ -313,6 +408,98 @@ pub fn list_projects(conn: &Connection) -> Result<Vec<(Option<String>, i64)>, Me
         out.push(row?);
     }
     Ok(out)
+}
+
+// -- Tests for resolve_id_prefix --------------------------------------------
+// Placed here rather than in a `#[cfg(test)] mod tests` block so each test
+// uses an in-memory SQLite connection with the full migration set — mirrors
+// the behavior callers get from `open_database`.
+
+#[cfg(test)]
+mod resolve_id_tests {
+    use super::*;
+    use crate::db::run_migrations;
+    use crate::db::models::Memory;
+
+    fn fresh_db() -> Connection {
+        let conn = Connection::open_in_memory().expect("open in-memory");
+        run_migrations(&conn).expect("migrate");
+        conn
+    }
+
+    fn insert(conn: &Connection, id: &str) {
+        let mut m = Memory::new(
+            format!("content {id}"),
+            None,
+            Some("test".to_string()),
+            None,
+            None,
+            Some("user".to_string()),
+        );
+        m.id = id.to_string();
+        insert_memory(conn, &m).expect("insert");
+    }
+
+    #[test]
+    fn exact_match_on_full_uuid() {
+        let conn = fresh_db();
+        insert(&conn, "aaaaaaaa-0000-1111-2222-333333333333");
+        let r = resolve_id_prefix(&conn, "aaaaaaaa-0000-1111-2222-333333333333").unwrap();
+        match r {
+            ResolvedId::Exact(id) => assert_eq!(id, "aaaaaaaa-0000-1111-2222-333333333333"),
+            other => panic!("expected Exact, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exact_match_on_short_prefix() {
+        let conn = fresh_db();
+        insert(&conn, "aaaaaaaa-0000-1111-2222-333333333333");
+        insert(&conn, "bbbbbbbb-0000-1111-2222-333333333333");
+        let r = resolve_id_prefix(&conn, "aaaaaaaa").unwrap();
+        match r {
+            ResolvedId::Exact(id) => assert_eq!(id, "aaaaaaaa-0000-1111-2222-333333333333"),
+            other => panic!("expected Exact, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ambiguous_returns_all_candidates() {
+        let conn = fresh_db();
+        insert(&conn, "4c82c482-c081-4937-aaaa-111111111111");
+        insert(&conn, "4c82c482-d7f2-4a18-bbbb-222222222222");
+        let r = resolve_id_prefix(&conn, "4c82c482").unwrap();
+        match r {
+            ResolvedId::Ambiguous(cands) => {
+                assert_eq!(cands.len(), 2);
+                let ids: Vec<_> = cands.iter().map(|m| m.id.clone()).collect();
+                assert!(ids.contains(&"4c82c482-c081-4937-aaaa-111111111111".to_string()));
+                assert!(ids.contains(&"4c82c482-d7f2-4a18-bbbb-222222222222".to_string()));
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn not_found_when_no_match() {
+        let conn = fresh_db();
+        insert(&conn, "aaaaaaaa-0000-1111-2222-333333333333");
+        let r = resolve_id_prefix(&conn, "deadbeef").unwrap();
+        assert!(matches!(r, ResolvedId::NotFound));
+    }
+
+    #[test]
+    fn prefix_too_short_returns_config_error() {
+        let conn = fresh_db();
+        insert(&conn, "aaaaaaaa-0000-1111-2222-333333333333");
+        let err = resolve_id_prefix(&conn, "aaa").unwrap_err();
+        match err {
+            MemoryError::Config(msg) => {
+                assert!(msg.contains("at least 4"));
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
 }
 
 pub fn prune_memories(
