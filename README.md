@@ -18,7 +18,10 @@ Persistent hybrid-search memory system for AI coding agents. Replaces markdown-b
 curl -fsSL https://raw.githubusercontent.com/nitecon/agent-memory/refs/heads/main/install.sh | sudo bash
 ```
 
-Installs to `/opt/agentic/bin/memory` with a symlink at `/usr/local/bin/memory`.
+Installs **two** binaries to `/opt/agentic/bin/` (symlinked into `/usr/local/bin/`):
+
+- `memory` — the main CLI + MCP server
+- `memory-dream` — offline batch compactor (condense + dedup, see [Dream compactor](#dream-compactor-offline-condensation--dedup) below)
 
 ### Windows (PowerShell as Administrator)
 
@@ -26,17 +29,35 @@ Installs to `/opt/agentic/bin/memory` with a symlink at `/usr/local/bin/memory`.
 irm https://raw.githubusercontent.com/nitecon/agent-memory/refs/heads/main/install.ps1 | iex
 ```
 
-Installs to `%USERPROFILE%\.agentic\bin\memory.exe` and adds it to your PATH.
+Installs `memory.exe` + `memory-dream.exe` to `%USERPROFILE%\.agentic\bin\` and adds the directory to your PATH.
 
 ### From source
 
+This is a Cargo workspace. The default build produces both binaries:
+
 ```bash
 cargo build --release
+# → target/release/memory
+# → target/release/memory-dream
 ```
 
-Binary: `target/release/memory` (Linux/macOS) or `target/release/memory.exe` (Windows)
+(Windows adds the `.exe` suffix.)
 
-First run downloads the embedding model (~80MB, cached alongside the database).
+First `memory` invocation downloads the embedding model (~80MB, cached alongside the database). First `memory-dream --pull` downloads the gemma3 weights (~2GB, same cache directory).
+
+### Release archives
+
+Each release tag produces a single combined archive per platform:
+
+```
+agent-memory-v1.2.0-linux-x86_64.tar.gz        # memory + memory-dream
+agent-memory-v1.2.0-linux-aarch64.tar.gz
+agent-memory-v1.2.0-macos-x86_64.tar.gz
+agent-memory-v1.2.0-macos-aarch64.tar.gz
+agent-memory-v1.2.0-windows-x86_64.zip
+```
+
+Archive size is ~70MB (candle + tokenizers add weight to `memory-dream`). The model weights are **not** shipped in the archive — they're downloaded on demand via `memory-dream --pull`. Users who never run `memory-dream` pay the ~28MB of disk it takes up but incur zero cognitive overhead; `memory update` force-bundles both binaries on every upgrade so install and updater logic stay symmetric.
 
 ## Database location
 
@@ -450,6 +471,88 @@ export AGENT_MEMORY_NO_UPDATE=1
 ```
 
 You can also trigger an update manually at any time with `memory update`.
+
+`memory update` fetches the combined release archive and atomically swaps **both** binaries (`memory` + `memory-dream`) in place. If `memory-dream` wasn't previously installed, the updater force-bundles it on the next upgrade — users who never run the compactor pay ~28MB of disk but no cognitive overhead.
+
+## Dream compactor (offline condensation + dedup)
+
+`memory-dream` is a one-shot batch utility that walks your memory DB and does two things:
+
+1. **Condenses** verbose memories into a shorter factual claim using an in-process gemma3 model (via `candle`). The original text is preserved in a new `content_raw` column so nothing is lost — condensed text replaces `content`, raw text lives alongside.
+2. **Dedups** near-identical memories via cosine similarity on the embeddings. The older of a duplicate pair gets a `superseded_by` pointer to the newer one; default reads filter superseded rows out, so they stay in the DB for audit but never surface in search / context / list.
+
+It's never a daemon. Each invocation loads the model, processes the DB, and exits. Run it however you like: cron, `launchd`, Windows Task Scheduler, or just manually after a heavy session.
+
+### First-time setup
+
+```bash
+# One-time: download gemma3 weights (~2GB, cached in the same dir as the DB).
+memory-dream --pull
+```
+
+### Regular use
+
+```bash
+# Preview: walk the DB and report what would change. No writes.
+memory-dream --dry-run
+
+# Apply: full pass. Per-memory BEGIN IMMEDIATE transactions serialize
+# with any concurrent `memory store` writes.
+memory-dream
+
+# Cap the pass for incremental runs on large DBs.
+memory-dream --limit 50
+
+# Swap model (rare — any HF repo id works; short `gemma3` resolves to
+# the canonical Google repo).
+memory-dream --model myorg/my-fork
+```
+
+### Scheduling examples
+
+**cron (Linux/macOS)** — daily at 03:00 local time:
+
+```cron
+0 3 * * * /opt/agentic/bin/memory-dream >> ~/.agentic/dream.log 2>&1
+```
+
+**launchd (macOS)** — run after login, again daily:
+
+```xml
+<!-- ~/Library/LaunchAgents/com.agentic.dream.plist -->
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.agentic.dream</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/agentic/bin/memory-dream</string>
+  </array>
+  <key>StartInterval</key><integer>86400</integer>
+  <key>RunAtLoad</key><true/>
+</dict></plist>
+```
+
+**Windows Task Scheduler** — daily at 03:00:
+
+```powershell
+$action = New-ScheduledTaskAction -Execute "$env:USERPROFILE\.agentic\bin\memory-dream.exe"
+$trigger = New-ScheduledTaskTrigger -Daily -At 3am
+Register-ScheduledTask -TaskName "agent-memory-dream" -Action $action -Trigger $trigger
+```
+
+### What gets condensed, what gets deduped
+
+A memory needs condensation when it has `content_raw IS NULL` (never processed) OR its `condenser_version` stamp no longer matches the current `<model>:<prompt-hash>` combo (prompt or model changed since last run). Stamping lets future passes detect and re-run stale rows without reprocessing everything.
+
+Dedup candidates must share the same `project` AND same `memory_type` AND same `embedding_model`. The cosine threshold defaults to `0.87` (empirically tuned for `all-MiniLM-L6-v2`). On match, the row with the earlier `created_at` is marked superseded. An exact-match short-circuit runs before the cosine scan so byte-identical inserts don't pay the vector cost.
+
+### Safety nets
+
+- **Prompt injection defense**: the condensation prompt wraps memory content in `<<<MEMORY>>> ... <<<END>>>` and explicitly instructs the model to treat anything inside as data, not instructions. A single few-shot example anchors verbatim preservation of paths / numbers / dates. The response must be JSON (`{"condensed": "..."}`); non-JSON triggers a fallback to the raw memory.
+- **Length-ratio check**: if the model's "condensed" output is longer than the input, it's rejected and the raw memory stays untouched.
+- **Refusal detection**: responses matching `I cannot`, `I'm sorry, but`, `as a language model`, etc. fall back to the raw memory.
+- **Per-memory error containment**: one bad memory can't halt the pass. Errors are logged and the orchestrator moves on.
+- **`--dry-run` writes nothing**: row counts are identical before/after a dry-run pass.
+- **BEGIN IMMEDIATE transactions**: every mutation runs inside a per-memory immediate transaction so concurrent `memory store` calls can't race.
 
 ## MCP tools
 
