@@ -17,6 +17,11 @@ use self::vector::vector_search;
 pub struct SearchResult {
     pub memory: Memory,
     pub rank_info: RankedResult,
+    /// Classified match quality. Not currently surfaced in the light-XML
+    /// output (Release 1 of the format change drops the per-hit metadata),
+    /// but retained so downstream consumers — tests, future `--verbose`
+    /// flags, Release 2's dream compactor — can reason about rank tier.
+    #[allow(dead_code)]
     pub match_quality: MatchQuality,
     pub is_current_project: bool,
     /// True when the memory is tagged with the global-scope sentinel project
@@ -34,6 +39,7 @@ pub enum MatchQuality {
 }
 
 impl MatchQuality {
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
         match self {
             MatchQuality::High => "high",

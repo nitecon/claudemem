@@ -7,14 +7,14 @@ use rmcp::schemars;
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use rusqlite::Connection;
 use serde::Deserialize;
-use serde_json::{json, Value};
 
 use crate::config::Config;
 use crate::db::models::Memory;
-use crate::db::queries;
+use crate::db::queries::{self, ResolvedId};
 use crate::embedding;
 use crate::error::MemoryError;
 use crate::project;
+use crate::render;
 use crate::search::{self, SearchOptions, SearchResult};
 
 /// Score multiplier applied to memories tagged with the current project.
@@ -28,7 +28,6 @@ const GLOBAL_BOOST: f32 = 1.25;
 /// cross-imported so the MCP surface stays independent of the CLI module's
 /// public API shape.
 const GLOBAL_PROJECT_IDENT: &str = "__global__";
-const DEFAULT_PREVIEW_CHARS: usize = 160;
 
 #[derive(Clone)]
 pub struct MemoryServer {
@@ -67,10 +66,6 @@ pub struct SearchArgs {
     pub only: Option<String>,
     /// If true, disable the current-project boost entirely (flat ranking).
     pub no_project_boost: Option<bool>,
-    /// Output format: "brief" (default) or "full".
-    pub format: Option<String>,
-    /// Preview length for brief format (default: 160).
-    pub preview_chars: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -85,15 +80,11 @@ pub struct RecallArgs {
     pub memory_type: Option<String>,
     /// Maximum number of results (default: 10)
     pub limit: Option<usize>,
-    /// Output format: "brief" (default) or "full".
-    pub format: Option<String>,
-    /// Preview length for brief format (default: 160).
-    pub preview_chars: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ForgetArgs {
-    /// Specific memory ID to delete
+    /// Specific memory ID to delete (full UUID or 4+ char short prefix)
     pub id: Option<String>,
     /// Search query to find and delete matching memories
     pub query: Option<String>,
@@ -121,25 +112,17 @@ pub struct ContextArgs {
     pub only: Option<String>,
     /// If true, disable the current-project boost entirely (flat ranking).
     pub no_project_boost: Option<bool>,
-    /// Output format: "brief" (default) or "full".
-    pub format: Option<String>,
-    /// Preview length for brief format (default: 160).
-    pub preview_chars: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetArgs {
-    /// Memory IDs to fetch.
+    /// Memory IDs to fetch (full UUIDs or 4+ char short prefixes).
     pub ids: Vec<String>,
-    /// Output format: "full" (default) or "brief".
-    pub format: Option<String>,
-    /// Preview length for brief format (default: 160).
-    pub preview_chars: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MoveArgs {
-    /// Move a single memory by ID.
+    /// Move a single memory by ID (full UUID or 4+ char short prefix).
     pub id: Option<String>,
     /// Move all memories whose current project equals this value. Pass an
     /// empty string ("") to target memories with no project.
@@ -152,7 +135,7 @@ pub struct MoveArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CopyArgs {
-    /// Copy a single memory by ID.
+    /// Copy a single memory by ID (full UUID or 4+ char short prefix).
     pub id: Option<String>,
     /// Copy all memories whose current project equals this value. Pass an
     /// empty string ("") to target memories with no project.
@@ -164,20 +147,6 @@ pub struct CopyArgs {
     pub dry_run: Option<bool>,
 }
 
-#[derive(Copy, Clone)]
-enum OutputFormat {
-    Brief,
-    Full,
-}
-
-fn parse_format(s: Option<&str>, default: OutputFormat) -> OutputFormat {
-    match s.map(|v| v.to_ascii_lowercase()) {
-        Some(ref v) if v == "brief" => OutputFormat::Brief,
-        Some(ref v) if v == "full" => OutputFormat::Full,
-        _ => default,
-    }
-}
-
 impl MemoryServer {
     pub fn new(config: Config, conn: Connection) -> Self {
         Self {
@@ -187,8 +156,12 @@ impl MemoryServer {
         }
     }
 
-    fn err_str(e: MemoryError) -> String {
-        e.to_string()
+    /// Format a `MemoryError` as a single light-XML `<result status="error" .../>`
+    /// line so all MCP tool responses share the same shape. Kept local rather
+    /// than in the render module because "error during tool call" is an
+    /// MCP-specific concept.
+    fn err_xml(e: MemoryError) -> String {
+        render::render_action_result("error", &[("message", e.to_string())])
     }
 }
 
@@ -197,6 +170,7 @@ impl MemoryServer {
     /// Store a memory with auto-embedding and BM25 indexing. Use this to save important context,
     /// user preferences, project decisions, feedback, or reference information for future retrieval.
     /// The project tag is auto-derived from the server's working directory unless overridden.
+    /// Returns a <result status="stored" .../> light-XML line.
     #[tool(name = "memory_store")]
     fn store(&self, Parameters(args): Parameters<StoreArgs>) -> String {
         let tag_list = args
@@ -209,8 +183,15 @@ impl MemoryServer {
         // When MCP scope support ships this guard moves to "unless the
         // scope argument was `global`" identical to the CLI path.
         if args.project.as_deref() == Some(GLOBAL_PROJECT_IDENT) {
-            return format!(
-                "{{\"error\": \"`{GLOBAL_PROJECT_IDENT}` is reserved for global-scoped memories. Use the CLI `memory store --scope global` until MCP exposes a scope argument.\"}}"
+            return render::render_action_result(
+                "error",
+                &[(
+                    "message",
+                    format!(
+                        "`{GLOBAL_PROJECT_IDENT}` is reserved for global-scoped memories. \
+                         Use the CLI `memory store --scope global` until MCP exposes a scope argument."
+                    ),
+                )],
             );
         }
 
@@ -232,32 +213,30 @@ impl MemoryServer {
 
         let emb = match embedding::embed_text(&args.content, &self.config.model_cache_dir) {
             Ok(e) => e,
-            Err(e) => return format!("{{\"error\": \"{}\"}}", Self::err_str(e)),
+            Err(e) => return Self::err_xml(e),
         };
         memory.embedding = Some(emb);
 
         let conn = self.conn.lock().unwrap();
         if let Err(e) = queries::insert_memory(&conn, &memory) {
-            return format!("{{\"error\": \"{}\"}}", Self::err_str(e));
+            return Self::err_xml(e);
         }
 
-        json!({
-            "status": "stored",
-            "id": memory.id,
-            "project": memory.project,
-        })
-        .to_string()
+        let mut attrs: Vec<(&str, String)> =
+            vec![("id", render::short_id(&memory.id).to_string())];
+        if let Some(p) = memory.project.as_deref() {
+            attrs.push(("project", p.to_string()));
+        }
+        render::render_action_result("stored", &attrs)
     }
 
     /// Hybrid BM25 + vector search across all memories. Combines keyword matching with semantic
     /// similarity. Boosts current-project memories by default while still surfacing cross-project
-    /// results as prior-art. Returns a brief preview per hit by default -- call memory_get for
-    /// the full content of hits you want to read.
+    /// results as prior-art. Returns a light-XML block with <project_memories>,
+    /// <general_knowledge>, and <other_projects> sections.
     #[tool(name = "memory_search")]
     fn search(&self, Parameters(args): Parameters<SearchArgs>) -> String {
         let limit = args.limit.unwrap_or(10);
-        let format = parse_format(args.format.as_deref(), OutputFormat::Brief);
-        let preview_chars = args.preview_chars.unwrap_or(DEFAULT_PREVIEW_CHARS);
 
         let cwd_project = project::project_ident_from_cwd().ok();
         let boosts = resolve_boosts(
@@ -265,7 +244,6 @@ impl MemoryServer {
             cwd_project.as_deref(),
             args.no_project_boost.unwrap_or(false),
         );
-        let boost_project_owned = boosts.current_project.map(|s| s.to_string());
 
         let opts = SearchOptions {
             limit,
@@ -280,25 +258,18 @@ impl MemoryServer {
         let results =
             match search::hybrid_search(&conn, &args.query, opts, &self.config.model_cache_dir) {
                 Ok(r) => r,
-                Err(e) => return format!("{{\"error\": \"{}\"}}", Self::err_str(e)),
+                Err(e) => return Self::err_xml(e),
             };
 
-        let out = render_ranked_output(
-            &results,
-            boost_project_owned.as_deref(),
-            format,
-            preview_chars,
-        );
-        serde_json::to_string_pretty(&out).unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e))
+        render_ranked_xml(&results, boosts.current_project)
     }
 
     /// Filter memories by project, agent, tags, or memory type. Use for structured retrieval
-    /// when you know the category of memory you're looking for.
+    /// when you know the category of memory you're looking for. Returns a <memories count=".."/>
+    /// light-XML block.
     #[tool(name = "memory_recall")]
     fn recall(&self, Parameters(args): Parameters<RecallArgs>) -> String {
         let limit = args.limit.unwrap_or(10);
-        let format = parse_format(args.format.as_deref(), OutputFormat::Brief);
-        let preview_chars = args.preview_chars.unwrap_or(DEFAULT_PREVIEW_CHARS);
         let tag_list: Option<Vec<String>> = args
             .tags
             .map(|t| t.split(',').map(|s| s.trim().to_string()).collect());
@@ -315,52 +286,68 @@ impl MemoryServer {
             limit,
         ) {
             Ok(m) => m,
-            Err(e) => return format!("{{\"error\": \"{}\"}}", Self::err_str(e)),
+            Err(e) => return Self::err_xml(e),
         };
 
-        let out = render_memory_list(&memories, cwd_project.as_deref(), format, preview_chars);
-        serde_json::to_string_pretty(&out).unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e))
+        render::render_memory_list(&memories, cwd_project.as_deref())
     }
 
-    /// Remove memories by ID or by search query. Use with an ID for precise deletion,
-    /// or a query to find and remove matching memories.
+    /// Remove memories by ID or by search query. Use with an ID (full UUID or short prefix)
+    /// for precise deletion, or a query to find and remove matching memories. Ambiguous short
+    /// prefixes return an <ambiguous/> block instead of deleting.
     #[tool(name = "memory_forget")]
     fn forget(&self, Parameters(args): Parameters<ForgetArgs>) -> String {
         let conn = self.conn.lock().unwrap();
 
         if let Some(id) = args.id {
-            match queries::delete_memory(&conn, &id) {
-                Ok(true) => json!({"status": "deleted", "id": id}).to_string(),
-                Ok(false) => json!({"status": "not_found", "id": id}).to_string(),
-                Err(e) => format!("{{\"error\": \"{}\"}}", Self::err_str(e)),
+            match queries::resolve_id_prefix(&conn, &id) {
+                Ok(ResolvedId::Exact(full_id)) => match queries::delete_memory(&conn, &full_id) {
+                    Ok(true) => render::render_action_result(
+                        "forgot",
+                        &[("id", render::short_id(&full_id).to_string())],
+                    ),
+                    Ok(false) => render::render_action_result(
+                        "not_found",
+                        &[("id", render::short_id(&full_id).to_string())],
+                    ),
+                    Err(e) => Self::err_xml(e),
+                },
+                Ok(ResolvedId::Ambiguous(cands)) => render::render_ambiguous(&id, &cands),
+                Ok(ResolvedId::NotFound) => {
+                    render::render_action_result("not_found", &[("id", id)])
+                }
+                Err(e) => Self::err_xml(e),
             }
         } else if let Some(query) = args.query {
             let opts = SearchOptions::new(5);
             let results =
                 match search::hybrid_search(&conn, &query, opts, &self.config.model_cache_dir) {
                     Ok(r) => r,
-                    Err(e) => return format!("{{\"error\": \"{}\"}}", Self::err_str(e)),
+                    Err(e) => return Self::err_xml(e),
                 };
 
-            let mut deleted_ids = Vec::new();
+            if results.is_empty() {
+                return render::render_action_result("no_matches", &[]);
+            }
+
+            let mut deleted = 0usize;
             for r in &results {
                 if let Ok(true) = queries::delete_memory(&conn, &r.memory.id) {
-                    deleted_ids.push(r.memory.id.clone());
+                    deleted += 1;
                 }
             }
-            json!({
-                "status": "deleted",
-                "count": deleted_ids.len(),
-                "ids": deleted_ids,
-            })
-            .to_string()
+            render::render_action_result("forgot", &[("count", deleted.to_string())])
         } else {
-            r#"{"error": "Either 'id' or 'query' must be provided"}"#.to_string()
+            render::render_action_result(
+                "error",
+                &[("message", "Either 'id' or 'query' must be provided".to_string())],
+            )
         }
     }
 
     /// Decay stale, low-access memories. Removes memories older than max_age_days with
     /// access_count at or below min_access_count. Use dry_run to preview before deleting.
+    /// Returns a <result status="pruned" count=".."/> line.
     #[tool(name = "memory_prune")]
     fn prune(&self, Parameters(args): Parameters<PruneArgs>) -> String {
         let max_age = args.max_age_days.unwrap_or(90);
@@ -370,31 +357,20 @@ impl MemoryServer {
         let conn = self.conn.lock().unwrap();
         let pruned = match queries::prune_memories(&conn, max_age, min_access, dry_run) {
             Ok(p) => p,
-            Err(e) => return format!("{{\"error\": \"{}\"}}", Self::err_str(e)),
+            Err(e) => return Self::err_xml(e),
         };
 
-        json!({
-            "status": if dry_run { "dry_run" } else { "pruned" },
-            "count": pruned.len(),
-            "memories": pruned.iter().map(|m| json!({
-                "id": m.id,
-                "content": m.content.chars().take(100).collect::<String>(),
-                "access_count": m.access_count,
-                "updated_at": m.updated_at,
-            })).collect::<Vec<_>>(),
-        })
-        .to_string()
+        let status = if dry_run { "dry_run" } else { "pruned" };
+        render::render_action_result(status, &[("count", pruned.len().to_string())])
     }
 
     /// Return the most relevant memories for a given task description, with a current-project
     /// boost so local context wins ties but cross-project memories can still surface as prior-art.
-    /// Use at the start of a task. Returns brief previews by default -- call memory_get for full
-    /// content on the hits you want to read.
+    /// Use at the start of a task. Returns a light-XML block grouped into <project_memories>,
+    /// <general_knowledge>, and <other_projects> sections.
     #[tool(name = "memory_context")]
     fn context(&self, Parameters(args): Parameters<ContextArgs>) -> String {
         let limit = args.limit.unwrap_or(5);
-        let format = parse_format(args.format.as_deref(), OutputFormat::Brief);
-        let preview_chars = args.preview_chars.unwrap_or(DEFAULT_PREVIEW_CHARS);
 
         let cwd_project = project::project_ident_from_cwd().ok();
         let boosts = resolve_boosts(
@@ -402,7 +378,6 @@ impl MemoryServer {
             cwd_project.as_deref(),
             args.no_project_boost.unwrap_or(false),
         );
-        let boost_project_owned = boosts.current_project.map(|s| s.to_string());
 
         let opts = SearchOptions {
             limit,
@@ -421,144 +396,163 @@ impl MemoryServer {
             &self.config.model_cache_dir,
         ) {
             Ok(r) => r,
-            Err(e) => return format!("{{\"error\": \"{}\"}}", Self::err_str(e)),
+            Err(e) => return Self::err_xml(e),
         };
 
-        let out = render_ranked_output(
-            &results,
-            boost_project_owned.as_deref(),
-            format,
-            preview_chars,
-        );
-        serde_json::to_string_pretty(&out).unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e))
+        render_ranked_xml(&results, boosts.current_project)
     }
 
-    /// Fetch full content for one or more memory IDs. Pair with memory_search or memory_context
-    /// using the default brief format for a cheap two-stage retrieval: scan lightweight hits,
-    /// then pull the full content of just the ones you want to read.
+    /// Fetch full content for one or more memory IDs. Each ID can be a full UUID or a 4+ char
+    /// short prefix; ambiguous prefixes return an <ambiguous/> block. Pair with memory_search
+    /// or memory_context for a two-stage retrieval: scan previews, then pull full content on
+    /// the handful you want to read.
     #[tool(name = "memory_get")]
     fn get(&self, Parameters(args): Parameters<GetArgs>) -> String {
-        let format = parse_format(args.format.as_deref(), OutputFormat::Full);
-        let preview_chars = args.preview_chars.unwrap_or(DEFAULT_PREVIEW_CHARS);
-
-        let cwd_project = project::project_ident_from_cwd().ok();
-
         let conn = self.conn.lock().unwrap();
         let mut fetched: Vec<Memory> = Vec::with_capacity(args.ids.len());
-        let mut missing: Vec<String> = Vec::new();
+        let mut out_parts: Vec<String> = Vec::with_capacity(args.ids.len());
+
         for id in &args.ids {
-            match queries::get_memory_by_id(&conn, id) {
-                Ok(m) => fetched.push(m),
-                Err(MemoryError::NotFound(_)) => missing.push(id.clone()),
-                Err(e) => return format!("{{\"error\": \"{}\"}}", Self::err_str(e)),
+            match queries::resolve_id_prefix(&conn, id) {
+                Ok(ResolvedId::Exact(full_id)) => {
+                    match queries::get_memory_by_id(&conn, &full_id) {
+                        Ok(m) => {
+                            out_parts.push(render::render_memory(&m));
+                            fetched.push(m);
+                        }
+                        Err(MemoryError::NotFound(_)) => {
+                            out_parts.push(render::render_action_result(
+                                "not_found",
+                                &[("id", id.clone())],
+                            ));
+                        }
+                        Err(e) => return Self::err_xml(e),
+                    }
+                }
+                Ok(ResolvedId::Ambiguous(cands)) => {
+                    out_parts.push(render::render_ambiguous(id, &cands));
+                }
+                Ok(ResolvedId::NotFound) => {
+                    out_parts.push(render::render_action_result(
+                        "not_found",
+                        &[("id", id.clone())],
+                    ));
+                }
+                Err(e) => return Self::err_xml(e),
             }
         }
+
         let hit_ids: Vec<String> = fetched.iter().map(|m| m.id.clone()).collect();
         if let Err(e) = queries::increment_access(&conn, &hit_ids) {
-            return format!("{{\"error\": \"{}\"}}", Self::err_str(e));
+            return Self::err_xml(e);
         }
 
-        let results: Vec<Value> = fetched
-            .iter()
-            .map(|m| render_memory(m, cwd_project.as_deref(), format, preview_chars))
-            .collect();
-
-        json!({
-            "results": results,
-            "missing": missing,
-        })
-        .to_string()
+        out_parts.join("\n")
     }
 
-    /// Reassign the project ident on one or more memories. Use this to migrate
-    /// memories that were tagged under a legacy project name (e.g.
-    /// "trading-platform-sre") to the canonical git-remote ident the cwd
-    /// resolver returns now (e.g. "github.com/nitecon/SRE.git"). Pass `id` for
-    /// a single memory or `from` to bulk-rename every memory currently tagged
-    /// with that project. Empty strings on `from`/`to` target or assign a NULL
-    /// project. Set `dry_run: true` to preview without writing.
+    /// Reassign the project ident on one or more memories. Use this to migrate memories
+    /// tagged under a legacy project name to the canonical git-remote ident the cwd resolver
+    /// returns now. Pass `id` for a single memory (full UUID or short prefix) or `from` to
+    /// bulk-rename. Empty strings on `from`/`to` target or assign a NULL project. Set
+    /// `dry_run: true` to preview without writing.
     #[tool(name = "memory_move")]
     fn move_tool(&self, Parameters(args): Parameters<MoveArgs>) -> String {
         // Mirror the CLI guard: reassigning into the global sentinel via
-        // `--to __global__` would bypass the `--scope global` contract.
+        // `to: "__global__"` would bypass the `--scope global` contract.
         if args.to == GLOBAL_PROJECT_IDENT {
-            return format!(
-                "{{\"error\": \"`{GLOBAL_PROJECT_IDENT}` is reserved for global-scoped memories. Use the CLI `memory store --scope global` for new globals, or re-run with a different `to` value.\"}}"
+            return render::render_action_result(
+                "error",
+                &[(
+                    "message",
+                    format!(
+                        "`{GLOBAL_PROJECT_IDENT}` is reserved for global-scoped memories. \
+                         Use the CLI `memory store --scope global` for new globals, or \
+                         re-run with a different `to` value."
+                    ),
+                )],
             );
         }
         let to = empty_to_none_owned(&args.to);
         let dry_run = args.dry_run.unwrap_or(false);
         let conn = self.conn.lock().unwrap();
-        match run_move(
+
+        // Resolve the id (if any) through the prefix resolver so MCP callers
+        // can pass short UUIDs just like the CLI.
+        let resolved_id = match args.id.as_deref() {
+            None => None,
+            Some(raw) => match queries::resolve_id_prefix(&conn, raw) {
+                Ok(ResolvedId::Exact(full)) => Some(full),
+                Ok(ResolvedId::Ambiguous(cands)) => {
+                    return render::render_ambiguous(raw, &cands);
+                }
+                Ok(ResolvedId::NotFound) => {
+                    return render::render_action_result(
+                        "not_found",
+                        &[("id", raw.to_string())],
+                    );
+                }
+                Err(e) => return Self::err_xml(e),
+            },
+        };
+
+        run_move(
             &conn,
-            args.id.as_deref(),
+            resolved_id.as_deref(),
             args.from.as_deref(),
             to.as_deref(),
             dry_run,
-        ) {
-            Ok(v) => serde_json::to_string_pretty(&v)
-                .unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e)),
-            Err(e) => format!("{{\"error\": \"{}\"}}", Self::err_str(e)),
-        }
+        )
     }
 
-    /// Duplicate one or more memories under a new project ident. Preserves
-    /// content, tags, agent, source_file, memory_type, and the cached
-    /// embedding; a new UUID is minted and timestamps reset. Pass `id` for a
-    /// single memory or `from` to bulk-copy every memory currently tagged with
-    /// that project. Empty strings on `from`/`to` target or assign a NULL
-    /// project. Set `dry_run: true` to preview without writing.
+    /// Duplicate one or more memories under a new project ident. Preserves content, tags,
+    /// agent, source_file, memory_type, and the cached embedding; a new UUID is minted and
+    /// timestamps reset. Pass `id` for a single memory (full UUID or short prefix) or `from`
+    /// to bulk-copy. Empty strings on `from`/`to` target or assign a NULL project. Set
+    /// `dry_run: true` to preview without writing.
     #[tool(name = "memory_copy")]
     fn copy_tool(&self, Parameters(args): Parameters<CopyArgs>) -> String {
         let to = empty_to_none_owned(&args.to);
         let dry_run = args.dry_run.unwrap_or(false);
         let conn = self.conn.lock().unwrap();
-        match run_copy(
+
+        let resolved_id = match args.id.as_deref() {
+            None => None,
+            Some(raw) => match queries::resolve_id_prefix(&conn, raw) {
+                Ok(ResolvedId::Exact(full)) => Some(full),
+                Ok(ResolvedId::Ambiguous(cands)) => {
+                    return render::render_ambiguous(raw, &cands);
+                }
+                Ok(ResolvedId::NotFound) => {
+                    return render::render_action_result(
+                        "not_found",
+                        &[("id", raw.to_string())],
+                    );
+                }
+                Err(e) => return Self::err_xml(e),
+            },
+        };
+
+        run_copy(
             &conn,
-            args.id.as_deref(),
+            resolved_id.as_deref(),
             args.from.as_deref(),
             to.as_deref(),
             dry_run,
-        ) {
-            Ok(v) => serde_json::to_string_pretty(&v)
-                .unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e)),
-            Err(e) => format!("{{\"error\": \"{}\"}}", Self::err_str(e)),
-        }
+        )
     }
 
-    /// List distinct project idents with memory counts. Useful for spotting
-    /// alias mismatches (e.g. "trading-platform-sre" vs
-    /// "github.com/nitecon/SRE.git") before running memory_move. The current
-    /// cwd-derived project is marked with is_current_project: true.
+    /// List distinct project idents with memory counts. Useful for spotting alias mismatches
+    /// before running memory_move. The current cwd-derived project is marked with `*`.
+    /// Returns a <projects count=".."/> light-XML block.
     #[tool(name = "memory_projects")]
     fn projects(&self) -> String {
         let cwd_project = project::project_ident_from_cwd().ok();
         let conn = self.conn.lock().unwrap();
         let rows = match queries::list_projects(&conn) {
             Ok(r) => r,
-            Err(e) => return format!("{{\"error\": \"{}\"}}", Self::err_str(e)),
+            Err(e) => return Self::err_xml(e),
         };
-        let items: Vec<Value> = rows
-            .iter()
-            .map(|(p, c)| {
-                let is_current = cwd_project
-                    .as_deref()
-                    .map(|cp| p.as_deref() == Some(cp))
-                    .unwrap_or(false);
-                json!({
-                    "project": p,
-                    "count": c,
-                    "is_current_project": is_current,
-                })
-            })
-            .collect();
-        let mut out = serde_json::Map::new();
-        out.insert("projects".into(), Value::Array(items));
-        if let Some(cp) = cwd_project.as_deref() {
-            out.insert("current_project".into(), Value::String(cp.to_string()));
-        }
-        serde_json::to_string_pretty(&Value::Object(out))
-            .unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e))
+        render::render_projects(&rows, cwd_project.as_deref())
     }
 }
 
@@ -570,115 +564,169 @@ fn empty_to_none_owned(s: &str) -> Option<String> {
     }
 }
 
+/// Execute a move operation and return a light-XML string. Shared between the
+/// MCP move tool and the would-be CLI path; duplicated here to keep the MCP
+/// module compilable without pulling in cli internals.
 fn run_move(
     conn: &Connection,
     id: Option<&str>,
     from: Option<&str>,
     to: Option<&str>,
     dry_run: bool,
-) -> Result<Value, MemoryError> {
+) -> String {
     match (id, from) {
         (Some(id), _) => {
             if dry_run {
-                let mem = queries::get_memory_by_id(conn, id)?;
-                Ok(json!({
-                    "status": "dry_run",
-                    "would_move": 1,
-                    "id": mem.id,
-                    "from_project": mem.project,
-                    "to_project": to,
-                }))
+                match queries::get_memory_by_id(conn, id) {
+                    Ok(mem) => {
+                        let mut attrs: Vec<(&str, String)> = vec![
+                            ("id", render::short_id(&mem.id).to_string()),
+                            ("would_move", "1".to_string()),
+                        ];
+                        if let Some(p) = mem.project.as_deref() {
+                            attrs.push(("from_project", p.to_string()));
+                        }
+                        if let Some(t) = to {
+                            attrs.push(("to_project", t.to_string()));
+                        }
+                        render::render_action_result("dry_run", &attrs)
+                    }
+                    Err(e) => MemoryServer::err_xml(e),
+                }
             } else {
-                let changed = queries::move_memory_by_id(conn, id, to)?;
-                Ok(json!({
-                    "status": if changed { "moved" } else { "not_found" },
-                    "id": id,
-                    "to_project": to,
-                }))
+                match queries::move_memory_by_id(conn, id, to) {
+                    Ok(changed) => {
+                        let status = if changed { "moved" } else { "not_found" };
+                        let mut attrs: Vec<(&str, String)> =
+                            vec![("id", render::short_id(id).to_string())];
+                        if let Some(t) = to {
+                            attrs.push(("to_project", t.to_string()));
+                        }
+                        render::render_action_result(status, &attrs)
+                    }
+                    Err(e) => MemoryServer::err_xml(e),
+                }
             }
         }
         (None, Some(from)) => {
             let from_opt = if from.is_empty() { None } else { Some(from) };
             if dry_run {
-                let mems = queries::list_memories_by_project(conn, from_opt)?;
-                Ok(json!({
-                    "status": "dry_run",
-                    "would_move": mems.len(),
-                    "from_project": from_opt,
-                    "to_project": to,
-                    "ids": mems.iter().map(|m| &m.id).collect::<Vec<_>>(),
-                }))
+                match queries::list_memories_by_project(conn, from_opt) {
+                    Ok(mems) => {
+                        let mut attrs: Vec<(&str, String)> = vec![
+                            ("would_move", mems.len().to_string()),
+                            ("from_project", from_opt.unwrap_or("").to_string()),
+                        ];
+                        if let Some(t) = to {
+                            attrs.push(("to_project", t.to_string()));
+                        }
+                        render::render_action_result("dry_run", &attrs)
+                    }
+                    Err(e) => MemoryServer::err_xml(e),
+                }
             } else {
-                let count = queries::move_memories_by_project(conn, from_opt, to)?;
-                Ok(json!({
-                    "status": "moved",
-                    "count": count,
-                    "from_project": from_opt,
-                    "to_project": to,
-                }))
+                match queries::move_memories_by_project(conn, from_opt, to) {
+                    Ok(count) => {
+                        let mut attrs: Vec<(&str, String)> = vec![
+                            ("count", count.to_string()),
+                            ("from_project", from_opt.unwrap_or("").to_string()),
+                        ];
+                        if let Some(t) = to {
+                            attrs.push(("to_project", t.to_string()));
+                        }
+                        render::render_action_result("moved", &attrs)
+                    }
+                    Err(e) => MemoryServer::err_xml(e),
+                }
             }
         }
-        (None, None) => Ok(json!({
-            "status": "error",
-            "message": "Either 'id' or 'from' must be provided",
-        })),
+        (None, None) => render::render_action_result(
+            "error",
+            &[("message", "Either 'id' or 'from' must be provided".to_string())],
+        ),
     }
 }
 
+/// Execute a copy operation and return a light-XML string. See [`run_move`] for
+/// the contract; this is its copy-flavored twin.
 fn run_copy(
     conn: &Connection,
     id: Option<&str>,
     from: Option<&str>,
     to: Option<&str>,
     dry_run: bool,
-) -> Result<Value, MemoryError> {
+) -> String {
     match (id, from) {
         (Some(id), _) => {
             if dry_run {
-                let mem = queries::get_memory_by_id(conn, id)?;
-                Ok(json!({
-                    "status": "dry_run",
-                    "would_copy": 1,
-                    "source_id": mem.id,
-                    "from_project": mem.project,
-                    "to_project": to,
-                }))
+                match queries::get_memory_by_id(conn, id) {
+                    Ok(mem) => {
+                        let mut attrs: Vec<(&str, String)> = vec![
+                            ("source_id", render::short_id(&mem.id).to_string()),
+                            ("would_copy", "1".to_string()),
+                        ];
+                        if let Some(p) = mem.project.as_deref() {
+                            attrs.push(("from_project", p.to_string()));
+                        }
+                        if let Some(t) = to {
+                            attrs.push(("to_project", t.to_string()));
+                        }
+                        render::render_action_result("dry_run", &attrs)
+                    }
+                    Err(e) => MemoryServer::err_xml(e),
+                }
             } else {
-                let new_id = queries::copy_memory_by_id(conn, id, to)?;
-                Ok(json!({
-                    "status": "copied",
-                    "source_id": id,
-                    "new_id": new_id,
-                    "to_project": to,
-                }))
+                match queries::copy_memory_by_id(conn, id, to) {
+                    Ok(new_id) => {
+                        let mut attrs: Vec<(&str, String)> = vec![
+                            ("source_id", render::short_id(id).to_string()),
+                            ("new_id", render::short_id(&new_id).to_string()),
+                        ];
+                        if let Some(t) = to {
+                            attrs.push(("to_project", t.to_string()));
+                        }
+                        render::render_action_result("copied", &attrs)
+                    }
+                    Err(e) => MemoryServer::err_xml(e),
+                }
             }
         }
         (None, Some(from)) => {
             let from_opt = if from.is_empty() { None } else { Some(from) };
             if dry_run {
-                let mems = queries::list_memories_by_project(conn, from_opt)?;
-                Ok(json!({
-                    "status": "dry_run",
-                    "would_copy": mems.len(),
-                    "from_project": from_opt,
-                    "to_project": to,
-                    "source_ids": mems.iter().map(|m| &m.id).collect::<Vec<_>>(),
-                }))
+                match queries::list_memories_by_project(conn, from_opt) {
+                    Ok(mems) => {
+                        let mut attrs: Vec<(&str, String)> = vec![
+                            ("would_copy", mems.len().to_string()),
+                            ("from_project", from_opt.unwrap_or("").to_string()),
+                        ];
+                        if let Some(t) = to {
+                            attrs.push(("to_project", t.to_string()));
+                        }
+                        render::render_action_result("dry_run", &attrs)
+                    }
+                    Err(e) => MemoryServer::err_xml(e),
+                }
             } else {
-                let new_ids = queries::copy_memories_by_project(conn, from_opt, to)?;
-                Ok(json!({
-                    "status": "copied",
-                    "count": new_ids.len(),
-                    "from_project": from_opt,
-                    "to_project": to,
-                    "new_ids": new_ids,
-                }))
+                match queries::copy_memories_by_project(conn, from_opt, to) {
+                    Ok(new_ids) => {
+                        let mut attrs: Vec<(&str, String)> = vec![
+                            ("count", new_ids.len().to_string()),
+                            ("from_project", from_opt.unwrap_or("").to_string()),
+                        ];
+                        if let Some(t) = to {
+                            attrs.push(("to_project", t.to_string()));
+                        }
+                        render::render_action_result("copied", &attrs)
+                    }
+                    Err(e) => MemoryServer::err_xml(e),
+                }
             }
         }
-        (None, None) => Ok(json!({
-            "status": "error",
-            "message": "Either 'id' or 'from' must be provided",
-        })),
+        (None, None) => render::render_action_result(
+            "error",
+            &[("message", "Either 'id' or 'from' must be provided".to_string())],
+        ),
     }
 }
 
@@ -714,43 +762,23 @@ fn resolve_boosts<'a>(
     }
 }
 
-fn render_ranked_output(
-    results: &[SearchResult],
-    current_project: Option<&str>,
-    format: OutputFormat,
-    preview_chars: usize,
-) -> Value {
+/// Render a ranked result set as light-XML with the same reflection hint the
+/// CLI emits. Factored out so `search` and `context` share the rendering path.
+fn render_ranked_xml(results: &[SearchResult], current_project: Option<&str>) -> String {
     let total = results.len();
-    let global_scope_count = results.iter().filter(|r| r.is_global).count();
-    let cross_project_count = if current_project.is_some() {
+    let globals = results.iter().filter(|r| r.is_global).count();
+    let cross = if current_project.is_some() {
         results.iter().filter(|r| !r.is_current_project).count()
     } else {
         0
     };
-
-    let items: Vec<Value> = results
-        .iter()
-        .map(|r| render_ranked(r, format, preview_chars))
-        .collect();
-
-    let mut out = serde_json::Map::new();
-    out.insert("results".into(), Value::Array(items));
-    if let Some(cp) = current_project {
-        out.insert("current_project".into(), Value::String(cp.to_string()));
-        out.insert(
-            "cross_project_count".into(),
-            Value::Number(cross_project_count.into()),
-        );
+    let hint = results_hint(cross, globals, total, current_project);
+    let rendered = render::render_search_results(results, current_project, hint.as_deref());
+    if rendered.is_empty() {
+        "<results count=\"0\"/>".to_string()
+    } else {
+        rendered
     }
-    out.insert(
-        "global_scope_count".into(),
-        Value::Number(global_scope_count.into()),
-    );
-    if let Some(hint) = results_hint(cross_project_count, global_scope_count, total, current_project)
-    {
-        out.insert("hint".into(), Value::String(hint));
-    }
-    Value::Object(out)
 }
 
 /// See `crate::cli::results_hint` for the full doc; kept in sync verbatim.
@@ -794,107 +822,22 @@ fn results_hint(
     }
 }
 
-fn render_ranked(r: &SearchResult, format: OutputFormat, preview_chars: usize) -> Value {
-    match format {
-        OutputFormat::Brief => json!({
-            "id": r.memory.id,
-            "tags": r.memory.tags,
-            "project": r.memory.project,
-            "memory_type": r.memory.memory_type,
-            "match_quality": r.match_quality.as_str(),
-            "is_current_project": r.is_current_project,
-            "preview": preview(&r.memory.content, preview_chars),
-            "content_len": r.memory.content.chars().count(),
-        }),
-        OutputFormat::Full => json!({
-            "id": r.memory.id,
-            "content": r.memory.content,
-            "tags": r.memory.tags,
-            "project": r.memory.project,
-            "agent": r.memory.agent,
-            "memory_type": r.memory.memory_type,
-            "match_quality": r.match_quality.as_str(),
-            "is_current_project": r.is_current_project,
-            "score": r.rank_info.score,
-            "bm25_rank": r.rank_info.bm25_rank,
-            "vector_rank": r.rank_info.vector_rank,
-            "access_count": r.memory.access_count,
-            "created_at": r.memory.created_at,
-        }),
-    }
-}
-
-fn render_memory_list(
-    memories: &[Memory],
-    cwd_project: Option<&str>,
-    format: OutputFormat,
-    preview_chars: usize,
-) -> Value {
-    let items: Vec<Value> = memories
-        .iter()
-        .map(|m| render_memory(m, cwd_project, format, preview_chars))
-        .collect();
-    Value::Array(items)
-}
-
-fn render_memory(
-    m: &Memory,
-    cwd_project: Option<&str>,
-    format: OutputFormat,
-    preview_chars: usize,
-) -> Value {
-    let is_current = cwd_project
-        .map(|cp| m.project.as_deref() == Some(cp))
-        .unwrap_or(false);
-    match format {
-        OutputFormat::Brief => json!({
-            "id": m.id,
-            "tags": m.tags,
-            "project": m.project,
-            "memory_type": m.memory_type,
-            "is_current_project": is_current,
-            "preview": preview(&m.content, preview_chars),
-            "content_len": m.content.chars().count(),
-            "access_count": m.access_count,
-            "updated_at": m.updated_at,
-        }),
-        OutputFormat::Full => json!({
-            "id": m.id,
-            "content": m.content,
-            "tags": m.tags,
-            "project": m.project,
-            "agent": m.agent,
-            "memory_type": m.memory_type,
-            "is_current_project": is_current,
-            "access_count": m.access_count,
-            "created_at": m.created_at,
-            "updated_at": m.updated_at,
-        }),
-    }
-}
-
-fn preview(content: &str, n: usize) -> String {
-    let mut out: String = content.chars().take(n).collect();
-    if content.chars().count() > n {
-        out.push('…');
-    }
-    out
-}
-
 #[tool_handler]
 impl ServerHandler for MemoryServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(
-                "Persistent memory system for AI coding agents. \
+                "Persistent memory system for AI coding agents. All tools return light-XML \
+                 text (sectioned tags with numbered content lines — no JSON). \
                  memory_store saves context (auto-tagged with cwd project), \
                  memory_search and memory_context rank with a current-project boost and \
-                 return brief previews by default; fetch full content via memory_get. \
+                 return grouped <project_memories>/<general_knowledge>/<other_projects> \
+                 sections; fetch full content via memory_get. \
                  memory_recall filters by project/agent/tags/type, \
-                 memory_forget deletes by id or query, memory_prune cleans stale memories. \
-                 memory_projects lists distinct project idents (spot aliases), \
-                 memory_move reassigns the project ident on memories (single id or bulk --from/--to), \
-                 memory_copy duplicates memories under a new project ident.",
+                 memory_forget deletes by id (short prefix supported) or query, \
+                 memory_prune cleans stale memories. memory_projects lists distinct project \
+                 idents (spot aliases), memory_move reassigns the project ident on memories \
+                 (single id or bulk from/to), memory_copy duplicates memories under a new ident.",
             )
     }
 }
