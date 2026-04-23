@@ -17,4 +17,5 @@
 
 pub mod menu;
 pub mod rules;
+pub mod settings_json;
 pub mod skill;
