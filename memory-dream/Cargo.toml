@@ -54,3 +54,18 @@ tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 
 # HuggingFace Hub client (used by --pull to download gemma3 weights).
 hf-hub = { version = "0.4", default-features = false, features = ["tokio", "rustls-tls"] }
+
+# HTTP client — used directly for the HEAD metadata probe in the HF hub
+# adapter so we can surface total file size before streaming begins.
+# hf-hub re-exports a client but not its status-code types, and matching
+# 401/403/404 on a typed StatusCode is cleaner than string-matching.
+reqwest = { workspace = true }
+
+# Async trait objects for the HubClient abstraction (test fake vs. real
+# hf-hub impl). Tiny; no additional runtime cost.
+async-trait = "0.1"
+
+[dev-dependencies]
+# Isolated staging dirs for the fake HubClient and for cache-dir fixtures
+# in the model_manager tests.
+tempfile = "3"
