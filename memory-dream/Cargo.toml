@@ -44,6 +44,20 @@ anyhow = { workspace = true }
 sha2 = "0.10"
 hex = "0.4"
 
+# Settings file (dream.toml) — TOML parse/serialize for the persistent
+# backend/model config layer. Intentionally separate from the SQLite store
+# so the file is human-editable and version-controllable.
+toml = "0.8"
+
+# PATH probing for the first-run auto-detect: checks for `claude` / `gemini`
+# binaries so a fresh install defaults to the right backend without prompts.
+which = "8"
+
+# Shell-safe tokenization of the headless command template. Used at
+# settings-load time so memory content is never re-interpreted by a shell;
+# spawn happens via `Command::new(tokens[0]).args(&tokens[1..])`.
+shlex = "1"
+
 # Candle — pure-Rust in-process inference backend for gemma3.
 # The feature flags pull in the gemma model definition, tokenizers, and
 # metal/accelerate backends where available (falling back to CPU).

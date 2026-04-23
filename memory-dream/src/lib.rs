@@ -9,3 +9,4 @@ pub mod cli;
 pub mod dream;
 pub mod inference;
 pub mod model_manager;
+pub mod settings;
