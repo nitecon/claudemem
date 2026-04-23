@@ -1027,8 +1027,8 @@ mod tests {
         // Attach the correct hash for config.json so verification on the
         // existing tampered file fails; other files have no etag, so
         // they pass through as checksum_skipped.
-        let client = FakeHubClient::new(files)
-            .with_etag("config.json", Some(hash_bytes(&authentic)));
+        let client =
+            FakeHubClient::new(files).with_etag("config.json", Some(hash_bytes(&authentic)));
 
         let rep = pull_model(&client, cache.path(), "gemma3", null_progress())
             .await
