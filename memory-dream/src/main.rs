@@ -18,7 +18,9 @@ use anyhow::Context;
 use clap::Parser;
 use memory_dream::cli::{Cli, Commands, ConfigCmd, ConfigSetArgs, RmArgs, TestArgs, UseArgs};
 use memory_dream::dream::{DreamConfig, DreamMode};
-use memory_dream::inference::{CandleInference, HeadlessInference, Inference, NoopInference};
+use memory_dream::inference::{
+    CandleInference, DevicePreference, HeadlessInference, Inference, NoopInference,
+};
 use memory_dream::model_manager;
 use memory_dream::settings::{BackendMode, CliOverrides, Settings};
 use tracing_subscriber::EnvFilter;
@@ -325,7 +327,22 @@ fn build_inference(
         BackendMode::Local => {
             let model_dir =
                 model_manager::resolve_model_path(model_cache_dir, &effective.active_model);
-            match CandleInference::new(&model_dir) {
+            // Parse the device preference here so misconfigured dream.toml
+            // surfaces a clean error before we try to mmap weights. A bad
+            // string falls back to `auto` so a corrupted file doesn't halt
+            // the pass outright — the warning is enough.
+            let pref = match effective.device.parse::<DevicePreference>() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!(
+                        "[WARN] invalid local.device {:?} in dream.toml ({e}); \
+                         falling back to 'auto'.",
+                        effective.device
+                    );
+                    DevicePreference::Auto
+                }
+            };
+            match CandleInference::new(&model_dir, pref) {
                 Ok(i) => Box::new(i),
                 Err(e) => {
                     eprintln!(

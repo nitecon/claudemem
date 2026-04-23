@@ -3,34 +3,43 @@
 //! The dream pipeline depends on exactly one capability: given a prompt,
 //! return a completion string. That narrow surface is modeled by the
 //! [`Inference`] trait, which lets tests swap in a deterministic stub
-//! without ever loading a multi-GB gemma3 checkpoint.
+//! without ever loading a multi-GB checkpoint.
 //!
-//! Two impls live in this file:
+//! Impls in this module tree:
 //!
-//! * [`FixedInference`] — returns a canned string for every call, used by the
-//!   dream unit tests. No dependencies on candle or model files.
-//! * [`CandleInference`] — wraps `candle-core` + `candle-transformers`. Loads
-//!   gemma3 weights from the local model cache; fails with a structured error
-//!   when the cache is empty (the user must run `memory-dream --pull` first).
-//!
-//! The candle path is deliberately *thin*. Anything that needs a real inference
-//! pass is a user action; unit tests never invoke it. The surface exists so
-//! the rest of the pipeline (prompt construction, response parsing, dedup)
-//! compiles and exercises against the trait without touching network or GPU.
+//! * [`FixedInference`] — returns a canned string for every call; the dream
+//!   unit tests rely on it to exercise the full condense → parse → dedup
+//!   pipeline without ever touching candle or a tokenizer.
+//! * [`NoopInference`] — always returns [`InferenceError::ModelMissing`];
+//!   the CLI drops to this when the candle backend can't initialize so the
+//!   dream orchestrator still runs a dedup-only pass.
+//! * [`CandleInference`] — real in-process inference. Loads a tokenizer and
+//!   model weights from disk, runs a KV-cache-aware sampling loop, and
+//!   returns the decoded completion. Lives in [`candle_backend`] so the
+//!   heavy dependency surface is scoped to one file.
+//! * [`HeadlessInference`] — spawns an external CLI (e.g. `claude -p`) as
+//!   an inference source. Kept separate so a user without a local model
+//!   can still condense memories through whatever CLI they already have.
 
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+pub mod candle_backend;
+pub mod device;
 pub mod headless;
 
+pub use candle_backend::CandleInference;
+pub use device::{resolve_device, DevicePreference};
 pub use headless::HeadlessInference;
 
 /// Errors surfaced by any [`Inference`] implementation.
 ///
-/// Grouped so the dream orchestrator can distinguish "transient — retry
-/// later" (`Io`) from "misconfigured — user must act" (`ModelMissing`) from
-/// "response is unusable — fall back to raw" (`Refusal`, `ParseError`).
+/// Grouped so the dream orchestrator can distinguish:
+///   * "transient — retry later" (`GenerationFailed`, `Io`)
+///   * "misconfigured — user must act" (`ModelMissing`, `LoadFailed`,
+///     `ArchUnsupported`, `DeviceUnavailable`)
+///   * "response is unusable — fall back to raw" (`Refusal`, `ParseError`)
 #[derive(Debug, Error)]
 pub enum InferenceError {
     /// The configured model directory does not contain the expected files.
@@ -38,6 +47,28 @@ pub enum InferenceError {
     /// before `memory-dream --pull`.
     #[error("model not found at {path}: {detail}")]
     ModelMissing { path: PathBuf, detail: String },
+
+    /// Loading one of the model artifacts failed. Distinct from
+    /// `ModelMissing` — the file exists but is malformed, truncated, a
+    /// wrong version, or a safetensors file with a shape mismatch against
+    /// the declared config. Carries the path so the CLI can tell the user
+    /// which asset to re-pull.
+    #[error("failed to load {file}: {reason}")]
+    LoadFailed { file: PathBuf, reason: String },
+
+    /// The config's `model_type` is recognized by HuggingFace but not yet
+    /// wired into our dispatch table. Surfacing this cleanly lets us land
+    /// architectures one at a time without forking the CLI.
+    #[error(
+        "unsupported model architecture '{0}'; supported: gemma3, llama (TinyLlama, SmolLM)"
+    )]
+    ArchUnsupported(String),
+
+    /// The caller asked for a device (Metal/CUDA) that isn't usable on this
+    /// host. Only raised when the user *explicitly* selected the device —
+    /// the `Auto` preference silently falls back to CPU instead.
+    #[error("device '{requested}' unavailable: {detail}")]
+    DeviceUnavailable { requested: String, detail: String },
 
     /// The model produced a response but it could not be parsed into the
     /// structured shape dream expects (e.g. the JSON envelope was malformed).
@@ -52,7 +83,13 @@ pub enum InferenceError {
     #[error("model refused: {0}")]
     Refusal(String),
 
-    /// Unexpected underlying IO / tokenizer / candle failure.
+    /// A runtime failure during the candle forward pass or sampling loop.
+    /// Backstop for any error thrown by candle/tokenizers mid-generation.
+    #[error("generation failed: {0}")]
+    GenerationFailed(String),
+
+    /// Unexpected underlying IO / tokenizer / candle failure outside of the
+    /// generation hot path (e.g. subprocess spawn for HeadlessInference).
     #[error("inference backend error: {0}")]
     Io(String),
 }
@@ -95,49 +132,6 @@ impl Inference for FixedInference {
     }
 }
 
-/// Real candle-backed inference for gemma3.
-///
-/// Construction loads the model from `model_dir`. The actual generation
-/// implementation is intentionally stubbed out below — loading gemma3 and
-/// running a full sampling loop requires multi-GB weights the user must
-/// pull explicitly, and wiring the candle sampling loop here without a
-/// tested checkpoint would be a guess. The stub surface exists so the rest
-/// of the pipeline compiles and the CLI can expose `--dry-run` today; a
-/// follow-up user-driven pass lands the real sampling loop once gemma3
-/// weights have been downloaded and validated end-to-end.
-#[derive(Debug)]
-pub struct CandleInference {
-    #[allow(dead_code)]
-    model_dir: PathBuf,
-}
-
-impl CandleInference {
-    /// Load gemma3 from `model_dir`. Returns `ModelMissing` when the
-    /// expected files (config.json, tokenizer.json, safetensors shards)
-    /// are absent so the caller can nudge the user toward `--pull`.
-    pub fn new(model_dir: impl AsRef<Path>) -> Result<Self, InferenceError> {
-        let model_dir = model_dir.as_ref().to_path_buf();
-        let config = model_dir.join("config.json");
-        let tokenizer = model_dir.join("tokenizer.json");
-        if !config.exists() || !tokenizer.exists() {
-            return Err(InferenceError::ModelMissing {
-                path: model_dir.clone(),
-                detail: format!(
-                    "expected config.json and tokenizer.json; got config={} tokenizer={}",
-                    config.exists(),
-                    tokenizer.exists()
-                ),
-            });
-        }
-        // TODO(dream): wire up the candle gemma3 load + sampling loop once
-        // a real checkpoint has been pulled and validated by the user. For
-        // now we accept the directory shape and defer actual model loading
-        // so `memory-dream --dry-run` can operate without ever touching
-        // candle's multi-GB allocation path.
-        Ok(Self { model_dir })
-    }
-}
-
 /// Always returns [`InferenceError::ModelMissing`] — used by the CLI when
 /// the candle backend couldn't initialize (e.g. no model pulled yet) so the
 /// dream orchestrator can still run a dedup-only fallback pass. Every
@@ -159,24 +153,8 @@ impl NoopInference {
 impl Inference for NoopInference {
     fn generate(&self, _prompt: &str, _max_tokens: u32) -> Result<String, InferenceError> {
         Err(InferenceError::ModelMissing {
-            path: std::path::PathBuf::new(),
+            path: Path::new("").to_path_buf(),
             detail: self.reason.clone(),
-        })
-    }
-}
-
-impl Inference for CandleInference {
-    fn generate(&self, _prompt: &str, _max_tokens: u32) -> Result<String, InferenceError> {
-        // Honest stub: the real sampling loop is a follow-up user action
-        // (requires gemma3 weights present and a validated generation path).
-        // Surfacing this as ModelMissing keeps the orchestrator's fallback
-        // behavior correct — the pass falls back to dedup-only on error
-        // per the `memory-dream --dry-run` documented behavior.
-        Err(InferenceError::ModelMissing {
-            path: self.model_dir.clone(),
-            detail: "candle generation path not wired; run --pull and an \
-                     end-to-end validation pass before enabling condensation"
-                .to_string(),
         })
     }
 }
@@ -193,8 +171,27 @@ mod tests {
     }
 
     #[test]
+    fn noop_inference_returns_model_missing() {
+        let i = NoopInference::new("no model on disk");
+        let err = i.generate("x", 1).unwrap_err();
+        match err {
+            InferenceError::ModelMissing { detail, .. } => {
+                assert!(detail.contains("no model"));
+            }
+            other => panic!("expected ModelMissing, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn candle_inference_errors_on_missing_model_dir() {
-        let err = CandleInference::new("/tmp/definitely-not-a-real-path-xyz").unwrap_err();
+        // Smoke: construction against a non-existent path surfaces a clean
+        // ModelMissing (no candle load is attempted). Detailed load-failure
+        // tests live in `candle_backend::tests`.
+        let err = CandleInference::new(
+            "/tmp/definitely-not-a-real-path-xyz",
+            DevicePreference::Cpu,
+        )
+        .unwrap_err();
         match err {
             InferenceError::ModelMissing { .. } => {}
             other => panic!("expected ModelMissing, got {other:?}"),

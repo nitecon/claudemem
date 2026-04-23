@@ -133,6 +133,17 @@ pub struct LocalConfig {
     /// the model-management UX.
     #[serde(default)]
     pub downloaded_models: Vec<String>,
+    /// Device preference for the candle backend: `auto|cpu|metal|cuda`.
+    /// Defaults to `auto` — pick the best-available accelerator for the host
+    /// and fall back to CPU on init failure. Explicit values are strict: if
+    /// the user asks for Metal on a machine without Metal we error rather
+    /// than silently downgrade.
+    #[serde(default = "default_device")]
+    pub device: String,
+}
+
+fn default_device() -> String {
+    "auto".to_string()
 }
 
 /// `[headless]` section.
@@ -184,6 +195,7 @@ impl Settings {
             active_model: model,
             headless_command: command,
             headless_timeout_ms: self.headless.timeout_ms,
+            device: self.local.device.clone(),
         }
     }
 
@@ -303,6 +315,7 @@ impl Settings {
             local: LocalConfig {
                 active_model: DEFAULT_LOCAL_MODEL.to_string(),
                 downloaded_models: Vec::new(),
+                device: default_device(),
             },
             headless: HeadlessConfig {
                 command: command.to_string(),
@@ -320,6 +333,7 @@ impl Settings {
             local: LocalConfig {
                 active_model: DEFAULT_LOCAL_MODEL.to_string(),
                 downloaded_models: Vec::new(),
+                device: default_device(),
             },
             headless: HeadlessConfig {
                 command: DEFAULT_CLAUDE_COMMAND.to_string(),
@@ -364,6 +378,16 @@ impl Settings {
             "local.active_model" => {
                 self.local.active_model = value.to_string();
             }
+            "local.device" => {
+                // Validate the string resolves to a known preference so a
+                // typo surfaces at `config set` time rather than during the
+                // next dream pass. Persist the value verbatim so the TOML
+                // reads naturally (`auto` / `cpu` / `metal` / `cuda`).
+                value
+                    .parse::<crate::inference::DevicePreference>()
+                    .map_err(|e| format!("invalid local.device {value:?}: {e}"))?;
+                self.local.device = value.to_string();
+            }
             "headless.command" => {
                 if shlex::split(value).is_none() {
                     return Err(format!(
@@ -381,7 +405,8 @@ impl Settings {
             other => {
                 return Err(format!(
                     "unknown setting '{other}'. Supported keys: backend.mode, \
-                     local.active_model, headless.command, headless.timeout_ms"
+                     local.active_model, local.device, headless.command, \
+                     headless.timeout_ms"
                 ));
             }
         }
@@ -409,6 +434,11 @@ pub struct EffectiveConfig {
     pub active_model: String,
     pub headless_command: String,
     pub headless_timeout_ms: u64,
+    /// Raw device preference string (`auto|cpu|metal|cuda`). The candle
+    /// backend parses this into a [`crate::inference::DevicePreference`] at
+    /// load time. Kept as a string here so settings and CLI override flows
+    /// share one storage shape.
+    pub device: String,
 }
 
 #[cfg(test)]

@@ -83,3 +83,9 @@ async-trait = "0.1"
 # Isolated staging dirs for the fake HubClient and for cache-dir fixtures
 # in the model_manager tests.
 tempfile = "3"
+
+[features]
+# Gate CUDA-only code paths in the device resolver. Turning this on also
+# requires the upstream candle crates' `cuda` feature; we keep ours separate
+# so a local dev build doesn't need the CUDA toolkit installed.
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
