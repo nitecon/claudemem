@@ -1150,4 +1150,160 @@ mod tests {
         assert_eq!(scope_label(MemoryScope::Project), "project");
         assert_eq!(scope_label(MemoryScope::Global), "global");
     }
+
+    // -- Light-XML output shape tests ---------------------------------------
+    //
+    // These replace the removed JSON-shape assertions. They exercise the same
+    // render helpers the CLI dispatch layer prints, so we lock in the text
+    // format without having to capture stdout from the `execute` function.
+
+    use crate::db::models::Memory;
+    use crate::render;
+
+    fn mk_mem(id: &str, content: &str, project: Option<&str>) -> Memory {
+        Memory {
+            id: id.to_string(),
+            content: content.to_string(),
+            tags: None,
+            project: project.map(String::from),
+            agent: None,
+            source_file: None,
+            created_at: "2026-04-23T00:00:00Z".to_string(),
+            updated_at: "2026-04-23T00:00:00Z".to_string(),
+            access_count: 0,
+            embedding: None,
+            memory_type: Some("user".to_string()),
+        }
+    }
+
+    /// Store result should emit a single `<result status="stored" .../>` line
+    /// carrying the short ID, scope, and project. No JSON braces anywhere.
+    #[test]
+    fn store_output_is_light_xml_result_line() {
+        let s = render::render_action_result(
+            "stored",
+            &[
+                (
+                    "id",
+                    render::short_id("abcdef12-3456-7890-abcd-ef1234567890").to_string(),
+                ),
+                ("scope", "global".to_string()),
+                ("project", "__global__".to_string()),
+            ],
+        );
+        assert_eq!(
+            s,
+            r#"<result status="stored" id="abcdef12" scope="global" project="__global__"/>"#
+        );
+        assert!(!s.contains('{'));
+        assert!(!s.contains('}'));
+    }
+
+    /// Forget-by-id success emits `<result status="forgot" .../>` with the
+    /// short ID. Not-found emits `status="not_found"` instead.
+    #[test]
+    fn forget_output_uses_forgot_status_on_success() {
+        let s_ok = render::render_action_result("forgot", &[("id", "a4936eff".to_string())]);
+        assert_eq!(s_ok, r#"<result status="forgot" id="a4936eff"/>"#);
+
+        let s_miss =
+            render::render_action_result("not_found", &[("id", "deadbeef".to_string())]);
+        assert_eq!(s_miss, r#"<result status="not_found" id="deadbeef"/>"#);
+    }
+
+    /// Forget-by-query with no hits emits `no_matches`; with hits emits the
+    /// count in the attribute set.
+    #[test]
+    fn forget_by_query_status_no_matches_vs_forgot() {
+        assert_eq!(
+            render::render_action_result("no_matches", &[]),
+            r#"<result status="no_matches"/>"#
+        );
+        let s = render::render_action_result("forgot", &[("count", "3".to_string())]);
+        assert_eq!(s, r#"<result status="forgot" count="3"/>"#);
+    }
+
+    /// Prune emits `<result status="pruned" count=".."/>` or `dry_run` when
+    /// the --dry-run flag is passed. No longer carries the memory content list
+    /// (callers can list + prune separately for a preview now).
+    #[test]
+    fn prune_output_uses_count_attribute() {
+        let s = render::render_action_result("pruned", &[("count", "7".to_string())]);
+        assert_eq!(s, r#"<result status="pruned" count="7"/>"#);
+        let s_dry = render::render_action_result("dry_run", &[("count", "7".to_string())]);
+        assert_eq!(s_dry, r#"<result status="dry_run" count="7"/>"#);
+    }
+
+    /// Memory get renders a `<memory>` wrapper with metadata attributes and
+    /// the full content as inner text.
+    #[test]
+    fn get_output_is_memory_wrapper_with_full_content() {
+        let m = mk_mem(
+            "a4936eff-1234-5678-9abc-def012345678",
+            "Content line\nwith newline",
+            Some("agent-memory"),
+        );
+        let s = render::render_memory(&m);
+        assert!(s.starts_with("<memory id=\"a4936eff\""));
+        assert!(s.contains("project=\"agent-memory\""));
+        assert!(s.contains("Content line\nwith newline"));
+        assert!(s.ends_with("</memory>"));
+    }
+
+    /// Projects output uses a `<projects count=".."/>` block with lines
+    /// marking the current project with `*`.
+    #[test]
+    fn projects_output_marks_current_project() {
+        let rows = vec![
+            (Some("agent-memory".to_string()), 42_i64),
+            (Some("colorithmic".to_string()), 7),
+        ];
+        let s = render::render_projects(&rows, Some("agent-memory"));
+        assert!(s.contains("<projects count=\"2\">"));
+        assert!(s.contains("*agent-memory (42)"));
+        assert!(s.contains(" colorithmic (7)"));
+    }
+
+    /// List empty projects surfaces a self-closing `<projects count="0"/>`.
+    #[test]
+    fn projects_output_empty_is_self_closing() {
+        assert_eq!(
+            render::render_projects(&[], None),
+            "<projects count=\"0\"/>"
+        );
+    }
+
+    /// Memory list renders `<memories count=".."/>` with the current-project
+    /// marker when cwd matches.
+    #[test]
+    fn list_output_is_memory_list_block() {
+        let mems = vec![
+            mk_mem("11111111-aaaa", "local mem", Some("agent-memory")),
+            mk_mem("22222222-bbbb", "other mem", Some("colorithmic")),
+        ];
+        let s = render::render_memory_list(&mems, Some("agent-memory"));
+        assert!(s.contains("<memories count=\"2\">"));
+        assert!(s.contains("1.*(user) agent-memory"));
+        assert!(s.contains("2. (user) colorithmic"));
+        assert!(s.ends_with("</memories>"));
+    }
+
+    /// Verify the output of every render helper contains zero JSON braces —
+    /// the user's explicit rule ("JSON output goes away entirely").
+    #[test]
+    fn no_render_helper_emits_json_braces() {
+        let m = mk_mem("11111111-aaaa-bbbb-cccc-dddddddddddd", "hi", Some("p"));
+        let checks: Vec<String> = vec![
+            render::render_action_result("stored", &[("id", "abc".to_string())]),
+            render::render_hint("x"),
+            render::render_memory(&m),
+            render::render_memory_list(std::slice::from_ref(&m), None),
+            render::render_projects(&[(Some("p".to_string()), 1)], None),
+            render::render_ambiguous("abcd", std::slice::from_ref(&m)),
+        ];
+        for s in checks {
+            assert!(!s.contains('{'), "unexpected '{{' in output: {s}");
+            assert!(!s.contains('}'), "unexpected '}}' in output: {s}");
+        }
+    }
 }

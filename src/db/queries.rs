@@ -410,16 +410,63 @@ pub fn list_projects(conn: &Connection) -> Result<Vec<(Option<String>, i64)>, Me
     Ok(out)
 }
 
-// -- Tests for resolve_id_prefix --------------------------------------------
-// Placed here rather than in a `#[cfg(test)] mod tests` block so each test
-// uses an in-memory SQLite connection with the full migration set — mirrors
-// the behavior callers get from `open_database`.
+pub fn prune_memories(
+    conn: &Connection,
+    max_age_days: u64,
+    min_access_count: i64,
+    dry_run: bool,
+) -> Result<Vec<Memory>, MemoryError> {
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(max_age_days as i64);
+    let cutoff_str = cutoff.to_rfc3339();
+
+    let mut stmt = conn.prepare(
+        "SELECT id, content, tags, project, agent, source_file,
+         created_at, updated_at, access_count, embedding, memory_type
+         FROM memories WHERE updated_at < ?1 AND access_count <= ?2",
+    )?;
+
+    let rows = stmt.query_map(params![cutoff_str, min_access_count], |row| {
+        let tags_str: Option<String> = row.get(2)?;
+        Ok(Memory {
+            id: row.get(0)?,
+            content: row.get(1)?,
+            tags: tags_str.and_then(|s| serde_json::from_str(&s).ok()),
+            project: row.get(3)?,
+            agent: row.get(4)?,
+            source_file: row.get(5)?,
+            created_at: row.get(6)?,
+            updated_at: row.get(7)?,
+            access_count: row.get(8)?,
+            embedding: None,
+            memory_type: row.get(10)?,
+        })
+    })?;
+
+    let mut to_prune = Vec::new();
+    for row in rows {
+        to_prune.push(row?);
+    }
+
+    if !dry_run {
+        conn.execute(
+            "DELETE FROM memories WHERE updated_at < ?1 AND access_count <= ?2",
+            params![cutoff_str, min_access_count],
+        )?;
+    }
+
+    Ok(to_prune)
+}
+
+// -- Tests ------------------------------------------------------------------
+// Lives at the end of the file so clippy's `items_after_test_module` lint is
+// happy. Each test opens an in-memory SQLite connection with the full
+// migration set, mirroring the behavior callers get from `open_database`.
 
 #[cfg(test)]
 mod resolve_id_tests {
     use super::*;
-    use crate::db::run_migrations;
     use crate::db::models::Memory;
+    use crate::db::run_migrations;
 
     fn fresh_db() -> Connection {
         let conn = Connection::open_in_memory().expect("open in-memory");
@@ -500,51 +547,4 @@ mod resolve_id_tests {
             other => panic!("expected Config error, got {other:?}"),
         }
     }
-}
-
-pub fn prune_memories(
-    conn: &Connection,
-    max_age_days: u64,
-    min_access_count: i64,
-    dry_run: bool,
-) -> Result<Vec<Memory>, MemoryError> {
-    let cutoff = chrono::Utc::now() - chrono::Duration::days(max_age_days as i64);
-    let cutoff_str = cutoff.to_rfc3339();
-
-    let mut stmt = conn.prepare(
-        "SELECT id, content, tags, project, agent, source_file,
-         created_at, updated_at, access_count, embedding, memory_type
-         FROM memories WHERE updated_at < ?1 AND access_count <= ?2",
-    )?;
-
-    let rows = stmt.query_map(params![cutoff_str, min_access_count], |row| {
-        let tags_str: Option<String> = row.get(2)?;
-        Ok(Memory {
-            id: row.get(0)?,
-            content: row.get(1)?,
-            tags: tags_str.and_then(|s| serde_json::from_str(&s).ok()),
-            project: row.get(3)?,
-            agent: row.get(4)?,
-            source_file: row.get(5)?,
-            created_at: row.get(6)?,
-            updated_at: row.get(7)?,
-            access_count: row.get(8)?,
-            embedding: None,
-            memory_type: row.get(10)?,
-        })
-    })?;
-
-    let mut to_prune = Vec::new();
-    for row in rows {
-        to_prune.push(row?);
-    }
-
-    if !dry_run {
-        conn.execute(
-            "DELETE FROM memories WHERE updated_at < ?1 AND access_count <= ?2",
-            params![cutoff_str, min_access_count],
-        )?;
-    }
-
-    Ok(to_prune)
 }
