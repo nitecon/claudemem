@@ -56,6 +56,13 @@ pub const GEMMA3_HF_REPO: &str = "google/gemma-3-1b-it";
 /// machinery end-to-end without HuggingFace credentials.
 pub const TINYLLAMA_HF_REPO: &str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0";
 
+/// HF repo id for the CI smoke model. SmolLM-135M-Instruct is ~300MB,
+/// Llama-architecture, ungated, and runs on a laptop CPU in under a minute
+/// end-to-end — the right size for routine verification of the inference
+/// pipeline. TinyLlama is kept around for higher-quality smoke tests where
+/// the extra 2GB of download budget is acceptable.
+pub const SMOLLM_HF_REPO: &str = "HuggingFaceTB/SmolLM-135M-Instruct";
+
 /// File names that every model cache directory must contain for
 /// `CandleInference::new` to succeed. Used by both the pull flow (to decide
 /// which assets to fetch) and the integrity check after download.
@@ -229,6 +236,7 @@ pub fn resolve_repo_id(model_name: &str) -> String {
     match model_name {
         "gemma3" => GEMMA3_HF_REPO.to_string(),
         "tinyllama" => TINYLLAMA_HF_REPO.to_string(),
+        "smollm" => SMOLLM_HF_REPO.to_string(),
         other => other.to_string(),
     }
 }
@@ -237,7 +245,7 @@ pub fn resolve_repo_id(model_name: &str) -> String {
 /// without an HF token. Used by the auth-required heuristic: we won't
 /// pre-reject a pull when we know the repo doesn't need credentials.
 pub fn is_ungated(repo_id: &str) -> bool {
-    matches!(repo_id, TINYLLAMA_HF_REPO)
+    matches!(repo_id, TINYLLAMA_HF_REPO | SMOLLM_HF_REPO)
 }
 
 /// Read an HF auth token from the environment. Checks `HF_TOKEN` first
@@ -492,6 +500,18 @@ mod tests {
     #[test]
     fn resolve_repo_id_maps_tinyllama_to_canonical() {
         assert_eq!(resolve_repo_id("tinyllama"), TINYLLAMA_HF_REPO);
+    }
+
+    #[test]
+    fn resolve_repo_id_maps_smollm_to_canonical() {
+        assert_eq!(resolve_repo_id("smollm"), SMOLLM_HF_REPO);
+    }
+
+    #[test]
+    fn is_ungated_flags_smollm() {
+        // SmolLM is the laptop-CPU CI smoke model — must be ungated so
+        // fresh contributors can run the e2e pipeline without HF_TOKEN.
+        assert!(is_ungated(SMOLLM_HF_REPO));
     }
 
     #[test]
