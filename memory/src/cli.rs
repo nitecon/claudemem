@@ -1179,6 +1179,10 @@ mod tests {
             access_count: 0,
             embedding: None,
             memory_type: Some("user".to_string()),
+            content_raw: None,
+            superseded_by: None,
+            condenser_version: None,
+            embedding_model: None,
         }
     }
 
