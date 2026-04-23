@@ -5,13 +5,8 @@
 //! near-identical rows via cosine similarity, and exits. Never runs as a
 //! daemon, never opens a network port, never listens for anything.
 //!
-//! See the Release 2 plan for the detailed pipeline; the top-level flow is
-//! orchestrated by [`dream::run`].
-
-mod cli;
-mod dream;
-mod inference;
-mod model_manager;
+//! The real logic lives in the sibling library crate (`src/lib.rs`); this
+//! binary just parses CLI args and dispatches.
 
 fn main() -> anyhow::Result<()> {
     // Placeholder entry point — the real dispatch lands in a follow-up

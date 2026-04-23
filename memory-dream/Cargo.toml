@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 description = "Offline batch compactor for agent-memory: condense, dedup, archive"
 
+[lib]
+name = "memory_dream"
+path = "src/lib.rs"
+
 [[bin]]
 name = "memory-dream"
 path = "src/main.rs"
