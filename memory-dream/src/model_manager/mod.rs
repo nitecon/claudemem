@@ -27,6 +27,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use thiserror::Error;
 
+#[cfg(test)]
+pub mod fake_hub;
 pub mod hub;
 
 pub use hub::HfHubClient;
@@ -453,7 +455,27 @@ fn libc_enospc() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_manager::fake_hub::FakeHubClient;
+    use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    fn null_progress() -> ProgressFn {
+        Arc::new(|_ev| {})
+    }
+
+    fn capturing_progress() -> (ProgressFn, Arc<Mutex<Vec<ProgressEvent>>>) {
+        let buf: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let buf_cb = buf.clone();
+        let cb: ProgressFn = Arc::new(move |ev| {
+            buf_cb.lock().unwrap().push(ev);
+        });
+        (cb, buf)
+    }
+
+    fn tmp_cache() -> tempfile::TempDir {
+        tempfile::tempdir().expect("tempdir")
+    }
 
     #[test]
     fn resolve_model_path_joins_cache_root_and_name() {
@@ -511,6 +533,149 @@ mod tests {
             .status_token(),
             "not_found"
         );
+    }
+
+    #[tokio::test]
+    async fn pull_model_happy_path_downloads_all_files() {
+        let cache = tmp_cache();
+        let mut files = HashMap::new();
+        for name in REQUIRED_FILES {
+            files.insert(name.to_string(), vec![42u8; 16]);
+        }
+        let client = FakeHubClient::new(files);
+
+        let (cb, events) = capturing_progress();
+        let rep = pull_model(&client, cache.path(), "gemma3", cb)
+            .await
+            .unwrap();
+        assert_eq!(rep.files, REQUIRED_FILES.len());
+        assert!(!rep.skipped);
+        for name in REQUIRED_FILES {
+            assert!(cache.path().join("gemma3").join(name).exists());
+        }
+        // Progress emits Start/Done at minimum per file.
+        let ev = events.lock().unwrap();
+        let starts = ev
+            .iter()
+            .filter(|e| matches!(e, ProgressEvent::Start { .. }))
+            .count();
+        let dones = ev
+            .iter()
+            .filter(|e| matches!(e, ProgressEvent::Done { .. }))
+            .count();
+        assert_eq!(starts, REQUIRED_FILES.len());
+        assert_eq!(dones, REQUIRED_FILES.len());
+    }
+
+    #[tokio::test]
+    async fn pull_model_idempotent_when_files_present() {
+        let cache = tmp_cache();
+        let model_dir = cache.path().join("gemma3");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        for f in REQUIRED_FILES {
+            std::fs::write(model_dir.join(f), b"stub").unwrap();
+        }
+        // Client with NO files configured — if pull_model were to hit it,
+        // the call would fail. Idempotent short-circuit means we never do.
+        let client = FakeHubClient::new(HashMap::new());
+        let rep = pull_model(&client, cache.path(), "gemma3", null_progress())
+            .await
+            .unwrap();
+        assert!(rep.skipped);
+    }
+
+    #[tokio::test]
+    async fn pull_model_surfaces_auth_required_with_model_short_name() {
+        let cache = tmp_cache();
+        let client = FakeHubClient::new(HashMap::new()).with_auth_required();
+        let err = pull_model(&client, cache.path(), "gemma3", null_progress())
+            .await
+            .unwrap_err();
+        match err {
+            ModelManagerError::AuthRequired { model, repo } => {
+                // Substitution: CLI short-name is threaded through so the
+                // error message points the user at the repo they tried to
+                // pull, not at the file-name of the first missing asset.
+                assert_eq!(model, "gemma3");
+                assert_eq!(repo, GEMMA3_HF_REPO);
+            }
+            other => panic!("expected AuthRequired, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pull_model_surfaces_not_found() {
+        let cache = tmp_cache();
+        let client = FakeHubClient::new(HashMap::new()).with_not_found();
+        let err = pull_model(&client, cache.path(), "gemma3", null_progress())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ModelManagerError::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn pull_model_retries_transient_then_exhausts() {
+        let cache = tmp_cache();
+        // Every attempt fails transiently — retry loop bails after
+        // MAX_ATTEMPTS and surfaces NetworkError with attempt count.
+        let client = FakeHubClient::new(HashMap::new()).with_always_transient();
+        let err = pull_model(&client, cache.path(), "gemma3", null_progress())
+            .await
+            .unwrap_err();
+        match err {
+            ModelManagerError::NetworkError { attempts, .. } => {
+                assert_eq!(attempts, MAX_ATTEMPTS);
+            }
+            other => panic!("expected NetworkError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pull_model_retries_transient_then_recovers() {
+        let cache = tmp_cache();
+        let mut files = HashMap::new();
+        for name in REQUIRED_FILES {
+            files.insert(name.to_string(), vec![7u8; 8]);
+        }
+        // First attempt transient, then success. Counts are per-file.
+        let client = FakeHubClient::new(files).with_transient_first_attempts(1);
+
+        let rep = pull_model(&client, cache.path(), "gemma3", null_progress())
+            .await
+            .unwrap();
+        assert_eq!(rep.files, REQUIRED_FILES.len());
+    }
+
+    #[tokio::test]
+    async fn pull_model_resumes_when_one_file_already_on_disk() {
+        // Simulates an interrupted pull — pre-seed one of the required
+        // files in the target dir, then ensure the fake client is only
+        // asked for the remaining three.
+        let cache = tmp_cache();
+        let model_dir = cache.path().join("gemma3");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("config.json"), b"already-here").unwrap();
+
+        let mut files = HashMap::new();
+        for name in REQUIRED_FILES {
+            if *name != "config.json" {
+                files.insert(name.to_string(), vec![1u8; 4]);
+            }
+        }
+        let client = FakeHubClient::new(files);
+
+        let rep = pull_model(&client, cache.path(), "gemma3", null_progress())
+            .await
+            .unwrap();
+        assert_eq!(rep.files, REQUIRED_FILES.len());
+        assert_eq!(
+            client.call_count(),
+            REQUIRED_FILES.len() - 1,
+            "pre-existing file must not be re-downloaded"
+        );
+        // Pre-seeded content untouched.
+        let body = std::fs::read(model_dir.join("config.json")).unwrap();
+        assert_eq!(body, b"already-here");
     }
 
     #[test]
