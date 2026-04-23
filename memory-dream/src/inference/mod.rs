@@ -22,6 +22,10 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+pub mod headless;
+
+pub use headless::HeadlessInference;
+
 /// Errors surfaced by any [`Inference`] implementation.
 ///
 /// Grouped so the dream orchestrator can distinguish "transient — retry
