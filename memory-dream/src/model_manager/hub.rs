@@ -77,17 +77,31 @@ impl HubClient for HfHubClient {
         // Trade-off: this costs one extra HTTP round-trip per file vs.
         // letting hf-hub handle everything in one go. That's cheap (~5ms)
         // against multi-minute downloads.
+        //
+        // IMPORTANT: The first hop (huggingface.co) is the ONLY one that
+        // surfaces `x-linked-etag` — the true SHA-256 of the LFS pointer.
+        // The S3/xet mirror past the redirect only exposes its own
+        // object-addressed hash (xet content id), which is not the
+        // safetensors SHA-256 and would cause every checksum check to
+        // fail. So we build a dedicated no-redirect client here and read
+        // the etag headers off the 302 response directly.
         let url = self.api.model(repo.to_string()).url(file);
-        let client = self.api.client();
-        let resp = client
+        let no_redirect_client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| ModelManagerError::NetworkError {
+                attempts: 1,
+                source: Box::new(e),
+            })?;
+        let first_hop = no_redirect_client
             .get(&url)
             .header(reqwest::header::RANGE, "bytes=0-0")
             .send()
             .await
             .map_err(|e| classify_reqwest_error(e, repo, file))?;
 
-        if !resp.status().is_success() && !resp.status().is_redirection() {
-            return Err(classify_status(resp.status(), repo, file));
+        if !first_hop.status().is_success() && !first_hop.status().is_redirection() {
+            return Err(classify_status(first_hop.status(), repo, file));
         }
 
         // Capture the LFS-pointer SHA from the first hop BEFORE following
@@ -97,12 +111,14 @@ impl HubClient for HfHubClient {
         // git-blob hash — useless for integrity — so we prefer the linked
         // form and fall back to the regular one; the caller validates the
         // format before trusting it as a checksum.
-        let expected_sha256 = extract_sha_from_headers(resp.headers());
+        let expected_sha256 = extract_sha_from_headers(first_hop.headers());
 
         // Follow the redirect manually so we can read Content-Range on
-        // the final hop without relying on hf-hub's Api internals.
-        let resp = if resp.status().is_redirection() {
-            let loc = resp
+        // the final hop for progress-bar initialization. The redirect
+        // target (S3/xet) returns Content-Range; the first hop returns
+        // just a Location header.
+        let resp = if first_hop.status().is_redirection() {
+            let loc = first_hop
                 .headers()
                 .get(reqwest::header::LOCATION)
                 .and_then(|v| v.to_str().ok())
@@ -114,14 +130,15 @@ impl HubClient for HfHubClient {
                     source: "HEAD redirect missing Location header".into(),
                 });
             }
-            client
+            self.api
+                .client()
                 .get(&loc)
                 .header(reqwest::header::RANGE, "bytes=0-0")
                 .send()
                 .await
                 .map_err(|e| classify_reqwest_error(e, repo, file))?
         } else {
-            resp
+            first_hop
         };
 
         let size = resp

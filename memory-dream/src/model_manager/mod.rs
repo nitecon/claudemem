@@ -403,22 +403,13 @@ pub async fn pull_model(
 
     let required = required_files_for(model_name);
 
-    // Idempotency: if every required file is already on disk, skip the
-    // download entirely. Users can delete the model dir to force a fresh
-    // pull; explicit --force is a follow-up.
-    let all_present = required.iter().all(|f| model_dir.join(f).exists());
-    if all_present {
-        tracing::info!(
-            model = model_name,
-            "model already present; skipping download"
-        );
-        return Ok(PullReport {
-            model: model_name.to_string(),
-            files: required.len(),
-            bytes_total: 0,
-            skipped: true,
-        });
-    }
+    // Idempotency is decided per-file inside the loop below. Files that
+    // already exist are SHA-256-verified against the advertised hash
+    // (when HF provides one); a mismatch triggers a re-download. This
+    // costs one HEAD per file on re-runs but guarantees a tampered or
+    // truncated blob self-heals on the next `--pull`. Users who want an
+    // unconditional full re-download can delete the model dir.
+    let all_present_pre = required.iter().all(|f| model_dir.join(f).exists());
 
     let repo_id = resolve_repo_id(model_name);
     tracing::info!(
@@ -429,20 +420,17 @@ pub async fn pull_model(
     );
 
     let mut total_bytes: u64 = 0;
+    let mut any_downloaded = false;
 
     for file in required {
         let dest = model_dir.join(file);
-        if dest.exists() {
-            // Per-file idempotency — one file may have landed in a prior
-            // partial run; skip it and move on.
-            continue;
-        }
 
-        // Fetch metadata BEFORE the download so we have the advertised
-        // SHA-256 (when HF provides one) to verify against after the
-        // bytes land. Errors here are non-terminal for the pull itself
-        // — we treat "no metadata" as "no checksum" and continue without
-        // verification rather than halting on transient HEAD failures.
+        // Fetch metadata up-front so we have the advertised SHA-256 (when
+        // HF provides one) for verification — both against an existing
+        // on-disk file (idempotency check) and against a fresh download.
+        // Errors here are non-terminal: we treat "no metadata" as "no
+        // checksum" and continue without verification rather than halting
+        // on transient HEAD failures.
         let metadata = match client.metadata(&repo_id, file).await {
             Ok(md) => md,
             Err(e) => {
@@ -455,6 +443,32 @@ pub async fn pull_model(
             }
         };
 
+        if dest.exists() {
+            // Per-file idempotency — an earlier partial pull may have
+            // landed one file. Verify it against the advertised hash
+            // before trusting it; a mismatch (tampered or truncated
+            // blob) re-enters the download path below.
+            match verify_file_checksum(&dest, file, &metadata, &progress) {
+                Ok(()) => {
+                    // Sum it into the final byte count so the report
+                    // reflects the on-disk layout accurately.
+                    if let Ok(md) = std::fs::metadata(&dest) {
+                        total_bytes = total_bytes.saturating_add(md.len());
+                    }
+                    continue;
+                }
+                Err(ModelManagerError::Checksum { .. }) => {
+                    // verify_file_checksum already deleted the bad file;
+                    // fall through to re-download.
+                    tracing::warn!(
+                        file,
+                        "existing file failed checksum verification; re-downloading"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
         let resolved =
             download_with_retry(client, &repo_id, file, model_name, progress.clone()).await?;
 
@@ -464,6 +478,7 @@ pub async fn pull_model(
         // layout self-contained — users tarring up $AGENT_MEMORY_DIR/models
         // for backup shouldn't have to chase symlinks.
         std::fs::copy(&resolved, &dest).map_err(classify_io_error)?;
+        any_downloaded = true;
 
         // Sum the file size for the final `pull_complete` event.
         if let Ok(md) = std::fs::metadata(&dest) {
@@ -476,11 +491,17 @@ pub async fn pull_model(
         verify_file_checksum(&dest, file, &metadata, &progress)?;
     }
 
+    // `skipped` is true only when every required file was already on
+    // disk AND verified cleanly — i.e. zero bytes flowed over the wire
+    // this invocation. Partial re-downloads (e.g. a tampered safetensors
+    // that had to be re-fetched) count as a non-skipped pull.
+    let skipped = all_present_pre && !any_downloaded;
+
     Ok(PullReport {
         model: model_name.to_string(),
         files: required.len(),
         bytes_total: total_bytes,
-        skipped: false,
+        skipped,
     })
 }
 
@@ -983,6 +1004,43 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn pull_model_redownloads_tampered_existing_file() {
+        // Pre-seed the model dir with a file whose contents don't match
+        // the advertised SHA-256 — simulates a truncation or tampering
+        // between runs. The pull must re-fetch the authentic bytes and
+        // the final on-disk content must be the authentic body.
+        let cache = tmp_cache();
+        let model_dir = cache.path().join("gemma3");
+        std::fs::create_dir_all(&model_dir).unwrap();
+
+        let authentic = vec![0u8; 32];
+        let tampered = vec![0xFFu8; 32];
+        std::fs::write(model_dir.join("config.json"), &tampered).unwrap();
+
+        let mut files = HashMap::new();
+        for name in REQUIRED_FILES {
+            files.insert(name.to_string(), authentic.clone());
+        }
+        // Attach the correct hash for config.json so verification on the
+        // existing tampered file fails; other files have no etag, so
+        // they pass through as checksum_skipped.
+        let client = FakeHubClient::new(files)
+            .with_etag("config.json", Some(hash_bytes(&authentic)));
+
+        let rep = pull_model(&client, cache.path(), "gemma3", null_progress())
+            .await
+            .unwrap();
+        assert!(
+            !rep.skipped,
+            "pull must NOT be marked skipped when a file was re-downloaded"
+        );
+        // The tampered file was replaced with the authentic bytes from
+        // the fake client.
+        let on_disk = std::fs::read(model_dir.join("config.json")).unwrap();
+        assert_eq!(on_disk, authentic, "tampered file must be replaced");
     }
 
     #[tokio::test]
