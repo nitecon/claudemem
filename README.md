@@ -485,10 +485,33 @@ It's never a daemon. Each invocation loads the model, processes the DB, and exit
 
 ### First-time setup
 
+The default model `gemma3` (`google/gemma-3-1b-it`) is **gated** on HuggingFace — you must accept its license and supply an access token before `--pull` will succeed.
+
 ```bash
-# One-time: download gemma3 weights (~2GB, cached in the same dir as the DB).
+# 1. Visit https://huggingface.co/google/gemma-3-1b-it and accept the license.
+# 2. Create an access token at https://huggingface.co/settings/tokens.
+# 3. Export the token (HF_TOKEN or HUGGING_FACE_HUB_TOKEN both work).
+export HF_TOKEN=hf_xxx_your_token_xxx
+
+# 4. Download. ~2GB, cached under $AGENT_MEMORY_DIR/models/gemma3/.
+#    Resume-safe: interrupt with Ctrl-C and re-run to continue from the
+#    same byte offset. Idempotent: subsequent runs with all files present
+#    exit with `<result status="pull_skipped"/>` and no network activity.
 memory-dream --pull
 ```
+
+Without a token, `memory-dream --pull` emits `<result status="auth_required" .../>` and the three-step remediation above, then exits non-zero.
+
+### Smoke-testing the pull pipeline (no auth required)
+
+For CI and contributors without an HF token, the short-name `tinyllama` resolves to an ungated repo (`TinyLlama/TinyLlama-1.1B-Chat-v1.0`, ~2GB) so the download plumbing can be exercised end-to-end without credentials:
+
+```bash
+export AGENT_MEMORY_DIR=/tmp/dream-smoke
+memory-dream --pull --model tinyllama
+```
+
+TinyLlama is not wired into the condenser — it exists solely to validate the pull flow. Real condensation still requires `gemma3`.
 
 ### Regular use
 
@@ -503,8 +526,8 @@ memory-dream
 # Cap the pass for incremental runs on large DBs.
 memory-dream --limit 50
 
-# Swap model (rare — any HF repo id works; short `gemma3` resolves to
-# the canonical Google repo).
+# Swap model (rare — any HF repo id works; short `gemma3` and `tinyllama`
+# resolve to canonical repos, everything else passes through unchanged).
 memory-dream --model myorg/my-fork
 ```
 
