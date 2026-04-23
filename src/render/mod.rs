@@ -6,6 +6,13 @@
 //! signal while keeping token overhead minimal — no repeated key names, no
 //! attribute noise on every row.
 //!
+//! Because this output is for agent reading (not a strict XML parser), we do
+//! **not** entity-escape angle brackets in content — `<` and `>` pass through
+//! raw so things like `"Use memory get <id>"` stay human-readable instead of
+//! turning into `"Use memory get &lt;id&gt;"`. The only escape we retain is
+//! `"` → `&quot;` inside attribute values (required so the `"..."` delimiters
+//! aren't broken by a literal quote in the value).
+//!
 //! All functions in this module produce owned `String`s. Callers (the CLI
 //! and the MCP server) are responsible for printing or returning them.
 //! This module has zero DB or IO dependencies — it's a pure formatter.
@@ -220,8 +227,10 @@ fn format_tags(tags: Option<&[String]>) -> Option<String> {
 /// and the full content as the inner text. Used by `memory get`.
 ///
 /// Attributes are emitted only when set. Content is placed on its own lines
-/// so multi-line memories stay readable; XML-unsafe characters in the content
-/// (`<`, `>`, `&`) are escaped so a consuming XML parser won't choke.
+/// so multi-line memories stay readable. We do **not** entity-escape `<`/`>`
+/// in the content — this is light-XML for agent consumption, not strict XML,
+/// and angle brackets in user text (e.g. `memory get <id>`) must render raw.
+/// Attribute values only escape `"` so the `"..."` delimiter isn't broken.
 pub fn render_memory(m: &Memory) -> String {
     let id_short = short_id(&m.id);
     let mut attrs = format!(r#"id="{id_short}""#);
@@ -240,7 +249,7 @@ pub fn render_memory(m: &Memory) -> String {
         attrs.push_str(&format!(r#" agent="{}""#, escape_attr(a)));
     }
 
-    format!("<memory {attrs}>\n{}\n</memory>", escape_text(&m.content))
+    format!("<memory {attrs}>\n{}\n</memory>", m.content)
 }
 
 /// Render a single-line mutation result, e.g.:
@@ -262,11 +271,15 @@ pub fn render_action_result(status: &str, attrs: &[(&str, String)]) -> String {
 
 /// Wrap a reflection or directive hint in a `<hint>` tag. Returns the empty
 /// string when `text` is empty so callers don't have to null-check.
+///
+/// Hint text is emitted verbatim — no entity escaping. Hints routinely
+/// contain snippets like `` `memory get <id>` `` and the angle brackets must
+/// survive round-trip for the agent to read them naturally.
 pub fn render_hint(text: &str) -> String {
     if text.is_empty() {
         String::new()
     } else {
-        format!("<hint>{}</hint>", escape_text(text))
+        format!("<hint>{text}</hint>")
     }
 }
 
@@ -372,34 +385,26 @@ pub fn render_whoami(project: Option<&str>, agent_id: Option<&str>) -> String {
     out
 }
 
-/// Escape a string for safe inclusion in an XML attribute value. `&`, `<`,
-/// `>`, `"` and `'` are replaced with their named entities. Keeps the
-/// produced XML parseable by a strict reader without requiring CDATA wrapping.
+/// Escape a string for safe inclusion in a `"..."`-delimited attribute value.
+///
+/// Deliberately minimal: only `"` is replaced with `&quot;`. In light-XML
+/// mode angle brackets must pass through raw (see module docs), and `&` is
+/// left alone — consumers of this output are agents reading text, not XML
+/// parsers demanding well-formed entity references. The one hard invariant
+/// is that a literal double-quote in a value cannot be allowed to close the
+/// attribute early, so that single case still escapes.
 fn escape_attr(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&apos;"),
-            c => out.push(c),
-        }
+    if !s.contains('"') {
+        // Fast path — the overwhelmingly common case (tag lists, project
+        // idents, memory types) contains no quotes, so avoid the allocation.
+        return s.to_string();
     }
-    out
-}
-
-/// Escape a string for safe inclusion as element text. Only `&`, `<`, and `>`
-/// need replacing in text position.
-fn escape_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            c => out.push(c),
+        if ch == '"' {
+            out.push_str("&quot;");
+        } else {
+            out.push(ch);
         }
     }
     out
@@ -508,10 +513,40 @@ mod tests {
     }
 
     #[test]
-    fn render_memory_escapes_content_specials() {
+    fn render_memory_passes_angle_brackets_through_raw() {
+        // Light-XML: content bodies are NOT entity-escaped. Angle brackets
+        // and ampersands must survive round-trip so guidance text like
+        // `Use memory get <id>` renders readably, not as `&lt;id&gt;`.
         let m = mk_memory("id1", "a <b> & c", None, None);
         let s = render_memory(&m);
-        assert!(s.contains("a &lt;b&gt; &amp; c"));
+        assert!(s.contains("a <b> & c"), "got: {s}");
+        assert!(
+            !s.contains("&lt;"),
+            "angle brackets should not be escaped: {s}"
+        );
+        assert!(
+            !s.contains("&amp;"),
+            "ampersands should not be escaped: {s}"
+        );
+    }
+
+    #[test]
+    fn render_hint_passes_angle_brackets_through_raw() {
+        // The live hint text includes back-ticked snippets like
+        // `memory get <id>` — these MUST render raw, not as `&lt;id&gt;`.
+        let h = render_hint("Use `memory get <id>` for full content.");
+        assert_eq!(h, "<hint>Use `memory get <id>` for full content.</hint>");
+        assert!(!h.contains("&lt;"));
+        assert!(!h.contains("&gt;"));
+    }
+
+    #[test]
+    fn escape_attr_only_escapes_double_quote() {
+        // Angle brackets and ampersands pass through; only `"` escapes so
+        // the `"..."` attribute delimiter isn't broken by a literal quote.
+        assert_eq!(escape_attr("plain"), "plain");
+        assert_eq!(escape_attr("a<b>&c"), "a<b>&c");
+        assert_eq!(escape_attr("a\"b"), "a&quot;b");
     }
 
     #[test]
