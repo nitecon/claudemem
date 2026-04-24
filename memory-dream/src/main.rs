@@ -298,10 +298,11 @@ fn run_compaction(cli: &Cli, config: &Config, settings: &Settings) -> anyhow::Re
 
     tracing::info!(
         walked = summary.total_walked,
-        condensed = summary.condensed,
-        agentic_batches = summary.agentic_batches,
-        skipped = summary.skipped,
-        errors = summary.errors,
+        kept = summary.kept,
+        rewritten = summary.rewritten,
+        forgot = summary.forgot,
+        superseded = summary.superseded,
+        failed = summary.failed,
         "dream pass finished"
     );
 
@@ -634,38 +635,63 @@ fn run_test(
     let effective = settings.effective(&overrides);
     let inference = build_inference(&effective, &config.model_cache_dir);
 
-    // `condense` returns either a `Condensed` or a typed fallback reason.
-    // For `test` we want to surface both outcomes cleanly — no silent
-    // fallback to raw (that behavior belongs to the real dream pass).
+    // Run the full per-memory three-way contract end-to-end so `test`
+    // mirrors what the live dream pass would do — but without writing.
+    // All three decisions (skip/forget/rewrite) and the failure path
+    // surface as distinct light-XML lines so A/B comparison across
+    // backends is structurally consistent.
     let original = memory.content.clone();
-    match memory_dream::dream::condense::condense(
-        inference.as_ref(),
-        &effective.active_model,
-        &original,
-    ) {
-        Ok(out) => {
+    let backend_name = effective.mode.as_str();
+    let model_label = match effective.mode {
+        BackendMode::Headless => {
+            // Best-effort: use argv[0] of the command template as the
+            // "model" label so the output still reads naturally
+            // (`model="claude"`). Falls back to the short-name.
+            shlex::split(&effective.headless_command)
+                .and_then(|v| v.into_iter().next())
+                .map(|bin| {
+                    std::path::Path::new(&bin)
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or(bin)
+                })
+                .unwrap_or_else(|| effective.active_model.clone())
+        }
+        _ => effective.active_model.clone(),
+    };
+    let id_short = agent_memory::render::short_id(&memory.id).to_string();
+    match memory_dream::dream::condense::run_per_memory(inference.as_ref(), &memory) {
+        Ok(memory_dream::dream::condense::Decision::Skip) => {
+            println!(
+                "{}",
+                render::render_action_result(
+                    "test_skip",
+                    &[
+                        ("id", id_short),
+                        ("backend", backend_name.to_string()),
+                        ("model", model_label),
+                    ]
+                )
+            );
+        }
+        Ok(memory_dream::dream::condense::Decision::Forget) => {
+            println!(
+                "{}",
+                render::render_action_result(
+                    "test_forget",
+                    &[
+                        ("id", id_short),
+                        ("backend", backend_name.to_string()),
+                        ("model", model_label),
+                    ]
+                )
+            );
+        }
+        Ok(memory_dream::dream::condense::Decision::Rewrite { text }) => {
             let ratio_pct = if original.chars().count() == 0 {
                 0
             } else {
-                (out.text.chars().count() * 100) / original.chars().count()
-            };
-            let backend_name = effective.mode.as_str();
-            let model_label = match effective.mode {
-                BackendMode::Headless => {
-                    // Best-effort: use argv[0] of the command template as
-                    // the "model" label so the output still reads naturally
-                    // (`model="claude"`). Falls back to the short-name.
-                    shlex::split(&effective.headless_command)
-                        .and_then(|v| v.into_iter().next())
-                        .map(|bin| {
-                            std::path::Path::new(&bin)
-                                .file_name()
-                                .map(|s| s.to_string_lossy().to_string())
-                                .unwrap_or(bin)
-                        })
-                        .unwrap_or_else(|| effective.active_model.clone())
-                }
-                _ => effective.active_model.clone(),
+                (text.chars().count() * 100) / original.chars().count()
             };
             println!(
                 "<test_result memory_id=\"{id}\" backend=\"{backend}\" model=\"{model}\">\n\
@@ -673,13 +699,13 @@ fn run_test(
                    <condensed bytes=\"{cond_bytes}\">{cond}</condensed>\n\
                    <ratio pct=\"{pct}\"/>\n\
                  </test_result>",
-                id = agent_memory::render::short_id(&memory.id),
+                id = id_short,
                 backend = backend_name,
                 model = escape_attr(&model_label),
                 orig_bytes = original.len(),
                 orig = original,
-                cond_bytes = out.text.len(),
-                cond = out.text,
+                cond_bytes = text.len(),
+                cond = text,
                 pct = ratio_pct,
             );
         }
@@ -689,8 +715,8 @@ fn run_test(
                 render::render_action_result(
                     "test_failed",
                     &[
-                        ("id", agent_memory::render::short_id(&memory.id).to_string()),
-                        ("backend", effective.mode.as_str().to_string()),
+                        ("id", id_short),
+                        ("backend", backend_name.to_string()),
                         ("reason", format!("{e}")),
                     ]
                 )
