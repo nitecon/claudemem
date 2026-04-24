@@ -154,7 +154,10 @@ pub fn run(
         render::render_action_result(
             "dream_probe",
             &[
-                ("mode", if agentic { "agentic" } else { "non_agentic" }.to_string()),
+                (
+                    "mode",
+                    if agentic { "agentic" } else { "non_agentic" }.to_string()
+                ),
                 ("outcome", format!("{probe:?}").to_lowercase()),
             ]
         )
@@ -207,13 +210,7 @@ pub fn run(
         }
 
         if agentic {
-            process_project_agentic(
-                inference,
-                cfg,
-                project_label,
-                &candidates,
-                &mut summary,
-            );
+            process_project_agentic(inference, cfg, project_label, &candidates, &mut summary);
         } else {
             for mem in &candidates {
                 match process_one_non_agentic(conn, inference, cfg, mem) {
@@ -258,7 +255,10 @@ pub fn run(
                 ("agentic_batches", summary.agentic_batches.to_string()),
                 ("skipped", summary.skipped.to_string()),
                 ("errors", summary.errors.to_string()),
-                ("mode", if agentic { "agentic" } else { "non_agentic" }.to_string()),
+                (
+                    "mode",
+                    if agentic { "agentic" } else { "non_agentic" }.to_string()
+                ),
             ]
         )
     );
@@ -512,7 +512,12 @@ mod tests {
     #[test]
     fn full_flag_re_walks_everything() {
         let mut conn = open_mem_db();
-        insert(&conn, "aaaaaaaa-0000-1111-2222-000000000001", "first", Some("p1"));
+        insert(
+            &conn,
+            "aaaaaaaa-0000-1111-2222-000000000001",
+            "first",
+            Some("p1"),
+        );
         q::set_last_dream_at(&conn, Some("p1"), "2099-01-01T00:00:00Z").unwrap();
 
         let inf = FixedInference::new("NO_TOOLS");
@@ -527,7 +532,12 @@ mod tests {
     #[test]
     fn apply_mode_stamps_project_state() {
         let mut conn = open_mem_db();
-        insert(&conn, "aaaaaaaa-0000-1111-2222-000000000001", "first", Some("p1"));
+        insert(
+            &conn,
+            "aaaaaaaa-0000-1111-2222-000000000001",
+            "first",
+            Some("p1"),
+        );
 
         let inf = FixedInference::new("NO_TOOLS");
         let tmp = std::env::temp_dir();
@@ -545,7 +555,12 @@ mod tests {
     #[test]
     fn dry_mode_does_not_stamp_project_state() {
         let mut conn = open_mem_db();
-        insert(&conn, "aaaaaaaa-0000-1111-2222-000000000001", "first", Some("p1"));
+        insert(
+            &conn,
+            "aaaaaaaa-0000-1111-2222-000000000001",
+            "first",
+            Some("p1"),
+        );
 
         let inf = FixedInference::new("NO_TOOLS");
         let tmp = std::env::temp_dir();
@@ -561,8 +576,18 @@ mod tests {
     #[test]
     fn supported_probe_runs_agentic_batch() {
         let mut conn = open_mem_db();
-        insert(&conn, "aaaaaaaa-0000-1111-2222-000000000001", "m1", Some("p1"));
-        insert(&conn, "bbbbbbbb-0000-1111-2222-000000000002", "m2", Some("p1"));
+        insert(
+            &conn,
+            "aaaaaaaa-0000-1111-2222-000000000001",
+            "m1",
+            Some("p1"),
+        );
+        insert(
+            &conn,
+            "bbbbbbbb-0000-1111-2222-000000000002",
+            "m2",
+            Some("p1"),
+        );
 
         let inf = FixedInference::new("memory 1.3.0");
         let tmp = std::env::temp_dir();

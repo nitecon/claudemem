@@ -640,10 +640,8 @@ pub fn update_content(
              updated_at = ?2,
              superseded_by = NULL",
     );
-    let mut bind: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
-        Box::new(new_content.to_string()),
-        Box::new(now.clone()),
-    ];
+    let mut bind: Vec<Box<dyn rusqlite::types::ToSql>> =
+        vec![Box::new(new_content.to_string()), Box::new(now.clone())];
 
     if new_tags.is_some() {
         sql.push_str(&format!(", tags = ?{}", bind.len() + 1));
@@ -1062,7 +1060,10 @@ mod resolve_id_tests {
         mark_superseded(&conn, older, newer).unwrap();
 
         assert!(
-            get_memory_by_id(&conn, older).unwrap().superseded_by.is_some(),
+            get_memory_by_id(&conn, older)
+                .unwrap()
+                .superseded_by
+                .is_some(),
             "pre-condition: older row should be marked superseded"
         );
 
@@ -1124,7 +1125,9 @@ mod resolve_id_tests {
     fn project_state_round_trip() {
         let conn = fresh_db();
         // Absent row reads as None.
-        assert!(get_last_dream_at(&conn, Some("agent-memory")).unwrap().is_none());
+        assert!(get_last_dream_at(&conn, Some("agent-memory"))
+            .unwrap()
+            .is_none());
 
         set_last_dream_at(&conn, Some("agent-memory"), "2026-04-23T00:00:00Z").unwrap();
         let ts = get_last_dream_at(&conn, Some("agent-memory"))
@@ -1209,14 +1212,9 @@ mod resolve_id_tests {
         .unwrap();
 
         // Cutoff between the two — only the newer row surfaces.
-        let rows = list_dream_candidates(
-            &conn,
-            Some("test"),
-            Some("2026-02-01T00:00:00Z"),
-            None,
-            0,
-        )
-        .unwrap();
+        let rows =
+            list_dream_candidates(&conn, Some("test"), Some("2026-02-01T00:00:00Z"), None, 0)
+                .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "bbbbbbbb-0000-1111-2222-000000000002");
     }

@@ -42,8 +42,7 @@ pub const AGENTIC_MAX_TOKENS: u32 = 8_192;
 /// backend falls through to the `NO_TOOLS` sentinel.
 ///
 /// Kept public so integration tests can assert the exact prompt surface.
-pub const PROBE_PROMPT: &str =
-    "Run `memory --version` and reply with just its output. \
+pub const PROBE_PROMPT: &str = "Run `memory --version` and reply with just its output. \
 If you cannot run shell commands, reply with `NO_TOOLS`.";
 
 /// Classification of a backend's response to the tool-support probe.

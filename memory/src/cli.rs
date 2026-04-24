@@ -704,36 +704,34 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
             content,
             tags,
             memory_type,
-        } => {
-            match id {
-                None => {
-                    if content.is_some() || tags.is_some() || memory_type.is_some() {
-                        return Err(MemoryError::Config(
-                            "`memory update --content ...` requires a positional <id>. \
+        } => match id {
+            None => {
+                if content.is_some() || tags.is_some() || memory_type.is_some() {
+                    return Err(MemoryError::Config(
+                        "`memory update --content ...` requires a positional <id>. \
                              Run `memory update <id> --content \"...\"` to re-author, or \
                              `memory update` alone to run the self-updater."
-                                .to_string(),
-                        ));
-                    }
-                    crate::updater::manual_update()?;
+                            .to_string(),
+                    ));
                 }
-                Some(raw_id) => {
-                    let new_content = content.ok_or_else(|| {
-                        MemoryError::Config(
-                            "`memory update <id>` requires --content \"...\"".to_string(),
-                        )
-                    })?;
-                    run_update_content(
-                        conn,
-                        &config,
-                        &raw_id,
-                        &new_content,
-                        tags.as_deref(),
-                        memory_type.as_deref(),
-                    )?;
-                }
+                crate::updater::manual_update()?;
             }
-        }
+            Some(raw_id) => {
+                let new_content = content.ok_or_else(|| {
+                    MemoryError::Config(
+                        "`memory update <id>` requires --content \"...\"".to_string(),
+                    )
+                })?;
+                run_update_content(
+                    conn,
+                    &config,
+                    &raw_id,
+                    &new_content,
+                    tags.as_deref(),
+                    memory_type.as_deref(),
+                )?;
+            }
+        },
         Cli::Setup { command } => {
             execute_setup(command).map_err(|e| MemoryError::Config(format!("{e:#}")))?;
         }
@@ -840,13 +838,8 @@ fn run_update_content(
             .collect()
     });
 
-    let changed = queries::update_content(
-        conn,
-        &full_id,
-        new_content,
-        tag_vec.as_deref(),
-        memory_type,
-    )?;
+    let changed =
+        queries::update_content(conn, &full_id, new_content, tag_vec.as_deref(), memory_type)?;
     if !changed {
         // resolve_id_prefix returned Exact but the UPDATE touched zero rows —
         // implies a TOCTOU delete between resolve and update. Surface it
@@ -878,10 +871,7 @@ fn run_update_content(
 
     println!(
         "{}",
-        render::render_action_result(
-            "updated",
-            &[("id", render::short_id(&full_id).to_string())]
-        )
+        render::render_action_result("updated", &[("id", render::short_id(&full_id).to_string())])
     );
     Ok(())
 }
