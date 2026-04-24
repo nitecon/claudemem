@@ -47,8 +47,14 @@ pub const DEFAULT_HEADLESS_TIMEOUT_MS: u64 = 600_000;
 ///   invocations only — prompt-injection attempts that try to run arbitrary
 ///   shell commands get blocked at the tool-permission layer, not just by
 ///   prompt wording.
-pub const DEFAULT_CLAUDE_COMMAND: &str =
-    "claude --permission-mode bypassPermissions --allowedTools 'Bash(memory *)' -p '{prompt}'";
+/// - `--model sonnet` pins to the current-latest Sonnet alias rather than
+///   a version-stamped tag (e.g. `claude-sonnet-4-6`). Sonnet is the right
+///   price/competence point for memory curation — Opus is overkill for
+///   bulleted condense + classify + forget work and costs ~5× more per
+///   token. The alias tracks Anthropic's rolling Sonnet release without
+///   requiring a local command update.
+pub const DEFAULT_CLAUDE_COMMAND: &str = "claude --permission-mode bypassPermissions \
+     --allowedTools 'Bash(memory *)' --model sonnet -p '{prompt}'";
 
 /// Canonical command template for Gemini on first-run auto-detect.
 pub const DEFAULT_GEMINI_COMMAND: &str = "gemini -p '{prompt}'";
