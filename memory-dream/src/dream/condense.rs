@@ -21,8 +21,10 @@
 //!   line, but any trailing content after the literal marker is rejected
 //!   as malformed (the model broke the "exactly one of these forms"
 //!   contract and we refuse to guess intent).
-//! * Anything else is treated as a rewritten body. It must be strictly
-//!   shorter than the input and must not match a refusal marker.
+//! * Anything else is treated as a rewritten body. It must not grow
+//!   meaningfully vs. the baseline input — a small char-count slack
+//!   ([`REWRITE_CHAR_SLACK`]) is allowed so clarity can trump pure
+//!   brevity — and must not match a refusal marker.
 
 use thiserror::Error;
 
@@ -34,6 +36,17 @@ use crate::inference::{Inference, InferenceError};
 /// Sentinel project ident that flags a memory as user-wide / global.
 /// Mirrors the value used by the `memory` crate's CLI surface.
 const GLOBAL_PROJECT_IDENT: &str = "__global__";
+
+/// Extra characters a rewrite is allowed to exceed the baseline by before
+/// being rejected as "too long". The intent: clarity trumps brevity when
+/// a handful of characters buys a self-contained headline or preserves a
+/// path/date verbatim. Measured in Unicode scalar values (chars), matching
+/// the length comparison below.
+///
+/// Sized so a stubborn model can't grow the corpus meaningfully over
+/// many passes when combined with the `content_raw` anchoring in
+/// [`run_per_memory`].
+pub const REWRITE_CHAR_SLACK: usize = 16;
 
 /// Parsed per-memory decision from a model response.
 ///
@@ -56,11 +69,12 @@ pub enum CondenseError {
     ParseFailed(String),
 
     #[error(
-        "condensed text was not shorter than input (raw={raw_len}, condensed={condensed_len})"
+        "condensed text exceeds baseline + slack (baseline={raw_len}, condensed={condensed_len}, slack={slack})"
     )]
     TooLong {
         raw_len: usize,
         condensed_len: usize,
+        slack: usize,
     },
 
     #[error("model refused the task: {0}")]
@@ -111,11 +125,17 @@ fn detect_refusal(raw: &str) -> Option<&'static str> {
 /// Parse a model response against the three-way contract.
 ///
 /// * `raw_response` is the model's stdout, pre-trim.
-/// * `raw_input` is the memory's current content (used to enforce the
-///   strictly-shorter invariant on rewrites).
+/// * `baseline_input` is the text a rewrite must not meaningfully grow
+///   beyond (callers should pass the original raw body when a prior
+///   condensation has already run — see [`run_per_memory`] — so
+///   repeated dream passes can't chain +[`REWRITE_CHAR_SLACK`] each
+///   time).
 ///
 /// Returns a [`Decision`] on success.
-pub fn parse_response(raw_response: &str, raw_input: &str) -> Result<Decision, CondenseError> {
+pub fn parse_response(
+    raw_response: &str,
+    baseline_input: &str,
+) -> Result<Decision, CondenseError> {
     let body = strip_code_fence(raw_response).trim();
     if body.is_empty() {
         return Err(CondenseError::ParseFailed(
@@ -160,14 +180,20 @@ pub fn parse_response(raw_response: &str, raw_input: &str) -> Result<Decision, C
         )));
     }
 
-    // Strictly-shorter invariant. The prompt is explicit about this; the
-    // orchestrator enforces it so a stubborn model can't grow the corpus.
+    // Length gate: the rewrite may exceed the baseline by at most
+    // REWRITE_CHAR_SLACK chars. Clarity (self-contained headline, verbatim
+    // paths/dates) is worth a few extra chars; meaningful growth is not.
+    // The prompt is explicit about this; the orchestrator enforces it so a
+    // stubborn model can't grow the corpus. Callers anchor against the
+    // original raw body (when available) so this ceiling doesn't drift
+    // across repeated dream passes.
     let condensed_len = body.chars().count();
-    let raw_len = raw_input.trim().chars().count();
-    if condensed_len >= raw_len {
+    let raw_len = baseline_input.trim().chars().count();
+    if condensed_len > raw_len.saturating_add(REWRITE_CHAR_SLACK) {
         return Err(CondenseError::TooLong {
             raw_len,
             condensed_len,
+            slack: REWRITE_CHAR_SLACK,
         });
     }
 
@@ -199,7 +225,15 @@ pub fn run_per_memory(
     };
     let prompt = build_condense_prompt(&inputs);
     let response = inference.generate(&prompt, MAX_OUTPUT_TOKENS)?;
-    parse_response(&response, &source.content)
+    // Anchor the length gate against the ORIGINAL raw body when it exists
+    // (i.e. this memory has been condensed before) so re-condensations
+    // can't chain +REWRITE_CHAR_SLACK each pass. Falls back to the current
+    // content for first-time dreams where content_raw is still NULL.
+    let baseline = source
+        .content_raw
+        .as_deref()
+        .unwrap_or(&source.content);
+    parse_response(&response, baseline)
 }
 
 #[cfg(test)]
@@ -296,12 +330,37 @@ mod tests {
             CondenseError::TooLong {
                 raw_len,
                 condensed_len,
+                slack,
             } => {
                 assert_eq!(raw_len, raw.chars().count());
-                assert!(condensed_len > raw_len);
+                assert_eq!(slack, REWRITE_CHAR_SLACK);
+                assert!(condensed_len > raw_len + slack);
             }
             other => panic!("expected TooLong, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rewrite_within_slack_is_accepted() {
+        // Baseline and rewrite are the same length: the old strict-
+        // shorter rule would reject, the new slack-aware rule accepts
+        // because clarity can legitimately need a few extra chars.
+        let raw = "user prefers tabs over spaces for indentation";
+        let resp = "user prefers tabs over spaces for indentation";
+        assert_eq!(raw.chars().count(), resp.chars().count());
+        let out = parse_response(resp, raw).expect("equal-length rewrite allowed by slack");
+        assert!(matches!(out, Decision::Rewrite { .. }));
+    }
+
+    #[test]
+    fn rewrite_just_over_slack_is_rejected() {
+        // One char past the slack ceiling must still be rejected so the
+        // corpus can't drift indefinitely.
+        let raw = "abcdefghij"; // 10 chars
+        let over_by_one: String =
+            std::iter::repeat_n('x', 10 + REWRITE_CHAR_SLACK + 1).collect();
+        let err = parse_response(&over_by_one, raw).unwrap_err();
+        assert!(matches!(err, CondenseError::TooLong { .. }));
     }
 
     #[test]
@@ -341,6 +400,25 @@ mod tests {
         let inf = FixedInference::new("skip");
         let d = run_per_memory(&inf, &mem).unwrap();
         assert_eq!(d, Decision::Skip);
+    }
+
+    #[test]
+    fn run_per_memory_anchors_length_gate_against_content_raw() {
+        // Simulate a memory that was already condensed on a prior pass:
+        // `content` is short, `content_raw` preserves the original long
+        // body. The model returns a rewrite that is larger than `content`
+        // (would be rejected if we gated against it) but smaller than
+        // `content_raw` (must be accepted because that's the true
+        // baseline that prevents cross-pass drift).
+        let mut mem = mk_memory("abc"); // current condensed content: 3 chars
+        mem.content_raw = Some("a".repeat(200)); // original: 200 chars
+        let rewrite = "b".repeat(50); // between the two — 50 chars
+        let inf = FixedInference::new(&rewrite);
+        let d = run_per_memory(&inf, &mem).expect("must gate against content_raw, not content");
+        match d {
+            Decision::Rewrite { text } => assert_eq!(text.chars().count(), 50),
+            other => panic!("expected Rewrite, got {other:?}"),
+        }
     }
 
     #[test]

@@ -57,7 +57,10 @@ no markdown fences, no commentary:
      - atomic fact 2
      - ...
 
-   The rewritten text MUST be strictly shorter than the input.
+   The rewritten text MUST NOT meaningfully grow the input. Aim to be
+   shorter; a handful of extra characters is tolerated only when they
+   buy real clarity (a self-contained headline, a preserved path or
+   date). Never pad, re-phrase for style, or add commentary.
    The headline MUST stand alone — do not put load-bearing context
    in the bullets that the headline fails to preview.
 
@@ -246,9 +249,19 @@ mod tests {
     }
 
     #[test]
-    fn prompt_requires_strictly_shorter_rewrite() {
+    fn prompt_requires_non_growing_rewrite() {
+        // The parser allows a small char-count slack so clarity can trump
+        // brevity, but the prompt must still push the model toward "don't
+        // grow the memory" and explain what narrow slack is tolerated.
         let p = build_condense_prompt(&inputs_for("x"));
-        assert!(p.contains("strictly shorter than the input"));
+        assert!(
+            p.contains("MUST NOT meaningfully grow the input"),
+            "rewrite must be told not to grow the memory"
+        );
+        assert!(
+            p.contains("Aim to be\n   shorter"),
+            "rewrite must still prefer shorter output"
+        );
     }
 
     #[test]

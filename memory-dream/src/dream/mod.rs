@@ -948,20 +948,20 @@ mod tests {
     /// Wiring note: the orchestrator uses one [`FixedInference`] stub for
     /// both Stage 0 (JSON project-review response) and Stage B (free-text
     /// three-way contract). We pad the memory body with enough filler so
-    /// the JSON payload is strictly shorter than the input — Stage B's
-    /// parser then accepts it as a rewrite, incrementing `rewritten`.
-    /// That bump is the signal Stage B fired; without --refresh it
-    /// stays at zero because the incremental gate hides the memory.
+    /// the JSON payload is comfortably below the Stage B length ceiling
+    /// (baseline + REWRITE_CHAR_SLACK) — the parser then accepts it as a
+    /// rewrite, incrementing `rewritten`. That bump is the signal Stage B
+    /// fired; without --refresh it stays at zero because the incremental
+    /// gate hides the memory.
     #[test]
     fn refresh_flag_reruns_stage_b_condense() {
         let mut conn = open_mem_db();
         let id = "aaaaaaaa-0000-1111-2222-000000000030";
 
-        // Pad the memory body so any plausible JSON payload is shorter.
-        // The actual content doesn't matter — only the length does,
-        // because Stage B rejects rewrites that aren't strictly shorter
-        // than the input. 300 chars is comfortably above the ~70-char
-        // keep-decision JSON below.
+        // Pad the memory body so any plausible JSON payload sits below
+        // the Stage B length ceiling (baseline + REWRITE_CHAR_SLACK).
+        // 300 chars is comfortably above the ~70-char keep-decision JSON
+        // below even after adding the slack.
         let long_content = "x".repeat(300);
         insert_already_processed(&conn, id, &long_content, "p3");
 
