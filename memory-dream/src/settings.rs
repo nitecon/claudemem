@@ -46,6 +46,22 @@ pub const DEFAULT_CLAUDE_COMMAND: &str =
 /// Canonical command template for Gemini on first-run auto-detect.
 pub const DEFAULT_GEMINI_COMMAND: &str = "gemini -p '{prompt}'";
 
+/// Headless command templates from earlier versions that are known to break
+/// the agentic probe. When an existing `dream.toml` is loaded with one of
+/// these as its stored command, the binary silently upgrades it to the
+/// current [`DEFAULT_CLAUDE_COMMAND`] and resaves the file. User-customized
+/// templates (anything not byte-matching an entry here) are never touched.
+///
+/// Add new entries when a subsequent release introduces a new must-have
+/// flag; never remove entries (users upgrading across multiple hops need
+/// the whole history to converge).
+const KNOWN_STALE_CLAUDE_COMMANDS: &[&str] = &[
+    // Pre-v1.3.0 default — `claude -p` without tool-permission flags
+    // auto-refuses Bash invocations in non-interactive mode and returns
+    // NO_TOOLS, forcing the dream pass to silently downgrade.
+    "claude -p '{prompt}'",
+];
+
 /// Default local model short-name when falling back to the `local` backend.
 pub const DEFAULT_LOCAL_MODEL: &str = "gemma3";
 
@@ -221,7 +237,15 @@ impl Settings {
     pub fn load(data_dir: &Path) -> Result<Self, SettingsError> {
         let path = data_dir.join(SETTINGS_FILENAME);
         if path.exists() {
-            return Self::load_existing(&path);
+            let mut settings = Self::load_existing(&path)?;
+            if settings.auto_upgrade_stale_fields() {
+                eprintln!(
+                    "[INFO] upgraded stale dream.toml — headless command now grants bounded tool access (see {})",
+                    path.display()
+                );
+                settings.save(data_dir)?;
+            }
+            return Ok(settings);
         }
         let (settings, warning) = Self::auto_detect_default();
         if let Some(msg) = warning {
@@ -229,6 +253,19 @@ impl Settings {
         }
         settings.save(data_dir)?;
         Ok(settings)
+    }
+
+    /// In-place upgrade of known-stale fields loaded from an older
+    /// `dream.toml`. Returns `true` if anything changed so the caller knows
+    /// to persist + log. Never mutates user-customized values — only byte
+    /// matches against [`KNOWN_STALE_CLAUDE_COMMANDS`] are rewritten.
+    fn auto_upgrade_stale_fields(&mut self) -> bool {
+        let trimmed = self.headless.command.trim();
+        if KNOWN_STALE_CLAUDE_COMMANDS.contains(&trimmed) {
+            self.headless.command = DEFAULT_CLAUDE_COMMAND.to_string();
+            return true;
+        }
+        false
     }
 
     /// Read and parse an existing settings file. Separated from [`load`] so
@@ -580,6 +617,93 @@ timeout_ms = 30000
             }
             other => panic!("expected InvalidHeadlessCommand, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn stale_claude_command_is_auto_upgraded_on_load() {
+        let dir = tmp();
+        // Write a dream.toml with the pre-v1.3.0 default that the probe
+        // refuses. Loading must silently upgrade it in place.
+        let body = r#"
+[backend]
+mode = "headless"
+
+[local]
+active_model = "gemma3"
+downloaded_models = []
+
+[headless]
+command = "claude -p '{prompt}'"
+timeout_ms = 30000
+"#;
+        std::fs::write(dir.path().join(SETTINGS_FILENAME), body).unwrap();
+
+        let loaded = Settings::load(dir.path()).expect("load ok");
+        assert_eq!(loaded.headless.command, DEFAULT_CLAUDE_COMMAND);
+
+        // The upgrade persisted — a second load finds the new command on disk
+        // and does NOT touch it (idempotent).
+        let second = Settings::load(dir.path()).expect("load ok");
+        assert_eq!(second.headless.command, DEFAULT_CLAUDE_COMMAND);
+
+        // On-disk file reflects the upgrade.
+        let raw = std::fs::read_to_string(dir.path().join(SETTINGS_FILENAME)).unwrap();
+        assert!(
+            raw.contains("--permission-mode bypassPermissions"),
+            "expected upgraded command on disk; got:\n{raw}"
+        );
+    }
+
+    #[test]
+    fn customized_headless_command_is_not_touched() {
+        let dir = tmp();
+        // User tweaked the template (e.g. added a model flag). Must remain
+        // byte-identical through load — we never stomp user intent.
+        let custom = "claude --model opus -p '{prompt}'";
+        let body = format!(
+            r#"
+[backend]
+mode = "headless"
+
+[local]
+active_model = "gemma3"
+downloaded_models = []
+
+[headless]
+command = "{custom}"
+timeout_ms = 30000
+"#
+        );
+        std::fs::write(dir.path().join(SETTINGS_FILENAME), body).unwrap();
+
+        let loaded = Settings::load(dir.path()).expect("load ok");
+        assert_eq!(loaded.headless.command, custom);
+    }
+
+    #[test]
+    fn current_default_command_is_not_re_upgraded() {
+        let dir = tmp();
+        let s = Settings::default_headless(DEFAULT_CLAUDE_COMMAND);
+        s.save(dir.path()).unwrap();
+        let before_mtime = std::fs::metadata(dir.path().join(SETTINGS_FILENAME))
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        // Sleep-free mtime check: we only care the loaded value matches.
+        let loaded = Settings::load(dir.path()).expect("load ok");
+        assert_eq!(loaded.headless.command, DEFAULT_CLAUDE_COMMAND);
+
+        // If the upgrader mis-fired, it would rewrite the file. Compare
+        // contents exactly.
+        let after_mtime = std::fs::metadata(dir.path().join(SETTINGS_FILENAME))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(
+            before_mtime, after_mtime,
+            "upgrader rewrote file when no upgrade was needed"
+        );
     }
 
     #[test]
