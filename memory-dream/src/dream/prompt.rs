@@ -60,11 +60,36 @@ Review the {n} memories below. For each:
   ONLY when it has no re-usable instruction or insight worth keeping.
 - For re-authored condensations: use `memory update <id> --content "..."` to
   replace content in place (preserves `created_at`, archives the original to
-  `content_raw` for audit). First line = headline claim, `- ` bullets underneath
-  = atomic facts. Preserve every path, date, number, and quote verbatim.
+  `content_raw` for audit). Preserve every path, date, number, and quote
+  verbatim.
 - Move entries that are actually user preferences (not project-specific) to
   `__global__`.
 - When in doubt, keep. Silence beats lost context.
+
+HEADLINE DISCIPLINE (critical)
+The FIRST LINE of every condensed memory must be a self-contained
+summary. A reader scanning a list of memory previews must be able
+to tell from line 1 alone:
+  - WHAT this memory is about (the subject/claim)
+  - WHY it matters (the signal that triggers a full retrieval)
+
+Subsequent `- ` bullets expand on the headline with supporting
+details: paths, dates, numbers, quotes, cross-references. Never
+put load-bearing context in the bullets that the headline doesn't
+preview — otherwise `memory list` / `memory context` results look
+interchangeable and the user loses the ability to rank at a glance.
+
+EXAMPLE (good headline-as-preview)
+
+User preference (stated 2026-04-23): prefer terse, direct responses
+- Remove filler: "I think", "It seems to me that", "Perhaps it would be better if"
+- Rationale: filler makes messages harder to read
+- Applies: all projects
+
+A reader seeing only the first line knows the subject (user
+preference), the stance (terse/direct), the date it was stated,
+and can decide whether to `memory get` for the specific filler
+phrases to strip.
 
 DO NOT use `memory prune` or `memory forget --query` — both are bulk operations
 and not safe in this context. Only `memory forget --id <id>` is allowed for
@@ -103,6 +128,19 @@ RULES:
   states a single atomic fact from the input.
 - The total condensed text MUST be strictly shorter than the input.
 
+HEADLINE DISCIPLINE (critical)
+The FIRST LINE of every condensed memory must be a self-contained
+summary. A reader scanning a list of memory previews must be able
+to tell from line 1 alone:
+  - WHAT this memory is about (the subject/claim)
+  - WHY it matters (the signal that triggers a full retrieval)
+
+Subsequent `- ` bullets expand on the headline with supporting
+details: paths, dates, numbers, quotes, cross-references. Never
+put load-bearing context in the bullets that the headline doesn't
+preview — otherwise `memory list` / `memory context` results look
+interchangeable and the user loses the ability to rank at a glance.
+
 EXAMPLE
 
 Input:
@@ -116,6 +154,11 @@ Output:
 2026-04-20 migration decision: keep idx_memories_project one more release
 - File: /db/migrations/019.sql
 - Blocker: removal broke the list_projects query
+
+The headline above is self-sufficient: a reader scanning previews
+sees the date, the decision ("keep idx_memories_project"), the
+duration ("one more release"), and knows whether to retrieve the
+full body for the blocker detail.
 
 NOW CONDENSE
 
@@ -194,6 +237,52 @@ mod tests {
             "prompt must describe the headline+bullets shape"
         );
         assert!(p.contains("- "), "bullet marker must appear in the prompt");
+    }
+
+    /// The headline discipline block is the whole reason condensed
+    /// memories produce scannable previews. Both prompt templates must
+    /// carry the canonical language verbatim so the model can't pattern
+    /// match against an abbreviated paraphrase.
+    #[test]
+    fn build_condense_prompt_carries_headline_discipline_block() {
+        let p = build_condense_prompt("x");
+        assert!(
+            p.contains("HEADLINE DISCIPLINE (critical)"),
+            "condense prompt must carry the headline-discipline header"
+        );
+        assert!(
+            p.contains("FIRST LINE of every condensed memory must be a self-contained"),
+            "condense prompt must state the first-line-is-self-contained rule"
+        );
+        assert!(
+            p.contains("WHAT this memory is about"),
+            "condense prompt must spell out the WHAT axis"
+        );
+        assert!(
+            p.contains("WHY it matters"),
+            "condense prompt must spell out the WHY axis"
+        );
+        assert!(
+            p.contains("`memory list`") && p.contains("`memory context`"),
+            "condense prompt must name the retrieval surfaces that depend on the headline"
+        );
+    }
+
+    #[test]
+    fn build_agentic_prompt_carries_headline_discipline_block() {
+        let p = build_agentic_prompt("p", 0, "");
+        assert!(
+            p.contains("HEADLINE DISCIPLINE (critical)"),
+            "agentic prompt must carry the headline-discipline header"
+        );
+        assert!(
+            p.contains("FIRST LINE of every condensed memory must be a self-contained"),
+            "agentic prompt must state the first-line-is-self-contained rule"
+        );
+        assert!(
+            p.contains("`memory list`") && p.contains("`memory context`"),
+            "agentic prompt must name the retrieval surfaces that depend on the headline"
+        );
     }
 
     #[test]
