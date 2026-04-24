@@ -32,7 +32,16 @@ pub const SETTINGS_FILENAME: &str = "dream.toml";
 pub const DEFAULT_HEADLESS_TIMEOUT_MS: u64 = 30_000;
 
 /// Canonical command template for Claude on first-run auto-detect.
-pub const DEFAULT_CLAUDE_COMMAND: &str = "claude -p '{prompt}'";
+///
+/// Includes the flags required for agentic dream mode to actually work:
+/// - `--permission-mode bypassPermissions` so non-interactive claude doesn't
+///   auto-refuse tool invocations (without this, claude -p returns NO_TOOLS).
+/// - `--allowedTools "Bash(memory *)"` scopes shell access to memory-CLI
+///   invocations only — prompt-injection attempts that try to run arbitrary
+///   shell commands get blocked at the tool-permission layer, not just by
+///   prompt wording.
+pub const DEFAULT_CLAUDE_COMMAND: &str =
+    "claude --permission-mode bypassPermissions --allowedTools 'Bash(memory *)' -p '{prompt}'";
 
 /// Canonical command template for Gemini on first-run auto-detect.
 pub const DEFAULT_GEMINI_COMMAND: &str = "gemini -p '{prompt}'";
