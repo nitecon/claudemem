@@ -67,19 +67,33 @@ pub const DEFAULT_CLAUDE_COMMAND: &str = "claude --permission-mode bypassPermiss
 pub const DEFAULT_GEMINI_COMMAND: &str = "gemini --model gemini-2.5-flash -p '{prompt}'";
 
 /// Headless command templates from earlier versions that are known to break
-/// the agentic probe. When an existing `dream.toml` is loaded with one of
-/// these as its stored command, the binary silently upgrades it to the
-/// current [`DEFAULT_CLAUDE_COMMAND`] and resaves the file. User-customized
-/// templates (anything not byte-matching an entry here) are never touched.
+/// the agentic probe or carry a stale model pin. When an existing
+/// `dream.toml` is loaded with one of these as its stored command, the
+/// binary silently upgrades it to the current [`DEFAULT_CLAUDE_COMMAND`]
+/// and resaves the file. User-customized templates (anything not
+/// byte-matching an entry here) are never touched.
 ///
 /// Add new entries when a subsequent release introduces a new must-have
-/// flag; never remove entries (users upgrading across multiple hops need
-/// the whole history to converge).
+/// flag or swaps the default model; never remove entries (users upgrading
+/// across multiple hops need the whole history to converge).
 const KNOWN_STALE_CLAUDE_COMMANDS: &[&str] = &[
     // Pre-v1.3.0 default — `claude -p` without tool-permission flags
     // auto-refuses Bash invocations in non-interactive mode and returns
     // NO_TOOLS, forcing the dream pass to silently downgrade.
     "claude -p '{prompt}'",
+    // v1.3.0 – v1.4.0 default — had tool-permission flags but no model
+    // pin, so the subprocess ran whatever Claude's CLI picked as its
+    // current default (historically Opus). v1.4.1 pins Sonnet for cost.
+    "claude --permission-mode bypassPermissions --allowedTools 'Bash(memory *)' -p '{prompt}'",
+];
+
+/// Gemini command templates from earlier versions that are auto-upgraded
+/// on load. Same contract as [`KNOWN_STALE_CLAUDE_COMMANDS`]: byte match
+/// only, never touch a user-customized template.
+const KNOWN_STALE_GEMINI_COMMANDS: &[&str] = &[
+    // Pre-v1.4.1 default — no model pin, so fresh installs ran whichever
+    // model Gemini's CLI picked up (historically Pro). v1.4.1 pins Flash.
+    "gemini -p '{prompt}'",
 ];
 
 /// Default local model short-name when falling back to the `local` backend.
@@ -260,7 +274,8 @@ impl Settings {
             let mut settings = Self::load_existing(&path)?;
             if settings.auto_upgrade_stale_fields() {
                 eprintln!(
-                    "[INFO] upgraded stale dream.toml — headless command now grants bounded tool access (see {})",
+                    "[INFO] upgraded stale dream.toml — pinned default model + \
+                     extended agentic-friendly timeout (see {})",
                     path.display()
                 );
                 settings.save(data_dir)?;
@@ -275,17 +290,65 @@ impl Settings {
         Ok(settings)
     }
 
+    /// Timeout value written by pre-v1.4.1 releases. Treated as a "not
+    /// hand-customized" sentinel by [`auto_upgrade_stale_fields`] — any
+    /// other value means the user manually tuned the field and we leave
+    /// it alone.
+    const STALE_TIMEOUT_MS: u64 = 30_000;
+
     /// In-place upgrade of known-stale fields loaded from an older
     /// `dream.toml`. Returns `true` if anything changed so the caller knows
     /// to persist + log. Never mutates user-customized values — only byte
-    /// matches against [`KNOWN_STALE_CLAUDE_COMMANDS`] are rewritten.
+    /// matches against the `KNOWN_STALE_*` tables / the pre-v1.4.1 default
+    /// timeout sentinel are rewritten.
+    ///
+    /// Upgrade paths covered:
+    ///   * Claude command: any entry in [`KNOWN_STALE_CLAUDE_COMMANDS`] →
+    ///     [`DEFAULT_CLAUDE_COMMAND`].
+    ///   * Gemini command: any entry in [`KNOWN_STALE_GEMINI_COMMANDS`] →
+    ///     [`DEFAULT_GEMINI_COMMAND`].
+    ///   * Timeout: the old 30s ceiling, upgraded only when the command
+    ///     is recognizable (stale OR current default for its vendor) so a
+    ///     user who manually set `timeout_ms = 30000` on a customized
+    ///     command keeps their setting. A custom timeout (e.g. 45_000)
+    ///     never matches the sentinel and is always preserved.
     fn auto_upgrade_stale_fields(&mut self) -> bool {
-        let trimmed = self.headless.command.trim();
-        if KNOWN_STALE_CLAUDE_COMMANDS.contains(&trimmed) {
+        let mut changed = false;
+        let trimmed = self.headless.command.trim().to_string();
+
+        // Command upgrade — Claude vendor family first, then Gemini. The
+        // two lists never overlap, so order is purely cosmetic.
+        let command_is_recognizable_default;
+        if KNOWN_STALE_CLAUDE_COMMANDS.contains(&trimmed.as_str()) {
             self.headless.command = DEFAULT_CLAUDE_COMMAND.to_string();
-            return true;
+            changed = true;
+            command_is_recognizable_default = true;
+        } else if KNOWN_STALE_GEMINI_COMMANDS.contains(&trimmed.as_str()) {
+            self.headless.command = DEFAULT_GEMINI_COMMAND.to_string();
+            changed = true;
+            command_is_recognizable_default = true;
+        } else {
+            // Unchanged — but we still need to decide whether the timeout
+            // upgrade is safe. It's safe iff the user is running the
+            // CURRENT default command (i.e. they accepted defaults all
+            // the way through). Hand-customized commands keep their
+            // timeout untouched to avoid surprising users who deliberately
+            // picked a short timeout for their specific binary.
+            command_is_recognizable_default =
+                trimmed == DEFAULT_CLAUDE_COMMAND || trimmed == DEFAULT_GEMINI_COMMAND;
         }
-        false
+
+        // Timeout upgrade — only when the user is on a default command
+        // lineage AND the stored timeout still matches the v1.4.0 ceiling.
+        if command_is_recognizable_default
+            && self.headless.timeout_ms == Self::STALE_TIMEOUT_MS
+            && DEFAULT_HEADLESS_TIMEOUT_MS != Self::STALE_TIMEOUT_MS
+        {
+            self.headless.timeout_ms = DEFAULT_HEADLESS_TIMEOUT_MS;
+            changed = true;
+        }
+
+        changed
     }
 
     /// Read and parse an existing settings file. Separated from [`load`] so
@@ -643,7 +706,9 @@ timeout_ms = 30000
     fn stale_claude_command_is_auto_upgraded_on_load() {
         let dir = tmp();
         // Write a dream.toml with the pre-v1.3.0 default that the probe
-        // refuses. Loading must silently upgrade it in place.
+        // refuses. Loading must silently upgrade it in place, and also
+        // bump the stale 30s timeout — both fields belonged to the
+        // pre-v1.4.1 default lineage.
         let body = r#"
 [backend]
 mode = "headless"
@@ -660,25 +725,84 @@ timeout_ms = 30000
 
         let loaded = Settings::load(dir.path()).expect("load ok");
         assert_eq!(loaded.headless.command, DEFAULT_CLAUDE_COMMAND);
+        assert_eq!(loaded.headless.timeout_ms, DEFAULT_HEADLESS_TIMEOUT_MS);
 
         // The upgrade persisted — a second load finds the new command on disk
         // and does NOT touch it (idempotent).
         let second = Settings::load(dir.path()).expect("load ok");
         assert_eq!(second.headless.command, DEFAULT_CLAUDE_COMMAND);
+        assert_eq!(second.headless.timeout_ms, DEFAULT_HEADLESS_TIMEOUT_MS);
 
         // On-disk file reflects the upgrade.
         let raw = std::fs::read_to_string(dir.path().join(SETTINGS_FILENAME)).unwrap();
         assert!(
-            raw.contains("--permission-mode bypassPermissions"),
+            raw.contains("--model sonnet"),
             "expected upgraded command on disk; got:\n{raw}"
+        );
+    }
+
+    /// v1.3.0 – v1.4.0 stored the command with tool flags but no `--model`
+    /// pin. v1.4.1 must also upgrade that form to the Sonnet-pinned
+    /// default, carrying the stale 30s timeout with it.
+    #[test]
+    fn v140_claude_command_is_upgraded_to_sonnet_pinned_default() {
+        let dir = tmp();
+        let body = r#"
+[backend]
+mode = "headless"
+
+[local]
+active_model = "gemma3"
+downloaded_models = []
+
+[headless]
+command = "claude --permission-mode bypassPermissions --allowedTools 'Bash(memory *)' -p '{prompt}'"
+timeout_ms = 30000
+"#;
+        std::fs::write(dir.path().join(SETTINGS_FILENAME), body).unwrap();
+
+        let loaded = Settings::load(dir.path()).expect("load ok");
+        assert_eq!(loaded.headless.command, DEFAULT_CLAUDE_COMMAND);
+        assert_eq!(loaded.headless.timeout_ms, DEFAULT_HEADLESS_TIMEOUT_MS);
+    }
+
+    /// Pre-v1.4.1 Gemini default (no model pin) must upgrade to the Flash
+    /// pin, and the stale 30s timeout bumps alongside it.
+    #[test]
+    fn stale_gemini_command_is_auto_upgraded_on_load() {
+        let dir = tmp();
+        let body = r#"
+[backend]
+mode = "headless"
+
+[local]
+active_model = "gemma3"
+downloaded_models = []
+
+[headless]
+command = "gemini -p '{prompt}'"
+timeout_ms = 30000
+"#;
+        std::fs::write(dir.path().join(SETTINGS_FILENAME), body).unwrap();
+
+        let loaded = Settings::load(dir.path()).expect("load ok");
+        assert_eq!(loaded.headless.command, DEFAULT_GEMINI_COMMAND);
+        assert_eq!(loaded.headless.timeout_ms, DEFAULT_HEADLESS_TIMEOUT_MS);
+        let raw = std::fs::read_to_string(dir.path().join(SETTINGS_FILENAME)).unwrap();
+        assert!(
+            raw.contains("gemini-2.5-flash"),
+            "expected Flash-pinned command on disk; got:\n{raw}"
         );
     }
 
     #[test]
     fn customized_headless_command_is_not_touched() {
         let dir = tmp();
-        // User tweaked the template (e.g. added a model flag). Must remain
-        // byte-identical through load — we never stomp user intent.
+        // User tweaked the template (e.g. picked Opus manually). Command
+        // MUST remain byte-identical through load — we never stomp user
+        // intent. The timeout must ALSO stay at the user's value: a
+        // custom command short-circuits the timeout-upgrade branch so a
+        // deliberate 30s setting on a hand-crafted CLI sticks.
         let custom = "claude --model opus -p '{prompt}'";
         let body = format!(
             r#"
@@ -698,6 +822,38 @@ timeout_ms = 30000
 
         let loaded = Settings::load(dir.path()).expect("load ok");
         assert_eq!(loaded.headless.command, custom);
+        assert_eq!(
+            loaded.headless.timeout_ms, 30_000,
+            "custom command must leave the user's timeout alone"
+        );
+    }
+
+    /// A hand-customized timeout (any value that isn't the exact stale
+    /// 30s sentinel) on the CURRENT default command must survive load.
+    /// Otherwise users who set `timeout_ms = 45000` to give slow batches
+    /// more room lose their tuning on every upgrade.
+    #[test]
+    fn custom_timeout_on_default_command_is_preserved() {
+        let dir = tmp();
+        let body = format!(
+            r#"
+[backend]
+mode = "headless"
+
+[local]
+active_model = "gemma3"
+downloaded_models = []
+
+[headless]
+command = "{cmd}"
+timeout_ms = 45000
+"#,
+            cmd = DEFAULT_CLAUDE_COMMAND
+        );
+        std::fs::write(dir.path().join(SETTINGS_FILENAME), body).unwrap();
+        let loaded = Settings::load(dir.path()).expect("load ok");
+        assert_eq!(loaded.headless.command, DEFAULT_CLAUDE_COMMAND);
+        assert_eq!(loaded.headless.timeout_ms, 45_000);
     }
 
     #[test]
