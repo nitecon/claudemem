@@ -736,6 +736,60 @@ pub fn list_distinct_projects_for_dream(
     Ok(out)
 }
 
+/// Light-weight snapshot of the dream-relevant columns for a set of
+/// memory ids. Returned as a `Vec` of `(id, project, updated_at)` tuples
+/// ordered by `id` for deterministic diffing.
+///
+/// Used by the dream orchestrator to compute per-batch deltas: it snapshots
+/// this triple for every candidate before a batch, invokes the agentic
+/// model (which may `memory forget` / `memory update` / `memory move`
+/// arbitrary rows), then re-queries to classify each candidate as
+/// `forgot` (missing from post-snapshot), `moved` (project changed), or
+/// `updated` (updated_at advanced within the same project).
+///
+/// Superseded rows ARE included in the result because the dream pass
+/// walks audit rows too; callers doing delta math treat them the same
+/// as any other row in the candidate list.
+///
+/// Empty input returns an empty vec without touching the DB.
+#[allow(dead_code)]
+pub fn snapshot_dream_rows(
+    conn: &Connection,
+    ids: &[String],
+) -> Result<Vec<(String, Option<String>, String)>, MemoryError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Build the `IN (?, ?, ?)` placeholder list dynamically. SQLite has a
+    // default 999-parameter ceiling which is comfortably above any real
+    // dream batch (capped at 100 upstream), so no chunking is required.
+    let placeholders: String = (1..=ids.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT id, project, updated_at FROM memories \
+         WHERE id IN ({placeholders}) ORDER BY id ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let bind: Vec<&dyn rusqlite::types::ToSql> = ids
+        .iter()
+        .map(|s| s as &dyn rusqlite::types::ToSql)
+        .collect();
+    let rows = stmt.query_map(bind.as_slice(), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut out = Vec::with_capacity(ids.len());
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 /// Incremental candidate selection for an agentic or non-agentic dream pass.
 ///
 /// Returns memories within `project` (NULL when `project.is_none()`) that
@@ -1318,6 +1372,49 @@ mod resolve_id_tests {
         assert_eq!(rows.len(), 2);
         assert!(rows.contains(&Some("p1".to_string())));
         assert!(rows.contains(&None));
+    }
+
+    #[test]
+    fn snapshot_dream_rows_returns_id_project_and_updated_at() {
+        let conn = fresh_db();
+        insert(&conn, "aaaaaaaa-0000-1111-2222-000000000001");
+        insert(&conn, "bbbbbbbb-0000-1111-2222-000000000002");
+        let ids = vec![
+            "aaaaaaaa-0000-1111-2222-000000000001".to_string(),
+            "bbbbbbbb-0000-1111-2222-000000000002".to_string(),
+        ];
+        let snap = snapshot_dream_rows(&conn, &ids).unwrap();
+        assert_eq!(snap.len(), 2);
+        // `insert` helper plants project="test"; result must echo that.
+        for (id, project, updated_at) in &snap {
+            assert!(ids.contains(id));
+            assert_eq!(project.as_deref(), Some("test"));
+            assert!(!updated_at.is_empty());
+        }
+    }
+
+    #[test]
+    fn snapshot_dream_rows_is_empty_for_empty_input() {
+        let conn = fresh_db();
+        insert(&conn, "aaaaaaaa-0000-1111-2222-000000000001");
+        let out = snapshot_dream_rows(&conn, &[]).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn snapshot_dream_rows_omits_missing_ids_without_error() {
+        // A batch may ask about ids that were already deleted by a
+        // concurrent writer. The helper must not error — callers treat
+        // the missing id as "forgot" in their delta math.
+        let conn = fresh_db();
+        insert(&conn, "aaaaaaaa-0000-1111-2222-000000000001");
+        let ids = vec![
+            "aaaaaaaa-0000-1111-2222-000000000001".to_string(),
+            "deadbeef-0000-1111-2222-000000000002".to_string(),
+        ];
+        let snap = snapshot_dream_rows(&conn, &ids).unwrap();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].0, "aaaaaaaa-0000-1111-2222-000000000001");
     }
 
     #[test]

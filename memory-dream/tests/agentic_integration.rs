@@ -212,6 +212,32 @@ exit 0
         "expected probe to route to agentic mode. stdout={dream_stdout}"
     );
 
+    // The batch-complete telemetry must reflect the actual DB deltas
+    // observed: the stub forgot one row and updated one. No rows moved.
+    // These fields are the whole point of the telemetry rework — without
+    // them the user sees "memories=3 reply_bytes=1" and has no way to
+    // tell whether the model actually did anything.
+    assert!(
+        dream_stdout.contains("status=\"dream_batch_complete\""),
+        "expected dream_batch_complete line. stdout={dream_stdout}"
+    );
+    assert!(
+        dream_stdout.contains("delta_forgot=\"1\""),
+        "expected delta_forgot=1 (stub forgot one row). stdout={dream_stdout}"
+    );
+    assert!(
+        dream_stdout.contains("delta_updated=\"1\""),
+        "expected delta_updated=1 (stub updated one row). stdout={dream_stdout}"
+    );
+    assert!(
+        dream_stdout.contains("delta_moved=\"0\""),
+        "expected delta_moved=0 (stub did not move anything). stdout={dream_stdout}"
+    );
+    assert!(
+        dream_stdout.contains("input=\"3\""),
+        "expected input=3 (three memories fed into the batch). stdout={dream_stdout}"
+    );
+
     // -- DB assertions ----------------------------------------------------
     let (list_out, _, ok) = run_memory(&["list", "-k", "100"], data_dir.path(), &memory_bin);
     assert!(ok, "memory list failed: {list_out}");

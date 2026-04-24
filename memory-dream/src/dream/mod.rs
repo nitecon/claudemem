@@ -210,7 +210,14 @@ pub fn run(
         }
 
         if agentic {
-            process_project_agentic(inference, cfg, project_label, &candidates, &mut summary);
+            process_project_agentic(
+                conn,
+                inference,
+                cfg,
+                project_label,
+                &candidates,
+                &mut summary,
+            );
         } else {
             for mem in &candidates {
                 match process_one_non_agentic(conn, inference, cfg, mem) {
@@ -289,9 +296,80 @@ fn resolve_incremental_cutoff(
     Ok(q::get_last_dream_at(conn, project)?)
 }
 
+/// Per-batch delta counts computed by diffing a pre- and post-batch
+/// snapshot of `(id, project, updated_at)` triples. Each candidate id
+/// lands in exactly one bucket:
+///   * `forgot` — row is gone from the post-snapshot → `memory forget`.
+///   * `moved`  — row still present but `project` changed → `memory move`.
+///   * `updated` — row still present, same project, `updated_at` bumped
+///     → `memory update` / re-condensation.
+///   * Untouched rows are excluded from all three counts.
+///
+/// `remaining` counts live rows still assigned to this project after the
+/// batch (may differ from `pre_count - forgot` when the batch also moved
+/// rows in from other projects, but in the current flow only the batch's
+/// own project is visible to the model so that's rare).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct BatchDelta {
+    forgot: usize,
+    updated: usize,
+    moved: usize,
+}
+
+/// Diff two snapshots to classify each pre-batch row. Post-batch ids that
+/// weren't in the pre-batch set (e.g. rows created by `memory store`
+/// inside the agentic call) are silently ignored — they're not part of
+/// this batch's accountability.
+fn diff_batch_snapshots(
+    pre: &[(String, Option<String>, String)],
+    post: &[(String, Option<String>, String)],
+    batch_project: &str,
+) -> BatchDelta {
+    use std::collections::HashMap;
+
+    // Index post-batch snapshot by id for O(1) lookups.
+    let post_index: HashMap<&str, (&Option<String>, &str)> = post
+        .iter()
+        .map(|(id, proj, ts)| (id.as_str(), (proj, ts.as_str())))
+        .collect();
+
+    let mut delta = BatchDelta::default();
+    for (id, pre_proj, pre_ts) in pre {
+        match post_index.get(id.as_str()) {
+            None => {
+                delta.forgot += 1;
+            }
+            Some((post_proj, post_ts)) => {
+                let pre_proj_str = pre_proj.as_deref().unwrap_or("");
+                let post_proj_str = post_proj.as_deref().unwrap_or("");
+                if pre_proj_str != post_proj_str {
+                    // Project changed — classify as moved even if
+                    // updated_at also bumped (which it always will,
+                    // because `move_memory_by_id` touches updated_at).
+                    // Counting both would double-count the same action.
+                    let _ = batch_project;
+                    delta.moved += 1;
+                } else if pre_ts != post_ts {
+                    delta.updated += 1;
+                }
+            }
+        }
+    }
+    delta
+}
+
 /// Agentic batch driver. Slices `candidates` into batches of
 /// `cfg.effective_batch_size(true)` and invokes the LLM once per batch.
+///
+/// Around every batch we snapshot the candidate rows (id, project,
+/// updated_at), invoke the model, then re-snapshot to compute the
+/// `forgot` / `updated` / `moved` deltas. The counts feed the
+/// `<dream_batch_complete ... delta_forgot delta_updated delta_moved
+/// remaining>` telemetry line so a caller watching dream output can
+/// actually verify the LLM did work (vs. replying with `.` and
+/// bouncing).
 fn process_project_agentic(
+    conn: &mut Connection,
     inference: &dyn Inference,
     cfg: &DreamConfig<'_>,
     project_label: &str,
@@ -328,9 +406,48 @@ fn process_project_agentic(
             continue;
         }
 
+        // Pre-snapshot. Ids the model is allowed to curate — everything
+        // else (new rows it might `memory store`, unrelated rows from
+        // other projects) is out of scope for the delta.
+        let batch_ids: Vec<String> = chunk.iter().map(|m| m.id.clone()).collect();
+        let pre_snap = match q::snapshot_dream_rows(conn, &batch_ids) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(project = %project_label, error = %e,
+                    "failed to snapshot pre-batch state; skipping delta telemetry");
+                Vec::new()
+            }
+        };
+
         match agentic::run_agentic_batch(inference, project_label, chunk) {
             Ok(report) => {
                 summary.agentic_batches += 1;
+
+                // Post-snapshot against the same id list. Any id that
+                // vanished is attributed to `forgot`; any with a bumped
+                // updated_at or changed project is classified accordingly.
+                let post_snap = match q::snapshot_dream_rows(conn, &batch_ids) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(project = %project_label, error = %e,
+                            "failed to snapshot post-batch state; emitting zero deltas");
+                        Vec::new()
+                    }
+                };
+                let delta = diff_batch_snapshots(&pre_snap, &post_snap, project_label);
+
+                // Remaining count for this project — may include rows
+                // outside the batch, which is the user-facing number
+                // (how much work is left per-project). A separate
+                // count_live_memories_in_project query isn't warranted;
+                // we re-use list_dream_candidates with no filters for a
+                // simple live-count against superseded_by IS NULL.
+                let remaining =
+                    match q::list_dream_candidates(conn, Some(project_label), None, None, 0) {
+                        Ok(rows) => rows.len(),
+                        Err(_) => 0,
+                    };
+
                 println!(
                     "{}",
                     render::render_action_result(
@@ -338,6 +455,11 @@ fn process_project_agentic(
                         &[
                             ("project", project_label.to_string()),
                             ("memories", report.memories_in_batch.to_string()),
+                            ("input", report.memories_in_batch.to_string()),
+                            ("remaining", remaining.to_string()),
+                            ("delta_forgot", delta.forgot.to_string()),
+                            ("delta_updated", delta.updated.to_string()),
+                            ("delta_moved", delta.moved.to_string()),
                             ("reply_bytes", report.reply_bytes.to_string()),
                         ]
                     )
@@ -595,6 +717,58 @@ mod tests {
         let summary = run(&mut conn, &inf, &cfg).expect("dream ok");
         assert_eq!(summary.agentic_batches, 1);
         assert_eq!(summary.total_walked, 2);
+    }
+
+    #[test]
+    fn diff_batch_snapshots_classifies_forgot_updated_moved() {
+        // Pre-batch: three rows under project "p1".
+        let pre = vec![
+            ("a".to_string(), Some("p1".to_string()), "t0".to_string()),
+            ("b".to_string(), Some("p1".to_string()), "t0".to_string()),
+            ("c".to_string(), Some("p1".to_string()), "t0".to_string()),
+        ];
+        // Post-batch:
+        //   a — deleted (forgot)
+        //   b — same project, newer updated_at (updated)
+        //   c — moved to global (moved)
+        let post = vec![
+            ("b".to_string(), Some("p1".to_string()), "t1".to_string()),
+            (
+                "c".to_string(),
+                Some("__global__".to_string()),
+                "t1".to_string(),
+            ),
+        ];
+        let delta = diff_batch_snapshots(&pre, &post, "p1");
+        assert_eq!(delta.forgot, 1);
+        assert_eq!(delta.updated, 1);
+        assert_eq!(delta.moved, 1);
+    }
+
+    #[test]
+    fn diff_batch_snapshots_ignores_untouched_rows() {
+        let pre = vec![("a".to_string(), Some("p1".to_string()), "t0".to_string())];
+        let post = vec![("a".to_string(), Some("p1".to_string()), "t0".to_string())];
+        let delta = diff_batch_snapshots(&pre, &post, "p1");
+        assert_eq!(delta.forgot, 0);
+        assert_eq!(delta.updated, 0);
+        assert_eq!(delta.moved, 0);
+    }
+
+    #[test]
+    fn diff_batch_snapshots_move_does_not_double_count_as_update() {
+        // `memory move` bumps updated_at internally. We must count it
+        // ONCE (as moved), not twice (moved + updated).
+        let pre = vec![("a".to_string(), Some("p1".to_string()), "t0".to_string())];
+        let post = vec![(
+            "a".to_string(),
+            Some("__global__".to_string()),
+            "t1".to_string(),
+        )];
+        let delta = diff_batch_snapshots(&pre, &post, "p1");
+        assert_eq!(delta.forgot, 0);
+        assert_eq!(delta.updated, 0);
+        assert_eq!(delta.moved, 1);
     }
 
     /// --batch-size override splits a large candidate list into multiple
