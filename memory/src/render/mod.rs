@@ -21,17 +21,27 @@
 //!
 //! ```text
 //! <project_memories>
-//! 1. preview text [tag1,tag2]: (ID:4c82c482)
+//! 1. preview text (ID:4c82c482)
 //! </project_memories>
+//! <tags>architecture, release, rules</tags>
 //! <general_knowledge>
-//! 1. preview text [tag1] (ID:372bd79d)
+//! 1. preview text (ID:372bd79d)
 //! </general_knowledge>
+//! <tags>preference, workflow</tags>
 //! <other_projects>
-//! 1. colorithmic: preview text [tag1] (ID:23d0142a)
+//! 1. colorithmic: preview text (ID:23d0142a)
 //! </other_projects>
+//! <tags>design, milestone</tags>
 //! <hint>Optional reflection prompt.</hint>
 //! <usage>IDs are 8-char prefixes. Use `memory get <id>` for full content. ...</usage>
 //! ```
+//!
+//! Tags moved out of per-line formatting (v1.4.4) because repeating the
+//! same tag on every line of a project's output was pure token overhead
+//! — once the reader knows "this project is mostly about X,Y,Z" the
+//! per-memory line doesn't need to restate that. The alphabetical
+//! `<tags>` cloud surfaces the same information once per section. Empty
+//! tag sets elide the block entirely.
 //!
 //! Sections are elided when empty. Mutation commands use a single self-closing
 //! `<result .../>` line. `memory get` uses a `<memory>` wrapper. Ambiguous
@@ -81,70 +91,51 @@ pub fn render_search_results(
     current_project: Option<&str>,
     hint: Option<&str>,
 ) -> String {
-    let mut project_lines: Vec<String> = Vec::new();
-    let mut global_lines: Vec<String> = Vec::new();
-    let mut other_lines: Vec<String> = Vec::new();
+    // Bucket results into the three section categories. Keep references
+    // to the SearchResult so the tag-cloud pass can walk each bucket
+    // independently without re-classifying.
+    let mut project_bucket: Vec<&SearchResult> = Vec::new();
+    let mut global_bucket: Vec<&SearchResult> = Vec::new();
+    let mut other_bucket: Vec<&SearchResult> = Vec::new();
 
     for r in results {
         // Global-scope memories always route to <general_knowledge> regardless
         // of whether a current-project was set; they're never "current".
         if r.is_global {
-            global_lines.push(format_result_line(
-                global_lines.len() + 1,
-                &r.memory,
-                /*show_project=*/ false,
-            ));
+            global_bucket.push(r);
         } else if r.is_current_project {
-            project_lines.push(format_result_line(
-                project_lines.len() + 1,
-                &r.memory,
-                false,
-            ));
+            project_bucket.push(r);
         } else if current_project.is_some() {
             // Cross-project hits during a scoped retrieval are prior-art;
             // show the originating project prefix so the agent can reason
             // about relevance.
-            other_lines.push(format_result_line(
-                other_lines.len() + 1,
-                &r.memory,
-                /*show_project=*/ true,
-            ));
+            other_bucket.push(r);
         } else {
             // Flat-ranking mode (no current-project) — no "other" distinction,
             // everything non-global goes in project_memories without a prefix.
-            project_lines.push(format_result_line(
-                project_lines.len() + 1,
-                &r.memory,
-                false,
-            ));
+            project_bucket.push(r);
         }
     }
 
     let mut out = String::new();
-    if !project_lines.is_empty() {
-        out.push_str("<project_memories>\n");
-        for line in &project_lines {
-            out.push_str(line);
-            out.push('\n');
-        }
-        out.push_str("</project_memories>\n");
-    }
-    if !global_lines.is_empty() {
-        out.push_str("<general_knowledge>\n");
-        for line in &global_lines {
-            out.push_str(line);
-            out.push('\n');
-        }
-        out.push_str("</general_knowledge>\n");
-    }
-    if !other_lines.is_empty() {
-        out.push_str("<other_projects>\n");
-        for line in &other_lines {
-            out.push_str(line);
-            out.push('\n');
-        }
-        out.push_str("</other_projects>\n");
-    }
+    append_section(
+        &mut out,
+        "project_memories",
+        &project_bucket,
+        /*show_project=*/ false,
+    );
+    append_section(
+        &mut out,
+        "general_knowledge",
+        &global_bucket,
+        /*show_project=*/ false,
+    );
+    append_section(
+        &mut out,
+        "other_projects",
+        &other_bucket,
+        /*show_project=*/ true,
+    );
     if let Some(h) = hint.filter(|s| !s.is_empty()) {
         out.push_str(&render_hint(h));
         out.push('\n');
@@ -156,19 +147,51 @@ pub fn render_search_results(
     out
 }
 
+/// Append one grouped section (numbered lines + closing tag + tag cloud)
+/// to `out`. No-op when `bucket` is empty so callers don't need to guard
+/// per-section. The tag-cloud block is emitted AFTER the section's
+/// closing tag so a line-oriented consumer can still grep by section
+/// without cloud noise interleaving.
+fn append_section(
+    out: &mut String,
+    section_name: &str,
+    bucket: &[&SearchResult],
+    show_project: bool,
+) {
+    if bucket.is_empty() {
+        return;
+    }
+    out.push_str(&format!("<{section_name}>\n"));
+    for (i, r) in bucket.iter().enumerate() {
+        out.push_str(&format_result_line(i + 1, &r.memory, show_project));
+        out.push('\n');
+    }
+    out.push_str(&format!("</{section_name}>\n"));
+
+    let cloud = render_tag_cloud_from(
+        bucket
+            .iter()
+            .filter_map(|r| r.memory.tags.as_deref().filter(|t| !t.is_empty())),
+    );
+    if !cloud.is_empty() {
+        out.push_str(&cloud);
+        out.push('\n');
+    }
+}
+
 /// Format a single ranked-result line in the shape:
 ///
 /// ```text
-/// 1. preview text [tag1,tag2] (ID:short)
-/// 2. project: preview text [tag1] (ID:short)
+/// 1. preview text (ID:short)
+/// 2. project: preview text (ID:short)
 /// ```
 ///
-/// When `show_project` is true the memory's project ident is prepended with a
-/// colon — used for the `<other_projects>` section. Tags are omitted when
-/// absent rather than rendered as `[]`.
+/// When `show_project` is true the memory's project ident is prepended
+/// with a colon — used for the `<other_projects>` section. Tags are
+/// surfaced via the per-section alphabetical `<tags>` cloud rather than
+/// repeated on every line.
 fn format_result_line(idx: usize, m: &Memory, show_project: bool) -> String {
     let preview = one_line_preview(&m.content, 160);
-    let tags_part = format_tags(m.tags.as_deref());
     let id_short = short_id(&m.id);
 
     let project_prefix = if show_project {
@@ -180,10 +203,7 @@ fn format_result_line(idx: usize, m: &Memory, show_project: bool) -> String {
         String::new()
     };
 
-    match tags_part {
-        Some(tags) => format!("{idx}. {project_prefix}{preview} {tags} (ID:{id_short})"),
-        None => format!("{idx}. {project_prefix}{preview} (ID:{id_short})"),
-    }
+    format!("{idx}. {project_prefix}{preview} (ID:{id_short})")
 }
 
 /// Collapse multi-line content to a single line with an ellipsis cut-off so a
@@ -219,11 +239,44 @@ fn one_line_preview(content: &str, max_chars: usize) -> String {
 /// Format a tag list as `[tag1,tag2]` or `None` when empty / missing. Kept
 /// bracketed to distinguish tags from other content at a glance without the
 /// verbosity of an XML attribute.
+///
+/// Retained for `render_ambiguous` where a compact per-row tag marker is
+/// still useful (the ambiguous list is short and the reader needs every
+/// disambiguator they can get).
 fn format_tags(tags: Option<&[String]>) -> Option<String> {
     match tags {
         Some(t) if !t.is_empty() => Some(format!("[{}]", t.join(","))),
         _ => None,
     }
+}
+
+/// Dedupe + alphabetize a stream of tag slices into a single `<tags>`
+/// line. Returns the empty string when the combined set is empty so the
+/// caller can unconditionally append without guarding.
+///
+/// Dedup is case-insensitive with first-seen-wins for casing; the sort
+/// is case-insensitive alphabetical. Consistent with the tag-as-label
+/// convention elsewhere — users type tags in lowercase but the DB is
+/// permissive, and the cloud shouldn't surface `ARCH` and `arch` as
+/// separate entries.
+fn render_tag_cloud_from<'a>(tag_lists: impl Iterator<Item = &'a [String]>) -> String {
+    let mut seen_lower: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut collected: Vec<String> = Vec::new();
+    for list in tag_lists {
+        for tag in list {
+            let lower = tag.to_lowercase();
+            if seen_lower.insert(lower) {
+                collected.push(tag.clone());
+            }
+        }
+    }
+    if collected.is_empty() {
+        return String::new();
+    }
+    // Alphabetical, case-insensitive compare so `Arch` and `arch` land
+    // next to each other in a mixed-casing corpus.
+    collected.sort_by_key(|a| a.to_lowercase());
+    format!("<tags>{}</tags>", collected.join(", "))
 }
 
 /// Render a single memory as a `<memory>` wrapper with metadata attributes
@@ -360,13 +413,24 @@ pub fn render_memory_list(memories: &[Memory], cwd_project: Option<&str>) -> Str
         let marker = if is_current { "*" } else { " " };
         let type_label = m.memory_type.as_deref().unwrap_or("?");
         let project_label = m.project.as_deref().unwrap_or("-");
-        let tags = format_tags(m.tags.as_deref()).unwrap_or_default();
         let preview = one_line_preview(&m.content, 120);
+        // Tags moved to the per-section `<tags>` cloud (v1.4.4) — see
+        // module docs. Repeating the same 3-4 tags on every line of a
+        // project's list was pure token overhead for no scannable benefit.
         out.push_str(&format!(
-            "{idx}.{marker}({type_label}) {project_label} {tags} (ID:{id_short}): {preview}\n"
+            "{idx}.{marker}({type_label}) {project_label} (ID:{id_short}): {preview}\n"
         ));
     }
     out.push_str("</memories>");
+    let cloud = render_tag_cloud_from(
+        memories
+            .iter()
+            .filter_map(|m| m.tags.as_deref().filter(|t| !t.is_empty())),
+    );
+    if !cloud.is_empty() {
+        out.push('\n');
+        out.push_str(&cloud);
+    }
     out
 }
 
@@ -610,11 +674,44 @@ mod tests {
         ];
         let out = render_search_results(&results, Some("agent-memory"), None);
         assert!(out.contains("<project_memories>"));
-        assert!(out.contains("current project memory [local] (ID:11111111)"));
+        // Per-line tags no longer present (v1.4.4).
+        assert!(!out.contains("[local]"), "per-line tag marker must be gone");
+        assert!(out.contains("current project memory (ID:11111111)"));
         assert!(out.contains("<general_knowledge>"));
-        assert!(out.contains("global directive [pref] (ID:22222222)"));
+        assert!(out.contains("global directive (ID:22222222)"));
         assert!(out.contains("<other_projects>"));
-        assert!(out.contains("colorithmic: cross project prior art [ref] (ID:33333333)"));
+        assert!(out.contains("colorithmic: cross project prior art (ID:33333333)"));
+
+        // Per-section `<tags>` clouds replace the inline markers.
+        // Each section has a single-tag cloud.
+        assert!(out.contains("</project_memories>\n<tags>local</tags>"));
+        assert!(out.contains("</general_knowledge>\n<tags>pref</tags>"));
+        assert!(out.contains("</other_projects>\n<tags>ref</tags>"));
+    }
+
+    #[test]
+    fn render_search_results_tag_cloud_is_alphabetical_and_deduped() {
+        let a = mk_memory(
+            "11111111-aaaa",
+            "alpha",
+            Some("p"),
+            Some(vec!["zzz", "arch", "ARCH"]),
+        );
+        let b = mk_memory(
+            "22222222-bbbb",
+            "beta",
+            Some("p"),
+            Some(vec!["mmm", "arch"]),
+        );
+        let results = vec![mk_result(a, true, false), mk_result(b, true, false)];
+        let out = render_search_results(&results, Some("p"), None);
+        // Expected alphabetical order (case-insensitive): arch, mmm, zzz.
+        // First-seen casing wins for `arch` (lowercase wins over `ARCH`
+        // because the first occurrence was lowercase).
+        assert!(
+            out.contains("<tags>arch, mmm, zzz</tags>"),
+            "expected alphabetical deduped tag cloud, got:\n{out}"
+        );
     }
 
     #[test]
@@ -626,6 +723,11 @@ mod tests {
         assert!(!out.contains("<other_projects>"));
         assert!(out.contains("<general_knowledge>"));
         assert!(out.contains("only global (ID:dddddddd)"));
+        // Empty tag set → no cloud line emitted.
+        assert!(
+            !out.contains("<tags>"),
+            "tag cloud must be omitted when no tags present"
+        );
     }
 
     #[test]
@@ -689,6 +791,51 @@ mod tests {
         assert!(out.contains("<memories count=\"2\">"));
         assert!(out.contains("1.*(user) agent-memory"));
         assert!(out.contains("2. (user) colorithmic"));
+        // No inline tags on either line (v1.4.4).
+        assert!(!out.contains("[]"));
+        // No tags set → no cloud line.
+        assert!(!out.contains("<tags>"));
+    }
+
+    #[test]
+    fn render_memory_list_appends_alphabetical_tag_cloud() {
+        // Two memories, overlapping tags. The cloud must surface each
+        // tag exactly once, alphabetically, after the `</memories>`
+        // closing tag.
+        let a = mk_memory(
+            "aaaaaaaa-1",
+            "first",
+            Some("agent-memory"),
+            Some(vec!["release", "architecture"]),
+        );
+        let b = mk_memory(
+            "bbbbbbbb-1",
+            "second",
+            Some("agent-memory"),
+            Some(vec!["architecture", "rules"]),
+        );
+        let out = render_memory_list(&[a, b], Some("agent-memory"));
+        // Per-line tags are gone.
+        assert!(
+            !out.contains("[release"),
+            "inline per-line tags must not appear"
+        );
+        // Cloud is emitted after </memories>, alphabetized, deduped.
+        assert!(
+            out.contains("</memories>\n<tags>architecture, release, rules</tags>"),
+            "expected alphabetical tag cloud after closing tag; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn render_memory_list_empty_tag_set_omits_cloud() {
+        let a = mk_memory("aaaaaaaa-1", "content", Some("p"), None);
+        let b = mk_memory("bbbbbbbb-1", "content2", Some("p"), Some(vec![]));
+        let out = render_memory_list(&[a, b], None);
+        assert!(
+            !out.contains("<tags>"),
+            "empty tag sets must not emit a cloud line: {out}"
+        );
     }
 
     #[test]
