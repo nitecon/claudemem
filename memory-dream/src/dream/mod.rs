@@ -494,11 +494,16 @@ fn run_stage_a_dedup(
 
 /// Stage B — per-memory condense using the three-way response contract.
 ///
-/// Each condensation is wrapped in `BEGIN IMMEDIATE` (Apply mode) so
-/// concurrent `memory store` / `memory update` writes serialize behind
-/// this row. Dry mode rolls the transaction back.
+/// Inference and embedding run with NO sqlite lock held; only the final
+/// single-statement write (`UPDATE` on rewrite, `DELETE` on forget) touches
+/// the DB, and SQLite's implicit per-statement transaction commits it
+/// atomically. No `BEGIN IMMEDIATE` is used here — the previous design
+/// wrapped the whole per-memory pass (LLM call included) in an immediate
+/// transaction, which held a RESERVED write lock for the full LLM round
+/// trip and stalled concurrent `memory store`/`update`/`forget` for the
+/// entire pass. See Issue: DB-lock-during-dream.
 fn run_stage_b_condense(
-    conn: &mut Connection,
+    conn: &Connection,
     inference: &dyn Inference,
     cfg: &DreamConfig<'_>,
     source: &Memory,
@@ -510,41 +515,12 @@ fn run_stage_b_condense(
         return;
     }
 
-    let tx = match conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
-        Ok(tx) => tx,
-        Err(e) => {
-            stats.failed += 1;
-            tracing::warn!(id = %source.id, error = %e, "stage B begin-immediate failed");
-            println!(
-                "{}",
-                render::render_action_result(
-                    "condense_failed",
-                    &[
-                        ("id", render::short_id(&source.id).to_string()),
-                        ("reason", format!("begin_tx: {e}")),
-                    ]
-                )
-            );
-            return;
-        }
-    };
-
+    // Inference — slow, lock-free.
     let outcome = condense::run_per_memory(inference, source);
-
-    let commit_tx = |tx: rusqlite::Transaction<'_>| -> Result<(), rusqlite::Error> {
-        if cfg.mode == DreamMode::Apply {
-            tx.commit()
-        } else {
-            tx.rollback()
-        }
-    };
 
     match outcome {
         Ok(condense::Decision::Skip) => {
             stats.kept += 1;
-            if let Err(e) = commit_tx(tx) {
-                tracing::warn!(id = %source.id, error = %e, "commit after skip failed");
-            }
             println!(
                 "{}",
                 render::render_action_result(
@@ -555,14 +531,9 @@ fn run_stage_b_condense(
         }
         Ok(condense::Decision::Forget) => {
             if cfg.mode == DreamMode::Apply {
-                match agent_memory::db::queries::delete_memory(&tx, &source.id) {
+                match agent_memory::db::queries::delete_memory(conn, &source.id) {
                     Ok(_) => {
                         stats.forgot += 1;
-                        if let Err(e) = commit_tx(tx) {
-                            stats.failed += 1;
-                            tracing::warn!(id = %source.id, error = %e, "commit after forget failed");
-                            return;
-                        }
                         println!(
                             "{}",
                             render::render_action_result(
@@ -573,7 +544,6 @@ fn run_stage_b_condense(
                     }
                     Err(e) => {
                         stats.failed += 1;
-                        let _ = tx.rollback();
                         println!(
                             "{}",
                             render::render_action_result(
@@ -588,7 +558,6 @@ fn run_stage_b_condense(
                 }
             } else {
                 stats.forgot += 1;
-                let _ = tx.rollback();
                 println!(
                     "{}",
                     render::render_action_result(
@@ -603,13 +572,12 @@ fn run_stage_b_condense(
             let bytes_after = text.len();
 
             // Re-embed the condensed content so vector search doesn't
-            // drift from the visible text. Embedding runs outside the
-            // transaction because fastembed doesn't touch SQLite.
+            // drift from the visible text. Embedding is CPU-bound and
+            // runs lock-free — fastembed never touches SQLite.
             let new_emb = match embed_text(&text, cfg.embedding_cache_dir) {
                 Ok(v) => v,
                 Err(e) => {
                     stats.failed += 1;
-                    let _ = tx.rollback();
                     println!(
                         "{}",
                         render::render_action_result(
@@ -629,7 +597,7 @@ fn run_stage_b_condense(
                 // COALESCE(content_raw, content) so a re-condensation
                 // never chains through an intermediate condensed form.
                 match q::update_condensation(
-                    &tx,
+                    conn,
                     &source.id,
                     &text,
                     source.content_raw.as_deref().unwrap_or(&source.content),
@@ -639,11 +607,6 @@ fn run_stage_b_condense(
                 ) {
                     Ok(()) => {
                         stats.rewritten += 1;
-                        if let Err(e) = commit_tx(tx) {
-                            stats.failed += 1;
-                            tracing::warn!(id = %source.id, error = %e, "commit after rewrite failed");
-                            return;
-                        }
                         println!(
                             "{}",
                             render::render_action_result(
@@ -658,7 +621,6 @@ fn run_stage_b_condense(
                     }
                     Err(e) => {
                         stats.failed += 1;
-                        let _ = tx.rollback();
                         println!(
                             "{}",
                             render::render_action_result(
@@ -673,7 +635,6 @@ fn run_stage_b_condense(
                 }
             } else {
                 stats.rewritten += 1;
-                let _ = tx.rollback();
                 println!(
                     "{}",
                     render::render_action_result(
@@ -689,7 +650,6 @@ fn run_stage_b_condense(
         }
         Err(e) => {
             stats.failed += 1;
-            let _ = tx.rollback();
             tracing::info!(id = %source.id, error = %e, "stage B condense failed");
             println!(
                 "{}",

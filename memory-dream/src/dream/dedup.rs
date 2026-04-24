@@ -104,11 +104,12 @@ pub fn find_duplicate<'a>(
     }
 }
 
-/// Persist a dedup decision inside the caller's open transaction.
+/// Persist a dedup decision.
 ///
-/// The dream orchestrator opens a `BEGIN IMMEDIATE` transaction per memory
-/// to serialize with concurrent `memory store` calls; this helper assumes
-/// the caller is already inside one and just issues the UPDATE.
+/// Issues a single `UPDATE` via [`mark_superseded`], which SQLite
+/// auto-commits atomically — no outer transaction wrapper is needed
+/// or desired (slow work inside a write-locking tx would stall
+/// concurrent `memory store` calls).
 ///
 /// Semantics:
 ///   - `ExactMatch(c)` — older row (whichever of source/c has the earlier

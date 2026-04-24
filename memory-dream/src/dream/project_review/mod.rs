@@ -455,11 +455,22 @@ impl From<RawDecision> for Decision {
 
 /// Persist decisions for a batch and push the survivors into `survivors`.
 ///
-/// Each batch runs inside a single `BEGIN IMMEDIATE` transaction so a
-/// concurrent `memory store` serializes behind it. A parse or decision
-/// error rolls the whole batch back rather than leaving a half-applied
-/// review — easier to reason about than cherry-picking which decisions
-/// committed on failure.
+/// Runs in two phases so the DB write lock is held only for the brief
+/// window needed to apply the writes:
+///
+/// 1. **Lock-free pre-materialization.** For every `SupersedeBy` /
+///    `Extract` decision we build the replacement [`Memory`] (including
+///    its embedding via fastembed) BEFORE touching sqlite. Previously
+///    this ran inside the batch's `BEGIN IMMEDIATE` tx and held a
+///    RESERVED write lock for the full embedding duration × every
+///    materialization in the batch. On a dense DB that stalled
+///    concurrent `memory store`/`update`/`forget` for minutes per batch.
+///
+/// 2. **Short tx for writes.** Once all replacements are materialized
+///    (or their failures recorded), we open a single `BEGIN IMMEDIATE`
+///    and apply only the fast DB statements. A delete+insert failure
+///    inside a `SupersedeBy` / `Extract` still rolls the whole batch
+///    back rather than leaving orphaned state.
 #[allow(clippy::too_many_arguments)]
 fn apply_decisions(
     conn: &mut Connection,
@@ -472,8 +483,33 @@ fn apply_decisions(
     stats: &mut ProjectReviewStats,
     survivors: &mut Vec<Memory>,
 ) -> Result<(), ProjectReviewError> {
-    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let project_label = project.unwrap_or("(null)");
+
+    // Phase 1 — pre-materialize replacement memories for SupersedeBy /
+    // Extract decisions with NO sqlite lock held.
+    let mut materialized: HashMap<String, Memory> = HashMap::new();
+    let mut materialize_failed: HashSet<String> = HashSet::new();
+    for mem in batch {
+        let (content, tags) = match decisions.get(&mem.id) {
+            Some(Decision::SupersedeBy { content, tags })
+            | Some(Decision::Extract { content, tags }) => (content.as_str(), tags.as_deref()),
+            _ => continue,
+        };
+        match materialize_new_memory(mem, content, tags, model_name, embedding_cache_dir) {
+            Ok(new_mem) => {
+                materialized.insert(mem.id.clone(), new_mem);
+            }
+            Err(e) => {
+                stats.failed += 1;
+                tracing::warn!(id = %mem.id, error = %e,
+                    "review materialize failed; keeping source memory alive");
+                materialize_failed.insert(mem.id.clone());
+            }
+        }
+    }
+
+    // Phase 2 — apply writes inside a short `BEGIN IMMEDIATE` tx.
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
     for mem in batch {
         let decision = decisions
@@ -538,107 +574,58 @@ fn apply_decisions(
                     )
                 );
             }
-            Decision::SupersedeBy { content, tags } => {
-                stats.superseded += 1;
-                let new_mem = match materialize_new_memory(
-                    mem,
-                    &content,
-                    tags.as_deref(),
-                    model_name,
-                    embedding_cache_dir,
-                ) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        stats.failed += 1;
-                        tracing::warn!(id = %mem.id, error = %e,
-                            "review supersede materialize failed");
-                        survivors.push(mem.clone());
-                        continue;
-                    }
-                };
+            Decision::SupersedeBy { .. } | Decision::Extract { .. } => {
+                // Materialization ran in Phase 1; if it failed we kept
+                // the source alive and already charged `stats.failed`.
+                if materialize_failed.contains(&mem.id) {
+                    survivors.push(mem.clone());
+                    continue;
+                }
+                let new_mem = materialized
+                    .remove(&mem.id)
+                    .expect("pre-materialized in phase 1");
+                let is_supersede = matches!(decision, Decision::SupersedeBy { .. });
+                if is_supersede {
+                    stats.superseded += 1;
+                } else {
+                    stats.extracted += 1;
+                }
+                let label_action = if is_supersede { "supersede" } else { "extract" };
+
                 if apply {
                     // Delete the old row and insert the new one as a
-                    // distinct memory so provenance stays audit-friendly:
-                    // a later reader who wants the full chain can still
-                    // query the deleted id's row pre-dream (from backup)
-                    // and see it was replaced with `new_mem.id`. In-DB
-                    // we only need the active shape.
+                    // distinct memory so provenance stays audit-friendly.
                     if let Err(e) = q::delete_memory(&tx, &mem.id) {
-                        stats.failed += 1;
-                        tracing::warn!(id = %mem.id, error = %e, "review supersede delete failed");
-                        survivors.push(mem.clone());
-                        continue;
-                    }
-                    if let Err(e) = q::insert_memory(&tx, &new_mem) {
-                        stats.failed += 1;
-                        tracing::warn!(id = %new_mem.id, error = %e,
-                            "review supersede insert failed");
-                        // Don't push the old memory — it's been deleted
-                        // inside this tx; the rollback below will restore
-                        // it. Fall through to rollback.
-                        let _ = tx.rollback();
-                        return Ok(());
-                    }
-                }
-                survivors.push(new_mem.clone());
-                println!(
-                    "{}",
-                    render::render_action_result(
-                        if apply {
-                            "review_supersede"
-                        } else {
-                            "review_would_supersede"
-                        },
-                        &[
-                            ("old_id", render::short_id(&mem.id).to_string()),
-                            ("new_id", render::short_id(&new_mem.id).to_string()),
-                            ("project", project_label.to_string()),
-                        ]
-                    )
-                );
-            }
-            Decision::Extract { content, tags } => {
-                stats.extracted += 1;
-                let new_mem = match materialize_new_memory(
-                    mem,
-                    &content,
-                    tags.as_deref(),
-                    model_name,
-                    embedding_cache_dir,
-                ) {
-                    Ok(m) => m,
-                    Err(e) => {
                         stats.failed += 1;
                         tracing::warn!(id = %mem.id, error = %e,
-                            "review extract materialize failed");
-                        survivors.push(mem.clone());
-                        continue;
-                    }
-                };
-                if apply {
-                    if let Err(e) = q::delete_memory(&tx, &mem.id) {
-                        stats.failed += 1;
-                        tracing::warn!(id = %mem.id, error = %e, "review extract delete failed");
+                            "review {label_action} delete failed");
                         survivors.push(mem.clone());
                         continue;
                     }
                     if let Err(e) = q::insert_memory(&tx, &new_mem) {
                         stats.failed += 1;
                         tracing::warn!(id = %new_mem.id, error = %e,
-                            "review extract insert failed");
+                            "review {label_action} insert failed");
                         let _ = tx.rollback();
                         return Ok(());
                     }
                 }
                 survivors.push(new_mem.clone());
+                let tag = if apply {
+                    if is_supersede {
+                        "review_supersede"
+                    } else {
+                        "review_extract"
+                    }
+                } else if is_supersede {
+                    "review_would_supersede"
+                } else {
+                    "review_would_extract"
+                };
                 println!(
                     "{}",
                     render::render_action_result(
-                        if apply {
-                            "review_extract"
-                        } else {
-                            "review_would_extract"
-                        },
+                        tag,
                         &[
                             ("old_id", render::short_id(&mem.id).to_string()),
                             ("new_id", render::short_id(&new_mem.id).to_string()),

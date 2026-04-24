@@ -557,8 +557,11 @@ pub fn list_dedup_candidates(
 /// `content_raw`, replaces `content` with the short form, stamps the
 /// condenser version and embedding metadata, and refreshes the embedding blob.
 ///
-/// Callers must wrap this in a `BEGIN IMMEDIATE` transaction so concurrent
-/// CLI writes can't race the dream pass.
+/// Issues a single `UPDATE` statement, which SQLite auto-commits as an
+/// atomic unit — no explicit transaction wrapper is needed. Callers
+/// should NOT hold an outer write-locking tx across slow work (LLM
+/// inference, embedding) when using this helper, or concurrent
+/// `memory store`/`update`/`forget` invocations will block.
 #[allow(dead_code)]
 pub fn update_condensation(
     conn: &Connection,
