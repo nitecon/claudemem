@@ -71,6 +71,20 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub full: bool,
 
+    /// Reprocess memories even if they were recently dreamed — bypasses the
+    /// `project_state.last_dream_at` cutoff AND the `condenser_version`
+    /// freshness check, so every qualifying memory flows through Stage 0
+    /// (project review), Stage A (cosine dedup), and Stage B (per-memory
+    /// condense) regardless of when it was last touched.
+    ///
+    /// Use this after a prompt change (the new Stage 0 review prompt, a
+    /// condense prompt revision, etc.), after a bad condensation run you
+    /// want to retry, or during manual testing. Equivalent to `--full` —
+    /// both flags set the same underlying switch, `--refresh` is the
+    /// preferred user-facing name.
+    #[arg(long, global = true)]
+    pub refresh: bool,
+
     /// Override the agentic/non-agentic batch size for this invocation.
     /// `0` = use the mode-appropriate default (100 agentic, 1 non-agentic).
     ///
@@ -233,6 +247,50 @@ mod tests {
     fn full_flag_defaults_to_false() {
         let cli = Cli::parse_from(["memory-dream"]);
         assert!(!cli.full);
+    }
+
+    #[test]
+    fn bare_refresh_flag_is_parsed() {
+        let cli = Cli::parse_from(["memory-dream", "--refresh"]);
+        assert!(cli.refresh);
+        // --refresh alone must NOT implicitly flip --full at the parse
+        // layer; the two flags are kept distinct in the struct and are
+        // OR'd together in main.rs when building DreamConfig. Keeping the
+        // parse layer "one flag, one field" makes `memory-dream --help`
+        // output honest and makes this test assertion meaningful.
+        assert!(!cli.full);
+    }
+
+    #[test]
+    fn refresh_flag_defaults_to_false() {
+        let cli = Cli::parse_from(["memory-dream"]);
+        assert!(!cli.refresh);
+    }
+
+    #[test]
+    fn refresh_and_full_flags_coexist() {
+        // Both on at once — main.rs OR's them, so this is a valid input
+        // that shouldn't confuse clap.
+        let cli = Cli::parse_from(["memory-dream", "--full", "--refresh"]);
+        assert!(cli.full);
+        assert!(cli.refresh);
+    }
+
+    #[test]
+    fn refresh_flag_help_text_mentions_reprocessing() {
+        // Regression guard: the user-facing `--help` output must make it
+        // obvious that --refresh bypasses the "recently dreamed" skip.
+        // We render the help via clap's rendered help and grep the text.
+        let mut cmd = <Cli as clap::CommandFactory>::command();
+        let help = cmd.render_long_help().to_string();
+        assert!(
+            help.contains("--refresh"),
+            "--refresh must appear in --help output"
+        );
+        assert!(
+            help.contains("recently dreamed"),
+            "--refresh help text must mention the 'recently dreamed' skip it bypasses"
+        );
     }
 
     #[test]
