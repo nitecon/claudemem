@@ -169,24 +169,14 @@ fn probe_skill() -> ComponentState {
     }
 }
 
-/// Detect the same four candidate files the rules injector uses. Mirrors
-/// `rules::detect_agent_files()` but without the `exists()` filter — the
-/// menu wants to *show* every candidate path so the user understands what
-/// will be considered, even when nothing is present yet.
+/// Surface every rule-file target that `rules::run()` will consider on a
+/// real install. We defer to `rules::detect_agent_files()` so the menu's
+/// probe and the installer agree on which candidates are visible — a
+/// target qualifies when either the file itself exists or the tool's
+/// parent directory does, with Codex precedence (CODEX_HOME → `~/.codex/`
+/// → `~/.config/codex/`) resolved to a single path.
 fn detect_rule_files() -> Vec<PathBuf> {
-    let home = match dirs::home_dir() {
-        Some(h) => h,
-        None => return vec![],
-    };
-    [
-        home.join(".claude").join("CLAUDE.md"),
-        home.join(".gemini").join("GEMINI.md"),
-        home.join(".codex").join("AGENTS.md"),
-        home.join(".config").join("codex").join("AGENTS.md"),
-    ]
-    .into_iter()
-    .filter(|p| p.exists())
-    .collect()
+    rules::detect_agent_files()
 }
 
 fn run_components(components: &[Component]) -> Result<()> {

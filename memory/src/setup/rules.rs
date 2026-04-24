@@ -10,6 +10,34 @@
 //! inserted directly after it so the two protocols stay grouped at the top of
 //! the file. Otherwise, the memory block is prepended.
 //!
+//! Install semantics:
+//!
+//! - When the target rule file **exists**, its contents are augmented in
+//!   place (replace existing block, insert-after-sibling, or prepend).
+//! - When the target rule file is **missing** but its parent tool directory
+//!   exists (e.g. `~/.codex/` is present but `AGENTS.md` was never created),
+//!   a fresh file is written containing a minimal one-line header plus the
+//!   memory-rules block. This covers brand-new agent installs that haven't
+//!   accumulated any local instructions yet — without it, the user would
+//!   have to hand-create an empty AGENTS.md just to give us somewhere to
+//!   write, which is exactly the kind of yak-shave the installer should
+//!   eliminate.
+//! - When the **parent tool directory is missing**, the target is skipped
+//!   silently. We never create a tool's home directory — that would be an
+//!   install the user didn't ask for.
+//!
+//! Codex path resolution. Codex honors a `CODEX_HOME` environment variable
+//! with `~/.codex/` as the default. `~/.config/codex/` is the legacy
+//! XDG-style fallback (some installers still use it). Both must never be
+//! written to at the same time: they would target the same Codex instance
+//! twice and the user would see double rules. Resolution order:
+//!
+//!   1. `$CODEX_HOME/AGENTS.md` if `CODEX_HOME` is set and the directory
+//!      exists — explicit user override wins.
+//!   2. `~/.codex/AGENTS.md` if `~/.codex/` exists (modern default).
+//!   3. `~/.config/codex/AGENTS.md` if only the XDG path is present.
+//!   4. Skip Codex entirely if none of the above.
+//!
 //! Claude Code coupling: when the target rule file is a Claude `CLAUDE.md`
 //! (user or project scope), we also merge `"autoMemoryEnabled": false` into
 //! the matching `settings.json`. The installed rules block redirects the
@@ -29,6 +57,14 @@ const CLOSE_MARKER: &str = "</memory-rules>";
 
 const SIBLING_OPEN: &str = "<agent-tools-rules>";
 const SIBLING_CLOSE: &str = "</agent-tools-rules>";
+
+/// Minimal header written as the first line of a freshly-created rule file
+/// so the output doesn't start with a bare `<memory-rules>` tag (which reads
+/// like malformed content to a human opening the file). A single markdown
+/// heading keeps things obviously intentional without looking authored —
+/// subsequent installs find the marker block and update it in place, they
+/// don't touch the header.
+const FRESH_FILE_HEADER: &str = "# Agent instructions\n\n";
 
 const HEADER: &str = r#"## Agent Memory — Mandatory Protocols
 
@@ -244,6 +280,20 @@ pub fn run(
                 println!("  backup: {}", backup.display());
                 sync_auto_memory(path, AutoMemoryAction::Disable, dry_run, &mut any_failed);
             }
+            Ok(OperationOutcome::Install(InjectOutcome::Created)) => {
+                // Emit the light-XML status line the README documents for
+                // fresh-file installs. The human-readable line mirrors the
+                // other install-outcome messages so scripted consumers and
+                // casual users both have something useful.
+                let agent = agent_label_for_rule_file(path);
+                println!(
+                    r#"<setup status="rules_created" agent="{}" path="{}"/>"#,
+                    agent,
+                    path.display()
+                );
+                println!("Created new rule file {}", path.display());
+                sync_auto_memory(path, AutoMemoryAction::Disable, dry_run, &mut any_failed);
+            }
             Ok(OperationOutcome::Remove(RemoveOutcome::DryRun(preview))) => {
                 println!("--- DRY RUN (remove): {} ---", path.display());
                 print!("{preview}");
@@ -280,18 +330,121 @@ pub fn run(
 /// Built-in detection list. Only home-dir global rule files; project-local
 /// instruction files (e.g. `./CLAUDE.md`) are intentionally left alone since
 /// they're per-repo content the user should edit directly.
+///
+/// A candidate qualifies when **either** the file already exists **or** the
+/// tool's parent directory exists (meaning the tool is installed and we
+/// have a valid target to write to). The second case is what lets fresh
+/// installs — e.g. a just-installed Codex that has never written
+/// `AGENTS.md` — pick up the memory-rules block on their first
+/// `memory setup rules` run.
+///
+/// We never create a tool's home directory on the user's behalf: a missing
+/// parent means the tool isn't installed and any write would be surprising.
+///
+/// Codex has two historical locations; [`resolve_codex_rule_file`] picks
+/// the single correct one based on `CODEX_HOME`, then `~/.codex/`, then
+/// `~/.config/codex/`. Writing to both would double-install into the same
+/// Codex instance.
 pub(crate) fn detect_agent_files() -> Vec<PathBuf> {
+    detect_agent_files_with_env(std::env::var("CODEX_HOME").ok().map(PathBuf::from))
+}
+
+/// Testable core of [`detect_agent_files`]. `codex_home_override` mirrors
+/// the `CODEX_HOME` env var and lets unit tests drive Codex path resolution
+/// without leaking env state across the test runner.
+fn detect_agent_files_with_env(codex_home_override: Option<PathBuf>) -> Vec<PathBuf> {
     let home = match dirs::home_dir() {
         Some(h) => h,
         None => return vec![],
     };
-    let candidates = [
-        home.join(".claude").join("CLAUDE.md"),
-        home.join(".gemini").join("GEMINI.md"),
-        home.join(".codex").join("AGENTS.md"),
-        home.join(".config").join("codex").join("AGENTS.md"),
-    ];
-    candidates.into_iter().filter(|p| p.exists()).collect()
+    let mut out = Vec::with_capacity(3);
+
+    let claude = home.join(".claude").join("CLAUDE.md");
+    if file_or_parent_exists(&claude) {
+        out.push(claude);
+    }
+
+    let gemini = home.join(".gemini").join("GEMINI.md");
+    if file_or_parent_exists(&gemini) {
+        out.push(gemini);
+    }
+
+    if let Some(codex) = resolve_codex_rule_file(&home, codex_home_override.as_deref()) {
+        out.push(codex);
+    }
+
+    out
+}
+
+/// Resolve the single Codex `AGENTS.md` target, honoring `CODEX_HOME` and
+/// the legacy XDG fallback. Returns `None` when no Codex install is
+/// visible.
+///
+/// Precedence:
+///   1. `CODEX_HOME` env var — explicit override always wins, provided its
+///      directory exists.
+///   2. `~/.codex/` — current Codex default.
+///   3. `~/.config/codex/` — legacy XDG-style location some installers
+///      still ship.
+///
+/// Rule-file creation is always allowed when the parent directory exists,
+/// matching the file-or-parent semantics of the other candidates. We never
+/// create a fresh Codex home, only a missing `AGENTS.md` inside an
+/// already-installed one.
+fn resolve_codex_rule_file(home: &Path, codex_home_override: Option<&Path>) -> Option<PathBuf> {
+    if let Some(override_dir) = codex_home_override {
+        if override_dir.is_dir() {
+            return Some(override_dir.join("AGENTS.md"));
+        }
+        // If the override is set but points at a missing directory, skip
+        // Codex entirely rather than falling through — the user told us
+        // explicitly where their Codex lives, and we must not silently
+        // second-guess that by writing to a different location.
+        return None;
+    }
+
+    let primary = home.join(".codex");
+    if primary.is_dir() {
+        return Some(primary.join("AGENTS.md"));
+    }
+
+    let xdg = home.join(".config").join("codex");
+    if xdg.is_dir() {
+        return Some(xdg.join("AGENTS.md"));
+    }
+
+    None
+}
+
+/// True when the file already exists or its immediate parent directory
+/// exists. Used as the install-candidate filter so we pick up both
+/// established and fresh tool installs, but never create a tool's home
+/// directory ourselves.
+fn file_or_parent_exists(path: &Path) -> bool {
+    if path.exists() {
+        return true;
+    }
+    match path.parent() {
+        Some(parent) => parent.is_dir(),
+        None => false,
+    }
+}
+
+/// Map a rule-file path to a short agent label for `<setup>` status lines.
+/// Falls back to `"unknown"` when the file's parent doesn't match any
+/// recognized tool home — that path is only reachable via explicit
+/// `--target`, where the user already knows which tool they're targeting.
+fn agent_label_for_rule_file(path: &Path) -> &'static str {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    match name.as_str() {
+        "claude.md" => "claude",
+        "gemini.md" => "gemini",
+        "agents.md" => "codex",
+        _ => "unknown",
+    }
 }
 
 /// Probe helper exposed to the interactive menu: does the given file already
@@ -311,9 +464,19 @@ fn build_block() -> String {
 
 enum InjectOutcome {
     DryRun(String),
-    Replaced { backup: PathBuf },
-    InsertedAfterSibling { backup: PathBuf },
-    Prepended { backup: PathBuf },
+    Replaced {
+        backup: PathBuf,
+    },
+    InsertedAfterSibling {
+        backup: PathBuf,
+    },
+    Prepended {
+        backup: PathBuf,
+    },
+    /// Target file did not exist; a fresh file was written containing the
+    /// header plus the memory-rules block. No `.bak` sibling is produced
+    /// because there was nothing to back up.
+    Created,
 }
 
 /// Result of an uninstall pass. Parallel to [`InjectOutcome`] but narrower:
@@ -346,10 +509,15 @@ enum AutoMemoryAction {
 }
 
 fn inject(path: &Path, block: &str, dry_run: bool) -> Result<InjectOutcome> {
+    // Capture existence up front — we need it to distinguish "augment an
+    // existing file" from "create a fresh file with a header" after the
+    // write has happened.
+    let file_existed = path.exists();
     let existing = std::fs::read_to_string(path).unwrap_or_default();
     let already_present = existing.contains(OPEN_MARKER) && existing.contains(CLOSE_MARKER);
     let has_sibling = existing.contains(SIBLING_OPEN) && existing.contains(SIBLING_CLOSE);
-    let (new_content, mode) = compute_new_content(&existing, block, already_present, has_sibling);
+    let (new_content, mode) =
+        compute_new_content(&existing, block, already_present, has_sibling, file_existed);
 
     if dry_run {
         return Ok(InjectOutcome::DryRun(new_content));
@@ -360,16 +528,31 @@ fn inject(path: &Path, block: &str, dry_run: bool) -> Result<InjectOutcome> {
             .with_context(|| format!("create parent of {}", path.display()))?;
     }
 
-    let backup = backup_path(path);
-    std::fs::write(&backup, &existing)
-        .with_context(|| format!("write backup to {}", backup.display()))?;
+    // Only write a `.bak` sidecar when there was prior content to preserve.
+    // Freshly-created files need no backup — there is nothing to roll back
+    // to, and leaving a zero-byte `.bak` would be confusing.
+    let backup = if file_existed {
+        let b = backup_path(path);
+        std::fs::write(&b, &existing)
+            .with_context(|| format!("write backup to {}", b.display()))?;
+        Some(b)
+    } else {
+        None
+    };
     std::fs::write(path, &new_content)
         .with_context(|| format!("write updated file {}", path.display()))?;
 
     Ok(match mode {
-        InjectMode::Replaced => InjectOutcome::Replaced { backup },
-        InjectMode::InsertedAfterSibling => InjectOutcome::InsertedAfterSibling { backup },
-        InjectMode::Prepended => InjectOutcome::Prepended { backup },
+        InjectMode::Replaced => InjectOutcome::Replaced {
+            backup: backup.expect("replace mode only reachable when file existed"),
+        },
+        InjectMode::InsertedAfterSibling => InjectOutcome::InsertedAfterSibling {
+            backup: backup.expect("insert-after-sibling only reachable when file existed"),
+        },
+        InjectMode::Prepended => InjectOutcome::Prepended {
+            backup: backup.expect("prepend only reachable when file existed"),
+        },
+        InjectMode::Created => InjectOutcome::Created,
     })
 }
 
@@ -378,6 +561,9 @@ enum InjectMode {
     Replaced,
     InsertedAfterSibling,
     Prepended,
+    /// Target file did not exist — write a fresh file with the
+    /// [`FRESH_FILE_HEADER`] prelude followed by the memory-rules block.
+    Created,
 }
 
 /// Strip the `<memory-rules>` block from `path`, writing a `.bak` sibling
@@ -518,14 +704,25 @@ fn sync_auto_memory(
 /// Pure helper: build the new file body from existing content + the rules
 /// block. Factored out so unit tests can verify idempotency and placement
 /// without touching the filesystem.
+///
+/// `file_existed` distinguishes two empty-content cases: a pre-existing but
+/// empty file (treated as Prepended — the user had a file we're augmenting)
+/// vs. a brand-new file we're creating for them (treated as Created and
+/// prefixed with [`FRESH_FILE_HEADER`] so the output doesn't look like a
+/// bare dump of XML-shaped markers).
 fn compute_new_content(
     existing: &str,
     block: &str,
     already_present: bool,
     has_sibling: bool,
+    file_existed: bool,
 ) -> (String, InjectMode) {
     if already_present {
         (replace_block(existing, block), InjectMode::Replaced)
+    } else if !file_existed {
+        // Brand-new file — give it a minimal header so opening the file in
+        // an editor doesn't greet the user with a naked `<memory-rules>`.
+        (format!("{FRESH_FILE_HEADER}{block}"), InjectMode::Created)
     } else if existing.is_empty() {
         (block.to_string(), InjectMode::Prepended)
     } else if has_sibling {
@@ -679,7 +876,9 @@ mod tests {
     fn compute_new_content_prepends_when_absent_and_no_sibling() {
         let existing = "# Existing instructions\n\nfoo bar\n";
         let block = build_block();
-        let (out, mode) = compute_new_content(existing, &block, false, false);
+        // `file_existed = true` — the user already had a CLAUDE.md-style
+        // file we're augmenting.
+        let (out, mode) = compute_new_content(existing, &block, false, false, true);
         assert_eq!(mode, InjectMode::Prepended);
         assert!(out.starts_with(OPEN_MARKER));
         assert!(out.contains("# Existing instructions"));
@@ -691,7 +890,7 @@ mod tests {
         let block = build_block();
         let existing =
             format!("{SIBLING_OPEN}\nagent-tools stuff\n{SIBLING_CLOSE}\n\n# Rest of file\n");
-        let (out, mode) = compute_new_content(&existing, &block, false, true);
+        let (out, mode) = compute_new_content(&existing, &block, false, true, true);
         assert_eq!(mode, InjectMode::InsertedAfterSibling);
         // Sibling block still first.
         let sibling_pos = out.find(SIBLING_CLOSE).unwrap();
@@ -708,7 +907,7 @@ mod tests {
         let block = build_block();
         let existing =
             format!("# Header\n\n{OPEN_MARKER}\nold memory body\n{CLOSE_MARKER}\n\n# Footer\n");
-        let (out, mode) = compute_new_content(&existing, &block, true, false);
+        let (out, mode) = compute_new_content(&existing, &block, true, false, true);
         assert_eq!(mode, InjectMode::Replaced);
         assert!(out.starts_with("# Header"));
         assert!(out.contains("# Footer"));
@@ -722,8 +921,8 @@ mod tests {
     fn compute_new_content_is_idempotent() {
         let block = build_block();
         let existing = "# Header\n";
-        let (once, _) = compute_new_content(existing, &block, false, false);
-        let (twice, mode) = compute_new_content(&once, &block, true, false);
+        let (once, _) = compute_new_content(existing, &block, false, false, true);
+        let (twice, mode) = compute_new_content(&once, &block, true, false, true);
         assert_eq!(mode, InjectMode::Replaced);
         assert_eq!(once, twice);
     }
@@ -731,9 +930,46 @@ mod tests {
     #[test]
     fn compute_new_content_handles_empty_file() {
         let block = build_block();
-        let (out, mode) = compute_new_content("", &block, false, false);
+        // Empty-but-existing file — Prepended, not Created, because the
+        // file is already on disk (possibly touched by another tool).
+        let (out, mode) = compute_new_content("", &block, false, false, true);
         assert_eq!(mode, InjectMode::Prepended);
         assert_eq!(out, block);
+    }
+
+    /// The fresh-file path: no pre-existing file at all. Output must begin
+    /// with [`FRESH_FILE_HEADER`] so opening the file in an editor greets
+    /// the user with something that looks intentional, not a bare block.
+    #[test]
+    fn compute_new_content_creates_fresh_file_with_header() {
+        let block = build_block();
+        let (out, mode) = compute_new_content("", &block, false, false, false);
+        assert_eq!(mode, InjectMode::Created);
+        assert!(
+            out.starts_with(FRESH_FILE_HEADER),
+            "fresh file must start with the header: {out}"
+        );
+        assert!(
+            out.contains(OPEN_MARKER),
+            "fresh file must contain the rules block"
+        );
+        assert!(out.contains("memory context"));
+    }
+
+    /// Once installed, a re-run of the installer on the same file must fall
+    /// through to Replaced regardless of the `file_existed` flag coming back
+    /// as true — the block-is-present check wins.
+    #[test]
+    fn compute_new_content_created_file_round_trips_to_replaced_on_refresh() {
+        let block = build_block();
+        let (fresh, _) = compute_new_content("", &block, false, false, false);
+        let (refreshed, mode) = compute_new_content(&fresh, &block, true, false, true);
+        assert_eq!(mode, InjectMode::Replaced);
+        // Exactly one block after the refresh — no accumulation.
+        assert_eq!(refreshed.matches(OPEN_MARKER).count(), 1);
+        assert_eq!(refreshed.matches(CLOSE_MARKER).count(), 1);
+        // Header survives the in-place replace.
+        assert!(refreshed.starts_with(FRESH_FILE_HEADER));
     }
 
     #[test]
@@ -743,9 +979,9 @@ mod tests {
         // Third run of `memory setup` detects its own existing block and
         // replaces in place, *not* re-inserting after the sibling.
         let block = build_block();
-        let (first, _) = compute_new_content("# Header\n", &block, false, false);
+        let (first, _) = compute_new_content("# Header\n", &block, false, false, true);
         let with_sibling = format!("{SIBLING_OPEN}\nfoo\n{SIBLING_CLOSE}\n\n{first}");
-        let (after_refresh, mode) = compute_new_content(&with_sibling, &block, true, true);
+        let (after_refresh, mode) = compute_new_content(&with_sibling, &block, true, true, true);
         assert_eq!(mode, InjectMode::Replaced);
         assert_eq!(after_refresh.matches(OPEN_MARKER).count(), 1);
         assert_eq!(after_refresh.matches(CLOSE_MARKER).count(), 1);
@@ -778,7 +1014,7 @@ mod tests {
     fn install_then_strip_is_lossless() {
         let block = build_block();
         let original = "# Existing instructions\n\nfoo bar\n";
-        let (installed, _) = compute_new_content(original, &block, false, false);
+        let (installed, _) = compute_new_content(original, &block, false, false, true);
         let stripped = strip_block(&installed);
         assert_eq!(stripped, original);
     }
@@ -790,5 +1026,181 @@ mod tests {
     fn strip_block_no_markers_returns_unchanged() {
         let input = "# Just a header\n\nno markers here\n";
         assert_eq!(strip_block(input), input);
+    }
+
+    // -- fresh-install / codex-precedence tests --------------------------------
+
+    /// Minimal isolated tempdir — mirrors the helper used by the skill
+    /// tests so the file stays dependency-free (no `tempfile` crate).
+    fn tempdir_in_target() -> PathBuf {
+        let base =
+            std::env::temp_dir().join(format!("agent-memory-rules-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    #[test]
+    fn file_or_parent_exists_true_when_file_exists() {
+        let tmp = tempdir_in_target();
+        let p = tmp.join("file.md");
+        std::fs::write(&p, "hello").unwrap();
+        assert!(file_or_parent_exists(&p));
+    }
+
+    #[test]
+    fn file_or_parent_exists_true_when_only_parent_exists() {
+        let tmp = tempdir_in_target();
+        let p = tmp.join("missing.md");
+        // `tmp` exists, but `missing.md` does not — qualifies as installable.
+        assert!(file_or_parent_exists(&p));
+    }
+
+    #[test]
+    fn file_or_parent_exists_false_when_parent_missing() {
+        let tmp = tempdir_in_target();
+        let p = tmp.join("no-such-dir").join("missing.md");
+        assert!(!file_or_parent_exists(&p));
+    }
+
+    /// `inject` on a path whose parent exists but whose file is missing
+    /// must write a fresh file with the header, not a bare block.
+    #[test]
+    fn inject_creates_file_with_header_when_missing_but_parent_exists() {
+        let tmp = tempdir_in_target();
+        let parent = tmp.join(".codex");
+        std::fs::create_dir_all(&parent).unwrap();
+        let target = parent.join("AGENTS.md");
+        assert!(!target.exists());
+
+        let block = build_block();
+        let outcome = inject(&target, &block, false).expect("inject should succeed");
+        assert!(matches!(outcome, InjectOutcome::Created));
+        assert!(target.exists(), "target file should have been created");
+        let body = std::fs::read_to_string(&target).unwrap();
+        assert!(body.starts_with(FRESH_FILE_HEADER));
+        assert!(body.contains(OPEN_MARKER));
+        assert!(body.contains("memory context"));
+        // No `.bak` sibling on a fresh create — nothing to back up.
+        let backup = backup_path(&target);
+        assert!(
+            !backup.exists(),
+            "no .bak should be written when creating a fresh file"
+        );
+    }
+
+    /// Re-running over a file we just created must behave like any other
+    /// augment: the block is replaced in place, NOT duplicated.
+    #[test]
+    fn inject_is_idempotent_after_create() {
+        let tmp = tempdir_in_target();
+        let parent = tmp.join(".codex");
+        std::fs::create_dir_all(&parent).unwrap();
+        let target = parent.join("AGENTS.md");
+        let block = build_block();
+        inject(&target, &block, false).expect("first inject (create)");
+        let outcome2 = inject(&target, &block, false).expect("second inject (replace)");
+        assert!(matches!(outcome2, InjectOutcome::Replaced { .. }));
+        let body = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(body.matches(OPEN_MARKER).count(), 1);
+        assert_eq!(body.matches(CLOSE_MARKER).count(), 1);
+    }
+
+    /// Parent missing → inject still creates both dir and file (it calls
+    /// `create_dir_all` first). This is the fallback for `--target` with a
+    /// user-supplied path that points at a non-existent directory — if
+    /// they passed it explicitly, they want us to write there.
+    #[test]
+    fn inject_creates_parent_dir_when_using_explicit_target() {
+        let tmp = tempdir_in_target();
+        let target = tmp.join("fresh-dir").join("CLAUDE.md");
+        let block = build_block();
+        let outcome = inject(&target, &block, false).expect("inject should succeed");
+        assert!(matches!(outcome, InjectOutcome::Created));
+        assert!(target.exists());
+    }
+
+    // -- detect_agent_files_with_env ------------------------------------------
+
+    #[test]
+    fn resolve_codex_honors_codex_home_override() {
+        let tmp = tempdir_in_target();
+        let override_dir = tmp.join("custom-codex");
+        std::fs::create_dir_all(&override_dir).unwrap();
+        let fake_home = tmp.join("fake-home");
+        std::fs::create_dir_all(&fake_home).unwrap();
+        // Also create both fallback dirs to prove the override wins even
+        // when the legacy paths are present.
+        std::fs::create_dir_all(fake_home.join(".codex")).unwrap();
+        std::fs::create_dir_all(fake_home.join(".config").join("codex")).unwrap();
+
+        let resolved = resolve_codex_rule_file(&fake_home, Some(&override_dir)).unwrap();
+        assert_eq!(resolved, override_dir.join("AGENTS.md"));
+    }
+
+    #[test]
+    fn resolve_codex_prefers_dot_codex_over_xdg_when_both_present() {
+        let tmp = tempdir_in_target();
+        let fake_home = tmp.join("home");
+        std::fs::create_dir_all(fake_home.join(".codex")).unwrap();
+        std::fs::create_dir_all(fake_home.join(".config").join("codex")).unwrap();
+
+        let resolved = resolve_codex_rule_file(&fake_home, None).unwrap();
+        assert_eq!(resolved, fake_home.join(".codex").join("AGENTS.md"));
+    }
+
+    #[test]
+    fn resolve_codex_falls_back_to_xdg_when_only_xdg_present() {
+        let tmp = tempdir_in_target();
+        let fake_home = tmp.join("home");
+        std::fs::create_dir_all(&fake_home).unwrap();
+        std::fs::create_dir_all(fake_home.join(".config").join("codex")).unwrap();
+
+        let resolved = resolve_codex_rule_file(&fake_home, None).unwrap();
+        assert_eq!(
+            resolved,
+            fake_home.join(".config").join("codex").join("AGENTS.md")
+        );
+    }
+
+    #[test]
+    fn resolve_codex_returns_none_when_no_install_visible() {
+        let tmp = tempdir_in_target();
+        let fake_home = tmp.join("home");
+        std::fs::create_dir_all(&fake_home).unwrap();
+        assert!(resolve_codex_rule_file(&fake_home, None).is_none());
+    }
+
+    /// An explicit but invalid `CODEX_HOME` must NOT silently fall through
+    /// to `~/.codex/` — the user told us exactly where Codex lives, and
+    /// writing elsewhere would be surprising.
+    #[test]
+    fn resolve_codex_override_to_missing_dir_returns_none() {
+        let tmp = tempdir_in_target();
+        let fake_home = tmp.join("home");
+        std::fs::create_dir_all(fake_home.join(".codex")).unwrap();
+        let missing = tmp.join("does-not-exist");
+        assert!(resolve_codex_rule_file(&fake_home, Some(&missing)).is_none());
+    }
+
+    // -- agent labels ---------------------------------------------------------
+
+    #[test]
+    fn agent_label_maps_known_rule_file_names() {
+        assert_eq!(
+            agent_label_for_rule_file(Path::new("/x/.claude/CLAUDE.md")),
+            "claude"
+        );
+        assert_eq!(
+            agent_label_for_rule_file(Path::new("/x/.gemini/GEMINI.md")),
+            "gemini"
+        );
+        assert_eq!(
+            agent_label_for_rule_file(Path::new("/x/.codex/AGENTS.md")),
+            "codex"
+        );
+        assert_eq!(
+            agent_label_for_rule_file(Path::new("/x/custom/FOOBAR.md")),
+            "unknown"
+        );
     }
 }
