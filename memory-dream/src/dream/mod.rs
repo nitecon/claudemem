@@ -1,24 +1,26 @@
-//! Dream orchestrator. Wires condense + dedup + embedding + persistence
-//! together into a single batch pass.
+//! Dream orchestrator (Release 2.3).
 //!
-//! The entry point [`run`] is called once per `memory-dream` invocation.
-//! It walks every memory in the DB (oldest `updated_at` first), opens a
-//! `BEGIN IMMEDIATE` transaction per row so concurrent `memory store`
-//! calls can't race, classifies the row, applies the chosen policy, and
-//! commits. Per-memory errors are logged and skipped — one bad memory
-//! can't halt the pass.
+//! Entry point: [`run`]. Called once per `memory-dream` invocation.
+//! Responsible for:
 //!
-//! Progress is emitted as light-XML on stdout using the same rendering
-//! helpers as `memory`'s CLI, so the dream output stays consistent with
-//! the rest of the project. See
-//! [`agent_memory::render::render_action_result`].
+//! 1. **Probe** the backend for shell-tool support ([`agentic::probe_tool_support`]).
+//!    The result is cached for the whole pass — we never re-probe.
+//! 2. **Enumerate projects** with at least one live memory.
+//! 3. **For each project**, pull incremental candidates (rows newer than
+//!    `project_state.last_dream_at`, or with a stale `condenser_version`)
+//!    and route to either:
+//!      - **Agentic path** ([`agentic::run_agentic_batch`]) — one batched
+//!        LLM call per N memories; the LLM invokes `memory` CLI tools
+//!        directly to curate. No parsing; DB is the output.
+//!      - **Non-agentic path** ([`process_one_non_agentic`]) — per-memory
+//!        plain-bullets condensation. No batching, no discards, no scope
+//!        reclassify. Local-candle backends always take this path.
+//! 4. **Stamp** `project_state.last_dream_at` per project after the batch
+//!    completes so the next incremental run skips untouched rows.
 //!
-//! Two execution modes:
-//!   - `mode = DreamMode::Dry` — walks the DB and reports intended
-//!     decisions; no writes. Useful for "what would dream do on my
-//!     current DB" inspection.
-//!   - `mode = DreamMode::Apply` — persists condensations and dedup
-//!     decisions. The normal CLI default.
+//! Progress is emitted as light-XML on stdout — same renderer the rest of
+//! the project uses — so a caller can pipe `memory-dream` output into a
+//! log collector alongside `memory` command output.
 
 pub mod agentic;
 pub mod condense;
@@ -37,8 +39,8 @@ use thiserror::Error;
 
 use crate::inference::Inference;
 
+use self::agentic::probe_tool_support;
 use self::condense::condense;
-use self::dedup::{apply_policy, find_duplicate, DEFAULT_COSINE_THRESHOLD};
 
 /// Top-level errors for the dream orchestrator.
 #[derive(Debug, Error)]
@@ -53,18 +55,28 @@ pub enum DreamError {
 /// Run mode for a dream pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DreamMode {
-    /// Walk every memory, run the classification pipeline, and print what
-    /// would happen. No writes.
+    /// Walk candidate memories and report intended decisions. In agentic
+    /// mode this means "probe + enumerate + print candidate counts", NOT
+    /// "invoke the LLM in read-only mode" — the LLM has no dry-run bit we
+    /// can flip, so dry-run for agentic is "what WOULD we hand to the
+    /// model". Non-agentic dry-run condenses in-memory but doesn't persist.
     Dry,
-    /// Walk every memory, condense / dedup, commit changes.
+    /// Commit changes.
     Apply,
 }
 
 /// Short name used for the embedding model column. Mirrors the fastembed
-/// default in `agent_memory::embedding::embed_text`. Kept as a constant so
-/// dedup can compare apples-to-apples even before a memory has been
-/// re-embedded by a dream pass.
+/// default in `agent_memory::embedding::embed_text`.
 pub const EMBEDDING_MODEL_NAME: &str = "all-MiniLM-L6-v2";
+
+/// Default maximum memories per agentic batch. Tuned for Claude's context
+/// window (~200k tokens): 100 memories × ~200 chars preview each ≈ 20k
+/// tokens, leaving plenty of room for tool-call round trips.
+pub const DEFAULT_AGENTIC_BATCH_SIZE: usize = 100;
+
+/// Default batch size for non-agentic per-memory condensation. One at a
+/// time — there is no cross-memory reasoning to amortize.
+pub const DEFAULT_NON_AGENTIC_BATCH_SIZE: usize = 1;
 
 /// Configuration for a single dream pass.
 pub struct DreamConfig<'a> {
@@ -76,21 +88,40 @@ pub struct DreamConfig<'a> {
     pub model_name: &'a str,
     /// Cache directory for fastembed's MiniLM model files.
     pub embedding_cache_dir: &'a Path,
-    /// Cosine threshold for `near_match` dedup decisions.
+    /// Cosine threshold (reserved for future reuse; non-agentic path
+    /// currently does not run dedup).
     pub cosine_threshold: f32,
+    /// Force a full walk, ignoring `project_state.last_dream_at`.
+    /// Set via `memory-dream --full`.
+    pub full: bool,
+    /// Override for agentic batch size (0 = use default).
+    pub batch_size_override: usize,
 }
 
 impl<'a> DreamConfig<'a> {
     /// Build a config with sensible defaults. The caller is still expected
-    /// to fill in `mode`, `embedding_cache_dir`, and (optionally) override
-    /// `limit` and `model_name`.
+    /// to fill in `mode` and `embedding_cache_dir`.
     pub fn new(mode: DreamMode, model_name: &'a str, embedding_cache_dir: &'a Path) -> Self {
         Self {
             mode,
             limit: 0,
             model_name,
             embedding_cache_dir,
-            cosine_threshold: DEFAULT_COSINE_THRESHOLD,
+            cosine_threshold: dedup::DEFAULT_COSINE_THRESHOLD,
+            full: false,
+            batch_size_override: 0,
+        }
+    }
+
+    /// Resolve the batch size for a given mode based on the override (if
+    /// set) and the agentic/non-agentic defaults.
+    fn effective_batch_size(&self, agentic: bool) -> usize {
+        if self.batch_size_override > 0 {
+            self.batch_size_override
+        } else if agentic {
+            DEFAULT_AGENTIC_BATCH_SIZE
+        } else {
+            DEFAULT_NON_AGENTIC_BATCH_SIZE
         }
     }
 }
@@ -101,70 +132,119 @@ impl<'a> DreamConfig<'a> {
 pub struct DreamSummary {
     pub total_walked: usize,
     pub condensed: usize,
-    pub superseded: usize,
+    pub agentic_batches: usize,
     pub skipped: usize,
     pub errors: usize,
 }
 
 /// Run a full dream pass.
-///
-/// Takes the inference backend as a `&dyn` so tests can swap in
-/// `FixedInference`. The embedder is pulled from the sibling `memory`
-/// crate — dream uses the same vector space as `memory store`'s default
-/// embedder so cosine comparisons remain meaningful.
 pub fn run(
     conn: &mut Connection,
     inference: &dyn Inference,
     cfg: &DreamConfig<'_>,
 ) -> Result<DreamSummary, DreamError> {
-    let rows = q::list_all_for_dream(conn, cfg.limit)?;
-    let total = rows.len();
+    // One-shot probe. Cached for the remainder of the pass — re-probing
+    // per batch would double latency with no benefit since a backend's
+    // tool support doesn't change mid-run.
+    let probe = probe_tool_support(inference);
+    let agentic = probe.supports_tools();
+
     println!(
         "{}",
         render::render_action_result(
-            "dream_start",
+            "dream_probe",
             &[
-                ("total", total.to_string()),
-                ("mode", format!("{:?}", cfg.mode).to_lowercase()),
+                ("mode", if agentic { "agentic" } else { "non_agentic" }.to_string()),
+                ("outcome", format!("{probe:?}").to_lowercase()),
             ]
         )
     );
 
-    let mut summary = DreamSummary {
-        total_walked: total,
-        ..Default::default()
-    };
+    let mut summary = DreamSummary::default();
 
-    for (idx, source_row) in rows.iter().enumerate() {
-        match process_one(conn, inference, cfg, source_row) {
-            Ok(Outcome::Condensed) => summary.condensed += 1,
-            Ok(Outcome::Superseded) => summary.superseded += 1,
-            Ok(Outcome::Skipped) => summary.skipped += 1,
-            Err(e) => {
-                summary.errors += 1;
-                tracing::warn!(id = %source_row.id, error = %e, "dream failure on memory");
-                println!(
-                    "{}",
-                    render::render_action_result(
-                        "dream_error",
-                        &[
-                            ("id", render::short_id(&source_row.id).to_string()),
-                            ("error", format!("{e}")),
-                        ]
-                    )
-                );
+    // Enumerate projects. An empty DB yields zero projects and the pass
+    // exits cleanly with zero work.
+    let projects = q::list_distinct_projects_for_dream(conn)?;
+
+    for project in &projects {
+        let project_label = project.as_deref().unwrap_or("(null)");
+        let cutoff = resolve_incremental_cutoff(conn, project.as_deref(), cfg)?;
+        let current_stamp = prompt::condenser_version_stamp(cfg.model_name);
+
+        // `list_dream_candidates` handles the --full branch internally:
+        // passing `last_dream_at = None` disables the time filter, which
+        // is exactly what we want when `cfg.full` is true.
+        let candidates = q::list_dream_candidates(
+            conn,
+            project.as_deref(),
+            cutoff.as_deref(),
+            // On --full, also drop the stamp-based filter so every row
+            // re-enters the pipeline regardless of its condenser_version.
+            if cfg.full {
+                None
+            } else {
+                Some(current_stamp.as_str())
+            },
+            cfg.limit,
+        )?;
+
+        let walked = candidates.len();
+        summary.total_walked += walked;
+
+        println!(
+            "{}",
+            render::render_action_result(
+                "dream_project",
+                &[
+                    ("project", project_label.to_string()),
+                    ("candidates", walked.to_string()),
+                ]
+            )
+        );
+
+        if walked == 0 {
+            continue;
+        }
+
+        if agentic {
+            process_project_agentic(
+                inference,
+                cfg,
+                project_label,
+                &candidates,
+                &mut summary,
+            );
+        } else {
+            for mem in &candidates {
+                match process_one_non_agentic(conn, inference, cfg, mem) {
+                    Ok(Outcome::Condensed) => summary.condensed += 1,
+                    Ok(Outcome::Skipped) => summary.skipped += 1,
+                    Err(e) => {
+                        summary.errors += 1;
+                        tracing::warn!(id = %mem.id, error = %e, "dream failure on memory");
+                        println!(
+                            "{}",
+                            render::render_action_result(
+                                "dream_error",
+                                &[
+                                    ("id", render::short_id(&mem.id).to_string()),
+                                    ("error", format!("{e}")),
+                                ]
+                            )
+                        );
+                    }
+                }
             }
         }
 
-        // Emit progress every 5 rows, plus always at the end.
-        if (idx + 1) % 5 == 0 || idx + 1 == total {
-            println!(
-                "{}",
-                render::render_action_result(
-                    "dream_progress",
-                    &[("n", (idx + 1).to_string()), ("total", total.to_string()),]
-                )
-            );
+        // Stamp the project's last_dream_at on Apply mode only — Dry runs
+        // must not influence the next incremental pass.
+        if cfg.mode == DreamMode::Apply {
+            let now = chrono::Utc::now().to_rfc3339();
+            if let Err(e) = q::set_last_dream_at(conn, project.as_deref(), &now) {
+                tracing::warn!(project = %project_label, error = %e,
+                    "failed to stamp project_state.last_dream_at");
+            }
         }
     }
 
@@ -175,9 +255,10 @@ pub fn run(
             &[
                 ("walked", summary.total_walked.to_string()),
                 ("condensed", summary.condensed.to_string()),
-                ("superseded", summary.superseded.to_string()),
+                ("agentic_batches", summary.agentic_batches.to_string()),
                 ("skipped", summary.skipped.to_string()),
                 ("errors", summary.errors.to_string()),
+                ("mode", if agentic { "agentic" } else { "non_agentic" }.to_string()),
             ]
         )
     );
@@ -185,42 +266,119 @@ pub fn run(
     Ok(summary)
 }
 
-/// Per-memory disposition, returned by [`process_one`] so the caller can
-/// tally the summary counters.
+/// Per-memory disposition in the non-agentic path.
 enum Outcome {
     Condensed,
-    Superseded,
     Skipped,
 }
 
-/// Classify + optionally persist the disposition for a single memory.
+/// Decide which `last_dream_at` cutoff applies for `project`.
 ///
-/// Wrapped in a `BEGIN IMMEDIATE` transaction in `Apply` mode so concurrent
-/// `memory store` writes are serialized behind the dream pass. In `Dry`
-/// mode the transaction is still opened (to read consistently) but
-/// rolled back at the end.
-fn process_one(
+/// Three cases, collapsed into one return value:
+///   - `cfg.full == true`              → `None` (no cutoff; re-walk all).
+///   - No prior pass (NULL row)        → `None` (first pass processes everything).
+///   - Prior pass timestamp present    → `Some(ts)`.
+fn resolve_incremental_cutoff(
+    conn: &Connection,
+    project: Option<&str>,
+    cfg: &DreamConfig<'_>,
+) -> Result<Option<String>, DreamError> {
+    if cfg.full {
+        return Ok(None);
+    }
+    Ok(q::get_last_dream_at(conn, project)?)
+}
+
+/// Agentic batch driver. Slices `candidates` into batches of
+/// `cfg.effective_batch_size(true)` and invokes the LLM once per batch.
+fn process_project_agentic(
+    inference: &dyn Inference,
+    cfg: &DreamConfig<'_>,
+    project_label: &str,
+    candidates: &[Memory],
+    summary: &mut DreamSummary,
+) {
+    let batch_size = cfg.effective_batch_size(/* agentic */ true);
+    for chunk in candidates.chunks(batch_size.max(1)) {
+        println!(
+            "{}",
+            render::render_action_result(
+                "dream_batch_start",
+                &[
+                    ("project", project_label.to_string()),
+                    ("size", chunk.len().to_string()),
+                ]
+            )
+        );
+
+        if cfg.mode == DreamMode::Dry {
+            // Dry-run for agentic: do NOT invoke the model. The LLM has
+            // no read-only mode, so the safest dry-run surfaces the
+            // candidate list and stops.
+            println!(
+                "{}",
+                render::render_action_result(
+                    "dream_batch_dry_run",
+                    &[
+                        ("project", project_label.to_string()),
+                        ("would_process", chunk.len().to_string()),
+                    ]
+                )
+            );
+            continue;
+        }
+
+        match agentic::run_agentic_batch(inference, project_label, chunk) {
+            Ok(report) => {
+                summary.agentic_batches += 1;
+                println!(
+                    "{}",
+                    render::render_action_result(
+                        "dream_batch_complete",
+                        &[
+                            ("project", project_label.to_string()),
+                            ("memories", report.memories_in_batch.to_string()),
+                            ("reply_bytes", report.reply_bytes.to_string()),
+                        ]
+                    )
+                );
+            }
+            Err(e) => {
+                summary.errors += 1;
+                tracing::warn!(project = %project_label, error = %e, "agentic batch failed");
+                println!(
+                    "{}",
+                    render::render_action_result(
+                        "dream_batch_error",
+                        &[
+                            ("project", project_label.to_string()),
+                            ("error", format!("{e}")),
+                        ]
+                    )
+                );
+            }
+        }
+    }
+}
+
+/// Non-agentic per-memory condensation.
+///
+/// Wrapped in a `BEGIN IMMEDIATE` transaction in Apply mode so concurrent
+/// `memory store` / `memory update` writes serialize behind this row. Dry
+/// mode rolls the transaction back so no side effect reaches the DB.
+fn process_one_non_agentic(
     conn: &mut Connection,
     inference: &dyn Inference,
     cfg: &DreamConfig<'_>,
     source: &Memory,
 ) -> Result<Outcome, DreamError> {
-    // Skip rows already marked superseded by a prior pass — they're dead
-    // and nothing the dream pipeline does will resurrect them.
     if source.superseded_by.is_some() {
+        // Belt-and-braces; the candidate query already filters these out.
         return Ok(Outcome::Skipped);
     }
 
-    // Transaction scope: every mutation below runs under BEGIN IMMEDIATE so
-    // concurrent stores / updates block until dream finishes this memory.
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
-    // --- Condense if needed --------------------------------------------
-    //
-    // A row needs condensation when it has no content_raw (never processed)
-    // or when its condenser_version stamp doesn't match what the current
-    // prompt would produce (stale). The stamp format is "<model>:<prompt8>"
-    // so a mismatch on either side triggers a re-run.
     let want_stamp = prompt::condenser_version_stamp(cfg.model_name);
     let needs_condensation = source.content_raw.is_none()
         || source
@@ -229,14 +387,11 @@ fn process_one(
             .map(|v| v != want_stamp)
             .unwrap_or(true);
 
-    let mut active_content = source.content.clone();
-    let mut active_raw = source.content_raw.clone();
-    let mut condensed_flag = false;
+    let mut outcome = Outcome::Skipped;
 
     if needs_condensation {
         match condense(inference, cfg.model_name, &source.content) {
             Ok(c) => {
-                // Re-embed the condensed text so vector search sees the short form.
                 let new_emb =
                     embed_text(&c.text, cfg.embedding_cache_dir).map_err(DreamError::from)?;
 
@@ -245,92 +400,32 @@ fn process_one(
                         &tx,
                         &source.id,
                         &c.text,
-                        // Preserve original raw text on first condensation;
-                        // subsequent re-condenses should keep the first raw
-                        // form rather than chain condensations through
-                        // condensed → raw.
+                        // First-pass condensation moves `content` to
+                        // `content_raw`. Re-condensations must keep the
+                        // very first raw form — never chain through a
+                        // prior condensed body.
                         source.content_raw.as_deref().unwrap_or(&source.content),
                         &c.version,
                         &new_emb,
                         EMBEDDING_MODEL_NAME,
                     )?;
                 }
-
-                active_content = c.text;
-                active_raw = Some(
-                    source
-                        .content_raw
-                        .clone()
-                        .unwrap_or_else(|| source.content.clone()),
-                );
-                condensed_flag = true;
+                outcome = Outcome::Condensed;
             }
             Err(e) => {
-                // Condensation failed (refused / parse error / too-long /
-                // inference backend down). Log and fall through to dedup
-                // against the raw content so a missing model doesn't
-                // block the dedup pass entirely — `memory-dream --dry-run`
-                // with no model pulled still produces useful output.
                 tracing::info!(id = %source.id, error = %e,
-                    "condense skipped; falling back to raw content for dedup");
+                    "non-agentic condense skipped; keeping raw content");
             }
         }
     }
 
-    // --- Dedup against peers ------------------------------------------
-    //
-    // Candidates share project + memory_type + embedding_model (or are NULL
-    // on the same axis). If the source row has no embedding we skip dedup
-    // entirely — dream's dedup contract is "same vector space or nothing".
-    let mut deduped = false;
-    if source.embedding.is_some() {
-        let candidates = q::list_dedup_candidates(
-            &tx,
-            &source.id,
-            source.project.as_deref(),
-            source.memory_type.as_deref(),
-            source
-                .embedding_model
-                .as_deref()
-                .or(Some(EMBEDDING_MODEL_NAME)),
-        )?;
-
-        // Substitute the freshly-condensed text into a throwaway clone so
-        // dedup compares against the current short form, not the stale
-        // raw content. The embedding stays the original — re-embedding
-        // happened above and the clone stores it faithfully.
-        let mut effective_source = source.clone();
-        effective_source.content = active_content.clone();
-        effective_source.content_raw = active_raw.clone();
-
-        let decision = find_duplicate(&effective_source, &candidates, cfg.cosine_threshold);
-        if cfg.mode == DreamMode::Apply {
-            if let Some((older, newer)) = apply_policy(&tx, &effective_source, &decision)? {
-                tracing::info!(older = %older, newer = %newer, "dream superseded");
-                deduped = true;
-            }
-        } else {
-            // Dry run — report but don't write.
-            if !matches!(decision, dedup::DedupDecision::Distinct) {
-                deduped = true;
-            }
-        }
-    }
-
-    // Commit or roll back depending on mode. Dry-run always rolls back.
     if cfg.mode == DreamMode::Apply {
         tx.commit()?;
     } else {
         tx.rollback()?;
     }
 
-    if deduped {
-        Ok(Outcome::Superseded)
-    } else if condensed_flag {
-        Ok(Outcome::Condensed)
-    } else {
-        Ok(Outcome::Skipped)
-    }
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -343,106 +438,161 @@ mod tests {
         agent_memory::db::open_database(&PathBuf::from(":memory:")).expect("open in-memory db")
     }
 
-    fn insert(conn: &Connection, id: &str, content: &str, emb: Option<Vec<f32>>) {
+    fn insert(conn: &Connection, id: &str, content: &str, project: Option<&str>) {
         let mut m = Memory::new(
             content.to_string(),
             None,
-            Some("p".to_string()),
+            project.map(String::from),
             None,
             None,
             Some("user".to_string()),
         );
         m.id = id.to_string();
-        m.embedding = emb;
         m.embedding_model = Some(EMBEDDING_MODEL_NAME.to_string());
         q::insert_memory(conn, &m).expect("insert");
     }
 
-    /// Dry-run should walk the DB and report intended decisions without
-    /// persisting anything. Rows keep their content_raw=NULL.
+    /// Zero-memory DB: the orchestrator runs the probe and exits cleanly.
     #[test]
-    fn dry_run_does_not_mutate_db() {
+    fn empty_db_exits_cleanly() {
         let mut conn = open_mem_db();
-        insert(
-            &conn,
-            "00000000-0000-1111-2222-000000000001",
-            "first memory",
-            None,
-        );
-        insert(
-            &conn,
-            "00000000-0000-1111-2222-000000000002",
-            "second memory",
-            None,
-        );
-
-        let inference = FixedInference::new(r#"{"condensed":"short form"}"#);
+        let inf = FixedInference::new("NO_TOOLS");
         let tmp = std::env::temp_dir();
-        let cfg = DreamConfig::new(DreamMode::Dry, "gemma3", &tmp);
-        let summary = run(&mut conn, &inference, &cfg).expect("dream ok");
-        // Two rows walked; content should still be the original since dry-run.
-        assert_eq!(summary.total_walked, 2);
-
-        for id in [
-            "00000000-0000-1111-2222-000000000001",
-            "00000000-0000-1111-2222-000000000002",
-        ] {
-            let got = q::get_memory_by_id(&conn, id).unwrap();
-            assert!(got.content_raw.is_none(), "dry-run should not persist");
-        }
+        let cfg = DreamConfig::new(DreamMode::Apply, "gemma3", &tmp);
+        let summary = run(&mut conn, &inf, &cfg).expect("dream ok");
+        assert_eq!(summary.total_walked, 0);
+        assert_eq!(summary.condensed, 0);
+        assert_eq!(summary.agentic_batches, 0);
     }
 
-    /// Superseded rows are skipped by the orchestrator so we don't
-    /// reprocess them on every pass.
+    /// Incremental filter: after a successful pass, re-running with no new
+    /// writes should yield zero candidates.
+    ///
+    /// The memory must also have a `condenser_version` matching the current
+    /// stamp — otherwise the stale-stamp branch keeps it in the candidate
+    /// pool. This mirrors real behavior where the first agentic pass writes
+    /// both the last_dream_at row AND stamps each condensed memory.
     #[test]
-    fn superseded_rows_are_skipped() {
+    fn incremental_filter_skips_processed_projects() {
         let mut conn = open_mem_db();
-        insert(&conn, "00000000-0000-1111-2222-000000000001", "older", None);
-        insert(&conn, "00000000-0000-1111-2222-000000000002", "newer", None);
-        q::mark_superseded(
-            &conn,
-            "00000000-0000-1111-2222-000000000001",
-            "00000000-0000-1111-2222-000000000002",
+
+        // Seed a memory pre-stamped with the current condenser version so
+        // the stale branch of the incremental filter doesn't pull it back
+        // in. This mirrors the state a memory would be in AFTER a
+        // successful non-agentic condensation.
+        let stamp = prompt::condenser_version_stamp("gemma3");
+        conn.execute(
+            "INSERT INTO memories (id, content, project, memory_type,
+                                   created_at, updated_at, condenser_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                "aaaaaaaa-0000-1111-2222-000000000001",
+                "first",
+                "p1",
+                "user",
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z",
+                stamp,
+            ],
         )
         .unwrap();
 
-        // Even in dry-run, the superseded row should be skipped (neither
-        // condensed nor deduped). Use a response that would fail JSON parse
-        // so any accidental condense call would bubble an error.
-        let inference = FixedInference::new("not json");
-        let tmp = std::env::temp_dir();
-        let cfg = DreamConfig::new(DreamMode::Dry, "gemma3", &tmp);
-        let summary = run(&mut conn, &inference, &cfg).expect("dream ok");
+        // Cutoff is after the row's updated_at, so the time filter rejects
+        // it too.
+        q::set_last_dream_at(&conn, Some("p1"), "2099-01-01T00:00:00Z").unwrap();
 
-        // Both rows walked, but the superseded one produces Skipped without
-        // invoking condense (no error bubbled).
-        assert_eq!(summary.total_walked, 2);
-        assert!(
-            summary.errors <= 1,
-            "superseded row must not cause an error; got {} errors",
-            summary.errors
-        );
+        let inf = FixedInference::new("NO_TOOLS");
+        let tmp = std::env::temp_dir();
+        let cfg = DreamConfig::new(DreamMode::Apply, "gemma3", &tmp);
+        let summary = run(&mut conn, &inf, &cfg).expect("dream ok");
+        assert_eq!(summary.total_walked, 0, "incremental filter must skip rows");
     }
 
-    /// Limit parameter caps the walk — a DB of 5 with limit=2 processes
-    /// only the 2 oldest rows.
+    /// --full flag overrides the incremental cutoff — every row is walked.
     #[test]
-    fn limit_caps_the_walk() {
+    fn full_flag_re_walks_everything() {
+        let mut conn = open_mem_db();
+        insert(&conn, "aaaaaaaa-0000-1111-2222-000000000001", "first", Some("p1"));
+        q::set_last_dream_at(&conn, Some("p1"), "2099-01-01T00:00:00Z").unwrap();
+
+        let inf = FixedInference::new("NO_TOOLS");
+        let tmp = std::env::temp_dir();
+        let mut cfg = DreamConfig::new(DreamMode::Apply, "gemma3", &tmp);
+        cfg.full = true;
+        let summary = run(&mut conn, &inf, &cfg).expect("dream ok");
+        assert_eq!(summary.total_walked, 1, "--full must ignore cutoff");
+    }
+
+    /// Apply-mode pass stamps `project_state.last_dream_at`.
+    #[test]
+    fn apply_mode_stamps_project_state() {
+        let mut conn = open_mem_db();
+        insert(&conn, "aaaaaaaa-0000-1111-2222-000000000001", "first", Some("p1"));
+
+        let inf = FixedInference::new("NO_TOOLS");
+        let tmp = std::env::temp_dir();
+        let cfg = DreamConfig::new(DreamMode::Apply, "gemma3", &tmp);
+        run(&mut conn, &inf, &cfg).expect("dream ok");
+
+        let ts = q::get_last_dream_at(&conn, Some("p1"))
+            .unwrap()
+            .expect("project_state row must exist after apply");
+        assert!(!ts.is_empty());
+    }
+
+    /// Dry-mode pass does NOT stamp `project_state` — the next run must
+    /// re-walk as if the dry pass never happened.
+    #[test]
+    fn dry_mode_does_not_stamp_project_state() {
+        let mut conn = open_mem_db();
+        insert(&conn, "aaaaaaaa-0000-1111-2222-000000000001", "first", Some("p1"));
+
+        let inf = FixedInference::new("NO_TOOLS");
+        let tmp = std::env::temp_dir();
+        let cfg = DreamConfig::new(DreamMode::Dry, "gemma3", &tmp);
+        run(&mut conn, &inf, &cfg).expect("dream ok");
+
+        let ts = q::get_last_dream_at(&conn, Some("p1")).unwrap();
+        assert!(ts.is_none(), "dry-run must not stamp project_state");
+    }
+
+    /// Agentic probe + batch: a supported probe routes into the agentic
+    /// driver, which records one batch per chunk.
+    #[test]
+    fn supported_probe_runs_agentic_batch() {
+        let mut conn = open_mem_db();
+        insert(&conn, "aaaaaaaa-0000-1111-2222-000000000001", "m1", Some("p1"));
+        insert(&conn, "bbbbbbbb-0000-1111-2222-000000000002", "m2", Some("p1"));
+
+        let inf = FixedInference::new("memory 1.3.0");
+        let tmp = std::env::temp_dir();
+        let cfg = DreamConfig::new(DreamMode::Apply, "gemma3", &tmp);
+        let summary = run(&mut conn, &inf, &cfg).expect("dream ok");
+        assert_eq!(summary.agentic_batches, 1);
+        assert_eq!(summary.total_walked, 2);
+    }
+
+    /// --batch-size override splits a large candidate list into multiple
+    /// agentic batches. Seeding 5 rows with batch_size=2 must produce 3
+    /// batches.
+    #[test]
+    fn batch_size_override_splits_agentic_work() {
         let mut conn = open_mem_db();
         for i in 1..=5 {
             insert(
                 &conn,
                 &format!("00000000-0000-1111-2222-00000000000{i}"),
-                &format!("memory {i}"),
-                None,
+                &format!("m{i}"),
+                Some("p1"),
             );
         }
 
-        let inference = FixedInference::new(r#"{"condensed":"x"}"#);
+        let inf = FixedInference::new("memory 1.3.0");
         let tmp = std::env::temp_dir();
-        let mut cfg = DreamConfig::new(DreamMode::Dry, "gemma3", &tmp);
-        cfg.limit = 2;
-        let summary = run(&mut conn, &inference, &cfg).expect("dream ok");
-        assert_eq!(summary.total_walked, 2);
+        let mut cfg = DreamConfig::new(DreamMode::Apply, "gemma3", &tmp);
+        cfg.batch_size_override = 2;
+        let summary = run(&mut conn, &inf, &cfg).expect("dream ok");
+        assert_eq!(summary.total_walked, 5);
+        assert_eq!(summary.agentic_batches, 3, "5/2 should produce 3 batches");
     }
 }

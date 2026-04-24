@@ -297,7 +297,7 @@ fn run_compaction(cli: &Cli, config: &Config, settings: &Settings) -> anyhow::Re
     tracing::info!(
         walked = summary.total_walked,
         condensed = summary.condensed,
-        superseded = summary.superseded,
+        agentic_batches = summary.agentic_batches,
         skipped = summary.skipped,
         errors = summary.errors,
         "dream pass finished"
