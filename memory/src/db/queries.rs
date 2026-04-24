@@ -602,6 +602,219 @@ pub fn mark_superseded(
     Ok(())
 }
 
+/// Atomic content replacement for `memory update <id>` and the agentic dream
+/// re-author flow.
+///
+/// Semantics:
+///   - Old `content` moves into `content_raw` (provenance / audit trail).
+///   - New `content` replaces the old.
+///   - `updated_at` bumps to now.
+///   - `superseded_by` clears (if the row had been dedup'd, a manual re-author
+///     resurrects it as an active record).
+///   - Optional `tags` / `memory_type` updates are applied when provided.
+///
+/// Returns true when a row was updated. Embedding is NOT touched here — the
+/// CLI handler re-embeds the new content separately so query helpers stay
+/// free of the fastembed dependency.
+#[allow(dead_code)]
+pub fn update_content(
+    conn: &Connection,
+    id: &str,
+    new_content: &str,
+    new_tags: Option<&[String]>,
+    new_memory_type: Option<&str>,
+) -> Result<bool, MemoryError> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let tags_json = new_tags.map(serde_json::to_string).transpose()?;
+
+    // SQL is dynamic on the presence of tags/memory_type so absent flags don't
+    // clobber the row's existing values with NULLs. The "move content to
+    // content_raw" step uses `COALESCE(content_raw, content)` so re-authoring
+    // a previously-condensed memory preserves the first-ever raw form — we
+    // never chain condensations through (raw → condensed → newer condensed →
+    // lose original) style drift.
+    let mut sql = String::from(
+        "UPDATE memories SET
+             content_raw = COALESCE(content_raw, content),
+             content = ?1,
+             updated_at = ?2,
+             superseded_by = NULL",
+    );
+    let mut bind: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+        Box::new(new_content.to_string()),
+        Box::new(now.clone()),
+    ];
+
+    if new_tags.is_some() {
+        sql.push_str(&format!(", tags = ?{}", bind.len() + 1));
+        bind.push(Box::new(tags_json));
+    }
+    if let Some(mt) = new_memory_type {
+        sql.push_str(&format!(", memory_type = ?{}", bind.len() + 1));
+        bind.push(Box::new(mt.to_string()));
+    }
+
+    sql.push_str(&format!(" WHERE id = ?{}", bind.len() + 1));
+    bind.push(Box::new(id.to_string()));
+
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = bind.iter().map(|b| b.as_ref()).collect();
+    let changed = conn.execute(&sql, param_refs.as_slice())?;
+    Ok(changed > 0)
+}
+
+// -- project_state helpers (Release 2.3) -------------------------------------
+//
+// Track per-project "last dream pass" timestamps so the incremental filter
+// in `list_dream_candidates` can skip rows that haven't changed since the
+// previous pass. RFC3339 strings throughout — same format every other
+// timestamp column uses in this schema.
+
+/// Return the RFC3339 timestamp of the last successful dream pass for a
+/// project, or `None` when the project has never been dreamed.
+///
+/// NULL semantics: `project` may be `None` for memories with no project tag.
+/// Internally stored as the literal string `"__null__"` so the primary key
+/// constraint on `project_state.project` stays strict TEXT NOT NULL — we
+/// don't need the three-valued logic headaches a nullable PK would bring.
+#[allow(dead_code)]
+pub fn get_last_dream_at(
+    conn: &Connection,
+    project: Option<&str>,
+) -> Result<Option<String>, MemoryError> {
+    let key = project.unwrap_or(NULL_PROJECT_SENTINEL);
+    let res = conn.query_row(
+        "SELECT last_dream_at FROM project_state WHERE project = ?1",
+        params![key],
+        |row| row.get::<_, String>(0),
+    );
+    match res {
+        Ok(ts) => Ok(Some(ts)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(MemoryError::Database(e)),
+    }
+}
+
+/// Upsert a project's last-dream timestamp. Call after successfully processing
+/// a project's batch so the next incremental pass can skip untouched rows.
+#[allow(dead_code)]
+pub fn set_last_dream_at(
+    conn: &Connection,
+    project: Option<&str>,
+    timestamp: &str,
+) -> Result<(), MemoryError> {
+    let key = project.unwrap_or(NULL_PROJECT_SENTINEL);
+    conn.execute(
+        "INSERT INTO project_state (project, last_dream_at) VALUES (?1, ?2)
+         ON CONFLICT(project) DO UPDATE SET last_dream_at = excluded.last_dream_at",
+        params![key, timestamp],
+    )?;
+    Ok(())
+}
+
+/// Sentinel used as the `project_state.project` key for memories whose
+/// `project` column is NULL. Visible in the DB for diagnostic purposes but
+/// never exposed to the CLI surface — the helpers above translate it back
+/// into `None` transparently.
+pub const NULL_PROJECT_SENTINEL: &str = "__null__";
+
+/// List the distinct project idents that have at least one live memory. The
+/// dream orchestrator walks this list to produce per-project batches. `NULL`
+/// projects surface as `None` so the caller can bind the
+/// [`NULL_PROJECT_SENTINEL`] translation via `set_last_dream_at`.
+#[allow(dead_code)]
+pub fn list_distinct_projects_for_dream(
+    conn: &Connection,
+) -> Result<Vec<Option<String>>, MemoryError> {
+    // Dream must see every project, even ones where every memory was
+    // superseded on a previous pass — clearing a superseded-by pointer via
+    // `memory update` should still cause the next dream run to re-examine
+    // the project.
+    let mut stmt = conn.prepare("SELECT DISTINCT project FROM memories")?;
+    let rows = stmt.query_map([], |row| row.get::<_, Option<String>>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Incremental candidate selection for an agentic or non-agentic dream pass.
+///
+/// Returns memories within `project` (NULL when `project.is_none()`) that
+/// either:
+///   - Have `updated_at > last_dream_at` (new or recently edited rows), OR
+///   - Have `condenser_version IS NULL` or a stale value (prompt revision),
+///   - AND are not superseded.
+///
+/// When `last_dream_at` is `None` (project has never been dreamed) the
+/// update-time filter is effectively epoch, i.e. every live row matches.
+///
+/// `current_condenser_version` scopes the "stale" check — rows whose
+/// `condenser_version` equals the current stamp are skipped even if they
+/// are newer than `last_dream_at`, because re-walking them produces no
+/// work. Passing `None` disables the condenser-version guard so the caller
+/// gets every live row (`--full` flag semantics).
+#[allow(dead_code)]
+pub fn list_dream_candidates(
+    conn: &Connection,
+    project: Option<&str>,
+    last_dream_at: Option<&str>,
+    current_condenser_version: Option<&str>,
+    limit: usize,
+) -> Result<Vec<Memory>, MemoryError> {
+    let mut sql = format!(
+        "SELECT {MEMORY_COLS} FROM memories \
+         WHERE superseded_by IS NULL"
+    );
+    let mut bind: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+    match project {
+        Some(p) => {
+            sql.push_str(&format!(" AND project = ?{}", bind.len() + 1));
+            bind.push(Box::new(p.to_string()));
+        }
+        None => sql.push_str(" AND project IS NULL"),
+    }
+
+    // Incremental gate: either the row is newer than the last dream cutoff,
+    // or its condenser_version is stale (or unstamped). Both branches fall
+    // through when `last_dream_at` is None (never dreamed) or when no
+    // current condenser version is provided (--full path).
+    match (last_dream_at, current_condenser_version) {
+        (Some(last), Some(cur)) => {
+            sql.push_str(&format!(
+                " AND (updated_at > ?{} OR condenser_version IS NULL OR condenser_version != ?{})",
+                bind.len() + 1,
+                bind.len() + 2
+            ));
+            bind.push(Box::new(last.to_string()));
+            bind.push(Box::new(cur.to_string()));
+        }
+        (Some(last), None) => {
+            sql.push_str(&format!(" AND updated_at > ?{}", bind.len() + 1));
+            bind.push(Box::new(last.to_string()));
+        }
+        (None, _) => {
+            // No cutoff — every live row in this project is a candidate.
+        }
+    }
+
+    sql.push_str(" ORDER BY updated_at ASC");
+    if limit > 0 {
+        sql.push_str(&format!(" LIMIT ?{}", bind.len() + 1));
+        bind.push(Box::new(limit as i64));
+    }
+
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = bind.iter().map(|b| b.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(param_refs.as_slice(), map_memory_row)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 // -- Tests ------------------------------------------------------------------
 // Lives at the end of the file so clippy's `items_after_test_module` lint is
 // happy. Each test opens an in-memory SQLite connection with the full
@@ -813,6 +1026,300 @@ mod resolve_id_tests {
                 .unwrap();
         assert_eq!(cands.len(), 1);
         assert_eq!(cands[0].id, id_same_axis);
+    }
+
+    #[test]
+    fn update_content_swaps_content_and_archives_raw() {
+        let conn = fresh_db();
+        let id = "aaaaaaaa-0000-1111-2222-000000000001";
+        insert(&conn, id);
+
+        // Before: content = "content aaaaaaaa-...", content_raw = None,
+        // superseded_by = None (fresh insert).
+        let before = get_memory_by_id(&conn, id).unwrap();
+        assert!(before.content_raw.is_none());
+
+        let changed = update_content(&conn, id, "new bullets\n- fact 1\n- fact 2", None, None)
+            .expect("update ok");
+        assert!(changed);
+
+        let after = get_memory_by_id(&conn, id).unwrap();
+        assert_eq!(after.content, "new bullets\n- fact 1\n- fact 2");
+        assert_eq!(after.content_raw.as_deref(), Some(before.content.as_str()));
+        assert!(after.superseded_by.is_none());
+        assert_ne!(after.updated_at, before.updated_at, "updated_at must bump");
+    }
+
+    #[test]
+    fn update_content_clears_superseded_by() {
+        // Re-authoring a previously-superseded row resurrects it; the dedup
+        // pointer clears so it rejoins default reads.
+        let conn = fresh_db();
+        let older = "aaaaaaaa-0000-1111-2222-000000000001";
+        let newer = "bbbbbbbb-0000-1111-2222-000000000002";
+        insert(&conn, older);
+        insert(&conn, newer);
+        mark_superseded(&conn, older, newer).unwrap();
+
+        assert!(
+            get_memory_by_id(&conn, older).unwrap().superseded_by.is_some(),
+            "pre-condition: older row should be marked superseded"
+        );
+
+        let changed = update_content(&conn, older, "resurrected", None, None).expect("update");
+        assert!(changed);
+        let after = get_memory_by_id(&conn, older).unwrap();
+        assert!(
+            after.superseded_by.is_none(),
+            "update_content must clear superseded_by"
+        );
+        assert_eq!(after.content, "resurrected");
+    }
+
+    #[test]
+    fn update_content_preserves_first_raw_across_multiple_rewrites() {
+        // First update archives the original; a second update must NOT
+        // overwrite content_raw with the first condensed form (that would
+        // lose the verbatim user content).
+        let conn = fresh_db();
+        let id = "aaaaaaaa-0000-1111-2222-000000000001";
+        insert(&conn, id);
+        let original = get_memory_by_id(&conn, id).unwrap().content;
+
+        update_content(&conn, id, "first rewrite", None, None).unwrap();
+        update_content(&conn, id, "second rewrite", None, None).unwrap();
+        let after = get_memory_by_id(&conn, id).unwrap();
+        assert_eq!(after.content, "second rewrite");
+        assert_eq!(
+            after.content_raw.as_deref(),
+            Some(original.as_str()),
+            "content_raw must retain the very first pre-update body"
+        );
+    }
+
+    #[test]
+    fn update_content_accepts_optional_tags_and_type() {
+        let conn = fresh_db();
+        let id = "aaaaaaaa-0000-1111-2222-000000000001";
+        insert(&conn, id);
+
+        let new_tags = vec!["a".to_string(), "b".to_string()];
+        let changed =
+            update_content(&conn, id, "x", Some(&new_tags), Some("project")).expect("update");
+        assert!(changed);
+        let after = get_memory_by_id(&conn, id).unwrap();
+        assert_eq!(after.tags.as_deref(), Some(&new_tags[..]));
+        assert_eq!(after.memory_type.as_deref(), Some("project"));
+    }
+
+    #[test]
+    fn update_content_missing_id_returns_false() {
+        let conn = fresh_db();
+        let changed =
+            update_content(&conn, "no-such-id", "body", None, None).expect("no error on miss");
+        assert!(!changed);
+    }
+
+    #[test]
+    fn project_state_round_trip() {
+        let conn = fresh_db();
+        // Absent row reads as None.
+        assert!(get_last_dream_at(&conn, Some("agent-memory")).unwrap().is_none());
+
+        set_last_dream_at(&conn, Some("agent-memory"), "2026-04-23T00:00:00Z").unwrap();
+        let ts = get_last_dream_at(&conn, Some("agent-memory"))
+            .unwrap()
+            .expect("should be present");
+        assert_eq!(ts, "2026-04-23T00:00:00Z");
+
+        // Upsert to a newer time.
+        set_last_dream_at(&conn, Some("agent-memory"), "2026-04-24T00:00:00Z").unwrap();
+        let updated = get_last_dream_at(&conn, Some("agent-memory"))
+            .unwrap()
+            .expect("should still be present");
+        assert_eq!(updated, "2026-04-24T00:00:00Z");
+    }
+
+    #[test]
+    fn project_state_null_project_is_supported() {
+        let conn = fresh_db();
+        assert!(get_last_dream_at(&conn, None).unwrap().is_none());
+        set_last_dream_at(&conn, None, "2026-04-23T00:00:00Z").unwrap();
+        assert_eq!(
+            get_last_dream_at(&conn, None).unwrap().as_deref(),
+            Some("2026-04-23T00:00:00Z")
+        );
+        // Null-project state does not leak to a named project key.
+        assert!(get_last_dream_at(&conn, Some("other")).unwrap().is_none());
+    }
+
+    #[test]
+    fn list_dream_candidates_returns_all_live_rows_without_cutoff() {
+        let conn = fresh_db();
+        insert(&conn, "aaaaaaaa-0000-1111-2222-000000000001");
+        insert(&conn, "bbbbbbbb-0000-1111-2222-000000000002");
+        let rows = list_dream_candidates(&conn, Some("test"), None, None, 0).unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn list_dream_candidates_excludes_superseded() {
+        let conn = fresh_db();
+        let older = "aaaaaaaa-0000-1111-2222-000000000001";
+        let newer = "bbbbbbbb-0000-1111-2222-000000000002";
+        insert(&conn, older);
+        insert(&conn, newer);
+        mark_superseded(&conn, older, newer).unwrap();
+        let rows = list_dream_candidates(&conn, Some("test"), None, None, 0).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, newer);
+    }
+
+    #[test]
+    fn list_dream_candidates_filters_by_updated_at() {
+        let conn = fresh_db();
+
+        // Seed two rows with different updated_at values. We set them manually
+        // so the cutoff comparison is deterministic (insert uses "now").
+        conn.execute(
+            "INSERT INTO memories (id, content, project, memory_type, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                "aaaaaaaa-0000-1111-2222-000000000001",
+                "old body",
+                "test",
+                "user",
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z",
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memories (id, content, project, memory_type, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                "bbbbbbbb-0000-1111-2222-000000000002",
+                "new body",
+                "test",
+                "user",
+                "2026-04-23T00:00:00Z",
+                "2026-04-23T00:00:00Z",
+            ],
+        )
+        .unwrap();
+
+        // Cutoff between the two — only the newer row surfaces.
+        let rows = list_dream_candidates(
+            &conn,
+            Some("test"),
+            Some("2026-02-01T00:00:00Z"),
+            None,
+            0,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "bbbbbbbb-0000-1111-2222-000000000002");
+    }
+
+    #[test]
+    fn list_dream_candidates_stale_condenser_version_overrides_cutoff() {
+        // Row is older than the cutoff BUT has a stale condenser_version;
+        // it must still be returned so a prompt change re-condenses it.
+        let conn = fresh_db();
+        conn.execute(
+            "INSERT INTO memories (id, content, project, memory_type, created_at, updated_at,
+                                   condenser_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "aaaaaaaa-0000-1111-2222-000000000001",
+                "old body",
+                "test",
+                "user",
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z",
+                "gemma3:deadbeef",
+            ],
+        )
+        .unwrap();
+
+        // Cutoff is well after the row's updated_at, so the time filter alone
+        // would reject it. Current condenser version mismatches → keep it.
+        let rows = list_dream_candidates(
+            &conn,
+            Some("test"),
+            Some("2026-04-23T00:00:00Z"),
+            Some("gemma3:cafefeed"),
+            0,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn list_dream_candidates_current_condenser_skips_fresh_rows() {
+        // Row is new-ish AND stamped with the current condenser; treat as
+        // already processed (nothing for agentic pass to do).
+        let conn = fresh_db();
+        conn.execute(
+            "INSERT INTO memories (id, content, project, memory_type, created_at, updated_at,
+                                   condenser_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "aaaaaaaa-0000-1111-2222-000000000001",
+                "old body",
+                "test",
+                "user",
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z",
+                "gemma3:cafefeed",
+            ],
+        )
+        .unwrap();
+
+        let rows = list_dream_candidates(
+            &conn,
+            Some("test"),
+            Some("2026-04-23T00:00:00Z"),
+            Some("gemma3:cafefeed"),
+            0,
+        )
+        .unwrap();
+        assert!(
+            rows.is_empty(),
+            "fresh-enough row with current stamp must be skipped"
+        );
+    }
+
+    #[test]
+    fn list_distinct_projects_for_dream_surfaces_null() {
+        let conn = fresh_db();
+
+        let mut a = Memory::new(
+            "with project".to_string(),
+            None,
+            Some("p1".to_string()),
+            None,
+            None,
+            Some("user".to_string()),
+        );
+        a.id = "aaaaaaaa-0000-1111-2222-000000000001".to_string();
+        insert_memory(&conn, &a).unwrap();
+
+        let mut b = Memory::new(
+            "null project".to_string(),
+            None,
+            None,
+            None,
+            None,
+            Some("user".to_string()),
+        );
+        b.id = "bbbbbbbb-0000-1111-2222-000000000002".to_string();
+        insert_memory(&conn, &b).unwrap();
+
+        let rows = list_distinct_projects_for_dream(&conn).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.contains(&Some("p1".to_string())));
+        assert!(rows.contains(&None));
     }
 
     #[test]
