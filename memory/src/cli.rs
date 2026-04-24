@@ -276,8 +276,38 @@ pub enum Cli {
     Projects,
     /// Start MCP stdio server.
     Serve,
-    /// Check for updates and install the latest version.
-    Update,
+    /// Dual-mode command:
+    ///
+    ///   - `memory update`                  → check for and install the
+    ///     latest `memory` release (self-updater; original behavior).
+    ///   - `memory update <id> --content X` → atomically re-author the
+    ///     memory at `<id>`: replace content, archive the prior body to
+    ///     `content_raw`, bump `updated_at`, clear `superseded_by`, and
+    ///     re-embed. Supports short ID prefixes (≥4 chars).
+    ///
+    /// The two modes are distinguished purely by presence of the positional
+    /// `<id>` argument. This lets the agentic dream pass use the CLI contract
+    /// documented in `docs/plan` while preserving the pre-2.3 self-updater
+    /// invocation verbatim. Primary writer of the content-update form is
+    /// `memory-dream` running under a tool-enabled LLM backend.
+    Update {
+        /// Memory ID (full UUID or ≥4-char prefix). When omitted, the
+        /// command runs the self-updater. When provided, `--content` is
+        /// required.
+        id: Option<String>,
+        /// New content body. Required when `id` is supplied; ignored by the
+        /// self-updater path.
+        #[arg(long)]
+        content: Option<String>,
+        /// Optional comma-separated tag replacement. Omit to preserve
+        /// existing tags. Ignored by the self-updater path.
+        #[arg(long)]
+        tags: Option<String>,
+        /// Optional memory type replacement (user | feedback | project | reference).
+        /// Omit to preserve the existing type. Ignored by the self-updater path.
+        #[arg(short = 'm', long)]
+        memory_type: Option<String>,
+    },
     /// Setup and configuration commands (run with no subcommand for an
     /// interactive checklist of available components).
     Setup {
@@ -669,8 +699,40 @@ pub fn execute(cmd: Cli, config: Config, conn: &Connection) -> Result<(), Memory
         Cli::Serve => {
             unreachable!("Serve is handled in main.rs");
         }
-        Cli::Update => {
-            crate::updater::manual_update()?;
+        Cli::Update {
+            id,
+            content,
+            tags,
+            memory_type,
+        } => {
+            match id {
+                None => {
+                    if content.is_some() || tags.is_some() || memory_type.is_some() {
+                        return Err(MemoryError::Config(
+                            "`memory update --content ...` requires a positional <id>. \
+                             Run `memory update <id> --content \"...\"` to re-author, or \
+                             `memory update` alone to run the self-updater."
+                                .to_string(),
+                        ));
+                    }
+                    crate::updater::manual_update()?;
+                }
+                Some(raw_id) => {
+                    let new_content = content.ok_or_else(|| {
+                        MemoryError::Config(
+                            "`memory update <id>` requires --content \"...\"".to_string(),
+                        )
+                    })?;
+                    run_update_content(
+                        conn,
+                        &config,
+                        &raw_id,
+                        &new_content,
+                        tags.as_deref(),
+                        memory_type.as_deref(),
+                    )?;
+                }
+            }
         }
         Cli::Setup { command } => {
             execute_setup(command).map_err(|e| MemoryError::Config(format!("{e:#}")))?;
@@ -733,6 +795,95 @@ fn resolve_id_arg(conn: &Connection, id: Option<&str>) -> Result<Option<String>,
             }
         },
     }
+}
+
+/// Handle `memory update <id> --content ...` — the content-update form.
+///
+/// Resolves the ID prefix (short or full UUID), re-embeds the new content,
+/// and calls `queries::update_content` which swaps `content`↔`content_raw`,
+/// bumps `updated_at`, and clears `superseded_by`. Emits a light-XML
+/// `<result status="updated" id="..."/>` line on success or the usual
+/// `<ambiguous>` / `not_found` shape on resolution failures.
+fn run_update_content(
+    conn: &Connection,
+    config: &Config,
+    raw_id: &str,
+    new_content: &str,
+    tags_csv: Option<&str>,
+    memory_type: Option<&str>,
+) -> Result<(), MemoryError> {
+    if new_content.trim().is_empty() {
+        return Err(MemoryError::Config(
+            "--content must not be empty".to_string(),
+        ));
+    }
+
+    let full_id = match queries::resolve_id_prefix(conn, raw_id)? {
+        ResolvedId::Exact(id) => id,
+        ResolvedId::Ambiguous(cands) => {
+            println!("{}", render::render_ambiguous(raw_id, &cands));
+            return Ok(());
+        }
+        ResolvedId::NotFound => {
+            println!(
+                "{}",
+                render::render_action_result("not_found", &[("id", raw_id.to_string())])
+            );
+            return Ok(());
+        }
+    };
+
+    let tag_vec: Option<Vec<String>> = tags_csv.map(|t| {
+        t.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    });
+
+    let changed = queries::update_content(
+        conn,
+        &full_id,
+        new_content,
+        tag_vec.as_deref(),
+        memory_type,
+    )?;
+    if !changed {
+        // resolve_id_prefix returned Exact but the UPDATE touched zero rows —
+        // implies a TOCTOU delete between resolve and update. Surface it
+        // cleanly rather than claiming success.
+        println!(
+            "{}",
+            render::render_action_result("not_found", &[("id", raw_id.to_string())])
+        );
+        return Ok(());
+    }
+
+    // Re-embed after the content swap so vector search picks up the new
+    // form on the next query. We intentionally embed *after* the SQL UPDATE
+    // so a flaky embedder doesn't block the metadata update — the worst
+    // case is a stale embedding that the next dream pass corrects.
+    let new_embedding = embedding::embed_text(new_content, &config.model_cache_dir)?;
+    let blob = crate::db::models::embedding_to_blob(&new_embedding);
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE memories SET embedding = ?1, embedding_model = ?2, updated_at = ?3
+         WHERE id = ?4",
+        rusqlite::params![
+            blob,
+            crate::db::models::EMBEDDING_MODEL_NAME_DEFAULT,
+            now,
+            full_id
+        ],
+    )?;
+
+    println!(
+        "{}",
+        render::render_action_result(
+            "updated",
+            &[("id", render::short_id(&full_id).to_string())]
+        )
+    );
+    Ok(())
 }
 
 /// Dispatch the `memory setup` family. Returns `anyhow::Result` so the
@@ -1075,6 +1226,58 @@ mod tests {
         match cli {
             Cli::Store { scope, .. } => assert_eq!(scope, Some(MemoryScope::Project)),
             _ => panic!("expected Store variant"),
+        }
+    }
+
+    /// Bare `memory update` still parses as the self-updater (no id, no
+    /// content). The dispatch layer routes to the manual-update path.
+    #[test]
+    fn parse_update_bare_is_self_updater() {
+        let cli = Cli::try_parse_from(["memory", "update"]).unwrap();
+        match cli {
+            Cli::Update {
+                id,
+                content,
+                tags,
+                memory_type,
+            } => {
+                assert!(id.is_none());
+                assert!(content.is_none());
+                assert!(tags.is_none());
+                assert!(memory_type.is_none());
+            }
+            _ => panic!("expected Update variant"),
+        }
+    }
+
+    /// `memory update <id> --content "..."` parses the content-update form.
+    #[test]
+    fn parse_update_content_form() {
+        let cli = Cli::try_parse_from([
+            "memory",
+            "update",
+            "aabbccdd",
+            "--content",
+            "new body\n- fact",
+            "--tags",
+            "a,b",
+            "-m",
+            "project",
+        ])
+        .unwrap();
+        match cli {
+            Cli::Update {
+                id,
+                content,
+                tags,
+                memory_type,
+            } => {
+                assert_eq!(id.as_deref(), Some("aabbccdd"));
+                assert_eq!(content.as_deref(), Some("new body\n- fact"));
+                assert_eq!(tags.as_deref(), Some("a,b"));
+                assert_eq!(memory_type.as_deref(), Some("project"));
+            }
+            _ => panic!("expected Update variant"),
         }
     }
 

@@ -77,6 +77,13 @@ impl Memory {
     }
 }
 
+/// Short name of the default fastembed model. Mirrors the hard-coded choice in
+/// `crate::embedding::embed_text` so dream / update-content writes can stamp
+/// `embedding_model` in sync with what the embedder actually produced.
+/// Kept here (rather than in `embedding.rs`) so code paths that don't want to
+/// pull in fastembed can still reference the identifier for DB writes.
+pub const EMBEDDING_MODEL_NAME_DEFAULT: &str = "all-MiniLM-L6-v2";
+
 pub fn embedding_to_blob(emb: &[f32]) -> Vec<u8> {
     emb.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
