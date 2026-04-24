@@ -86,7 +86,7 @@ Calling the `memory` binary directly is the recommended approach. It is just as 
 |---------|----------|
 | `memory setup` | Interactive checklist: shows the install state of each component (rules, skill) and lets you pick which to (re)install |
 | `memory setup rules [flags]` | Inject the `<memory-rules>` block into known agent rule files (CLAUDE.md, GEMINI.md, AGENTS.md) |
-| `memory setup rules --remove` | Strip the `<memory-rules>` block and remove the paired `autoMemoryEnabled` key from Claude `settings.json` |
+| `memory setup rules --remove` | Strip the `<memory-rules>` block and reverse every paired native-memory-disable write (Claude `autoMemoryEnabled`, Gemini `excludeTools: save_memory`, Codex `[features] memories`) |
 | `memory setup skill [flags]` | Install `SKILL.md` under **every** known agent frontend — `~/.claude/skills/agent-memory/` (Claude Code) and `~/.gemini/skills/agent-memory/` (Gemini CLI) — so each session auto-loads a ~100-token description that nudges the model toward the CLI |
 | `memory setup skill --remove` | Delete the installed `SKILL.md` from every known target. Missing files are silently skipped — parity with `setup rules --remove` |
 | `memory setup all [-y]` | Run rules → skill non-interactively (use `-y` / `--yes` to skip confirmation) |
@@ -102,7 +102,7 @@ memory setup rules --all         # update every detected file
 memory setup rules --target ~/.claude/CLAUDE.md
 memory setup rules --dry-run     # preview, don't write
 memory setup rules --print       # emit just the <memory-rules> block
-memory setup rules --all --remove  # uninstall: strip block + settings.json key
+memory setup rules --all --remove  # uninstall: strip block + reverse every native-memory-disable write
 
 # Skill only — installs SKILL.md to every known frontend:
 #   ~/.claude/skills/agent-memory/SKILL.md   (Claude Code)
@@ -118,7 +118,15 @@ memory setup all --yes
 
 `memory setup rules` writes a `<memory-rules>…</memory-rules>` block (loose-XML markers so it is easy to locate and update) and saves a `.bak` sibling before each modification. Re-running replaces the block in place — your agent rule files never accumulate duplicates. If the companion [`agent-tools setup rules`](https://github.com/nitecon/agent-tools) block (`<agent-tools-rules>…</agent-tools-rules>`) is already present in the file, the memory block is inserted directly after it so the two protocols stay grouped at the top; otherwise it is prepended.
 
-**Interaction with Claude Code auto-memory.** When the target is a Claude `CLAUDE.md`, `memory setup rules` also merges `"autoMemoryEnabled": false` into the matching `settings.json` (`~/.claude/settings.json` for user scope, `./.claude/settings.json` for project scope). The installed rules block directs the agent to route every memory operation through the `memory` CLI, so leaving Claude Code's native auto-memory enabled would cause the agent to write into both Claude's own `MEMORY.md` and this tool's SQLite store simultaneously — silent duplication the rules block is specifically designed to avoid. The merge is conservative: existing keys (`theme`, `model`, `hooks`, permissions, etc.) are preserved, corrupt JSON fails loudly instead of being overwritten, and re-runs are no-ops once the key is already at `false`. `memory setup rules --remove` strips the block from CLAUDE.md and deletes the key from `settings.json` — deletion rather than forcing `true` so the user's prior state is restored rather than overwritten.
+**Interaction with native agent memory.** The installed rules block directs the agent to route every memory operation through the `memory` CLI, so leaving each tool's built-in memory system enabled would cause the agent to write into both the tool's native memory surface and this tool's SQLite store simultaneously — silent duplication the rules block is specifically designed to avoid. For every supported frontend, `memory setup rules` also merges the matching native-memory-disable setting; `--remove` reverses each merge by deleting (not forcing) the key so prior state is restored.
+
+| Agent  | Target file                 | Change on install                                         |
+|--------|-----------------------------|-----------------------------------------------------------|
+| Claude | `~/.claude/settings.json`   | set `"autoMemoryEnabled": false` (also `./.claude/settings.json` for project-scope `CLAUDE.md`) |
+| Gemini | `~/.gemini/settings.json`   | append `"save_memory"` to `excludeTools` (disables Gemini's built-in memory tool) |
+| Codex  | `$CODEX_HOME/config.toml` (or `~/.codex/`, then `~/.config/codex/`) | set `[features] memories = false` (disables the Chronicle memory feature) |
+
+All three merges are conservative: unrelated keys, tables, and array entries are preserved; corrupt input fails loudly instead of being overwritten; re-runs are no-ops once the target state is reached. Writes are atomic (`.new` + rename) so a crash mid-write cannot leave a half-serialized file behind.
 
 `memory setup skill` writes the same SKILL.md byte-for-byte to every known agent frontend — `~/.claude/skills/agent-memory/SKILL.md` (Claude Code) and `~/.gemini/skills/agent-memory/SKILL.md` (Gemini CLI). Both frontends honor the same YAML frontmatter + Markdown body; Gemini silently ignores the Claude-specific `allowed-tools` key. The frontmatter `description` is always loaded into sessions (~100 tokens), pulling the model toward `memory context` at task start and `memory store` at task end. The full body only loads on demand when the skill is picked. Install is unconditional — no auto-detection of whether each agent is installed — because running `memory setup skill` is itself the opt-in signal. Re-runs write a `.bak` sidecar then overwrite, so the command is idempotent.
 
@@ -306,7 +314,7 @@ memory setup rules --all                  # rules: update every detected file
 memory setup rules --target ~/.claude/CLAUDE.md
 memory setup rules --dry-run              # rules: preview, don't write
 memory setup rules --print                # rules: print <memory-rules> block
-memory setup rules --all --remove         # rules: strip block + clear settings.json key
+memory setup rules --all --remove         # rules: strip block + reverse every native-memory-disable write
 memory setup skill                        # install SKILL.md under Claude + Gemini skill dirs
 memory setup skill --dry-run              # skill: preview SKILL.md
 memory setup skill --print                # skill: print SKILL.md to stdout
