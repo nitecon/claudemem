@@ -20,6 +20,7 @@
 //!   - `mode = DreamMode::Apply` — persists condensations and dedup
 //!     decisions. The normal CLI default.
 
+pub mod agentic;
 pub mod condense;
 pub mod dedup;
 pub mod prompt;
