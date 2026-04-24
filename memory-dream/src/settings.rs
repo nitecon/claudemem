@@ -57,7 +57,14 @@ pub const DEFAULT_CLAUDE_COMMAND: &str = "claude --permission-mode bypassPermiss
      --allowedTools 'Bash(memory *)' --model sonnet -p '{prompt}'";
 
 /// Canonical command template for Gemini on first-run auto-detect.
-pub const DEFAULT_GEMINI_COMMAND: &str = "gemini -p '{prompt}'";
+///
+/// Pins the `gemini-2.5-flash` model for the same reason Sonnet is pinned
+/// in [`DEFAULT_CLAUDE_COMMAND`]: Flash is cheap, fast, and plenty
+/// competent for memory condense/classify work; Pro is overkill. Uses
+/// `--model` / `-p` per `gemini --help`; no `--yolo` because Gemini's
+/// headless path is the non-agentic fallback (it doesn't pass the
+/// tool-support probe) so no tool-approval bypass is needed.
+pub const DEFAULT_GEMINI_COMMAND: &str = "gemini --model gemini-2.5-flash -p '{prompt}'";
 
 /// Headless command templates from earlier versions that are known to break
 /// the agentic probe. When an existing `dream.toml` is loaded with one of
