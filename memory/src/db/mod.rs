@@ -148,6 +148,28 @@ pub(crate) fn run_migrations(conn: &Connection) -> Result<(), MemoryError> {
         )?;
     }
 
+    if version < 4 {
+        // Schema v4 — per-project dream state (Release 2.3).
+        //
+        // The agentic dream pass runs incrementally. Each project's
+        // `last_dream_at` records the wall-clock instant we last curated
+        // memories for that project, so the next pass can pull only rows
+        // with `updated_at > last_dream_at` OR a stale `condenser_version`.
+        //
+        // Absent row = "never dreamed"; dream treats the timestamp as epoch
+        // on the first pass. Stored as RFC3339 so the column survives
+        // timezone migrations. No backfill needed — pre-v4 DBs simply have
+        // no rows, so every project re-walks once on the first upgraded
+        // dream pass (expected behavior).
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS project_state (
+                 project TEXT PRIMARY KEY,
+                 last_dream_at TEXT NOT NULL
+             );
+             INSERT OR IGNORE INTO schema_version (version) VALUES (4);",
+        )?;
+    }
+
     Ok(())
 }
 
@@ -202,16 +224,16 @@ mod migration_tests {
         )
         .expect("seed v2 db");
 
-        // Apply migrations — should run only the v3 step.
-        run_migrations(&conn).expect("migrate to v3");
+        // Apply migrations — should run v3 and v4 steps in sequence.
+        run_migrations(&conn).expect("migrate to v4");
 
-        // Schema version advanced.
+        // Schema version advanced to latest (v4).
         let max_v: i64 = conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 3);
+        assert_eq!(max_v, 4);
 
         // New columns are present and NULL on the pre-existing row.
         let (raw, sup, cond, emb): (
@@ -244,7 +266,7 @@ mod migration_tests {
     }
 
     /// Fresh DB path: no prior schema_version rows, run_migrations should
-    /// apply every step (1, 2, 3) and leave an empty but well-formed DB.
+    /// apply every step (1, 2, 3, 4) and leave an empty but well-formed DB.
     #[test]
     fn fresh_database_applies_all_migrations() {
         let conn = Connection::open_in_memory().expect("open in-memory db");
@@ -254,7 +276,65 @@ mod migration_tests {
                 row.get(0)
             })
             .expect("query schema_version");
-        assert_eq!(max_v, 3);
+        assert_eq!(max_v, 4);
+    }
+
+    /// v4 migration from a v3 fixture DB must create the `project_state`
+    /// table without disturbing existing memory rows. Mirrors the v2→v3 test
+    /// so we exercise the upgrade path for each release independently.
+    #[test]
+    fn v3_database_upgrades_to_v4_creating_project_state() {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+
+        // Hand-construct a v3 schema + a memory row so we can verify the v4
+        // migration adds `project_state` without touching existing data.
+        conn.execute_batch(
+            "CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
+             CREATE TABLE memories (
+                 id TEXT PRIMARY KEY, content TEXT NOT NULL,
+                 tags TEXT, project TEXT, agent TEXT, source_file TEXT,
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                 access_count INTEGER DEFAULT 0, embedding BLOB, memory_type TEXT,
+                 content_raw TEXT, superseded_by TEXT,
+                 condenser_version TEXT, embedding_model TEXT
+             );
+             CREATE VIRTUAL TABLE memories_fts USING fts5(
+                 content, content='memories', content_rowid='rowid',
+                 tokenize='porter unicode61'
+             );
+             INSERT INTO schema_version (version) VALUES (1);
+             INSERT INTO schema_version (version) VALUES (2);
+             INSERT INTO schema_version (version) VALUES (3);
+             INSERT INTO memories (id, content, project, created_at, updated_at)
+                 VALUES ('existing-row', 'body', 'agent-memory', '2026-01-01', '2026-01-01');",
+        )
+        .expect("seed v3 db");
+
+        run_migrations(&conn).expect("migrate to v4");
+
+        // project_state now exists and is empty (no backfill).
+        let row_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM project_state", [], |row| row.get(0))
+            .expect("query project_state");
+        assert_eq!(row_count, 0);
+
+        // Schema version advanced exactly one step.
+        let max_v: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get(0)
+            })
+            .expect("query schema_version");
+        assert_eq!(max_v, 4);
+
+        // Existing memory row survived untouched.
+        let existing: String = conn
+            .query_row(
+                "SELECT content FROM memories WHERE id = 'existing-row'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("select existing row");
+        assert_eq!(existing, "body");
     }
 
     /// Content + content_raw are concatenated in the FTS index so terms that
