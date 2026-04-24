@@ -32,7 +32,7 @@ pub const DEFAULT_MODEL_NAME: &str = "gemma3";
 #[derive(Debug, Parser)]
 #[command(
     name = "memory-dream",
-    version = env!("CARGO_PKG_VERSION"),
+    version = env!("AGENT_MEMORY_VERSION"),
     about = "Offline batch compactor for agent-memory: condense, dedup, archive."
 )]
 pub struct Cli {

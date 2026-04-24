@@ -500,7 +500,12 @@ mod tests {
 
     #[test]
     fn test_is_newer_older() {
-        assert!(!is_newer("0.0.1"));
+        // CURRENT_VERSION is either the sentinel "0.0.0-source" (local
+        // dev builds) or a real release tag (CI builds). "0.0.0-aaa" is
+        // strictly older than both: it's a prerelease of 0.0.0 with
+        // identifier "aaa" < "source" alphabetically, and 0.0.0 < any
+        // real release like 1.0.0+.
+        assert!(!is_newer("0.0.0-aaa"));
     }
 
     #[test]
