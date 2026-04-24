@@ -1,6 +1,6 @@
 //! Per-memory condensation with a strict three-way response contract.
 //!
-//! Replaces the Release 2.3 plain-bullets parser. The v1.4.4 prompt
+//! Replaces the Release 2.3 plain-bullets parser. The v1.5.0 prompt
 //! ([`crate::dream::prompt::CONDENSE_PROMPT_TEMPLATE`]) instructs the
 //! model to respond with EXACTLY ONE of:
 //!

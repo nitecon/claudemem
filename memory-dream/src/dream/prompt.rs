@@ -1,6 +1,6 @@
-//! Per-memory condensation prompt (v1.4.4).
+//! Per-memory condensation prompt (v1.5.0).
 //!
-//! v1.4.4 retires the Release 2.3 agentic batch mode entirely. The dream
+//! v1.5.0 retires the Release 2.3 agentic batch mode entirely. The dream
 //! orchestrator now runs a straight per-project pipeline: cosine dedup
 //! (algorithmic, no LLM) → per-memory condense via headless subprocess.
 //! The condense step uses a three-way response contract — the model must

@@ -264,7 +264,7 @@ pub fn delete_memory(conn: &Connection, id: &str) -> Result<bool, MemoryError> {
 /// stamping them as such would make every `memory get` / `memory context`
 /// resurface a memory at the top of `ORDER BY updated_at DESC` lists (and
 /// poison the dream incremental cutoff, which uses `updated_at > last_dream_at`
-/// to find new work). Prior to v1.4.4 this function did bump `updated_at`
+/// to find new work). Prior to v1.5.0 this function did bump `updated_at`
 /// and caused exactly those regressions; keep the SQL minimal and the
 /// semantics read-only so neither problem returns.
 pub fn increment_access(conn: &Connection, ids: &[String]) -> Result<(), MemoryError> {
@@ -1426,7 +1426,7 @@ mod resolve_id_tests {
 
     #[test]
     fn increment_access_does_not_touch_updated_at() {
-        // Reads must not bump `updated_at`. Prior to v1.4.4 this function
+        // Reads must not bump `updated_at`. Prior to v1.5.0 this function
         // did, and it polluted `ORDER BY updated_at DESC` lists + dream's
         // incremental cutoff. This test pins the read-only semantics.
         let conn = fresh_db();

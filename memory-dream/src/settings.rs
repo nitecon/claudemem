@@ -40,7 +40,7 @@ pub const DEFAULT_HEADLESS_TIMEOUT_MS: u64 = 600_000;
 
 /// Canonical command template for Claude on first-run auto-detect.
 ///
-/// v1.4.4 drops the tool-permission flags — per-memory condensation
+/// v1.5.0 drops the tool-permission flags — per-memory condensation
 /// does not invoke any tools, so `bypassPermissions` / `allowedTools`
 /// were dead weight (and a frequent source of `claude -p` startup
 /// warnings when the invoking user didn't have the matching permission
@@ -70,19 +70,19 @@ pub const DEFAULT_GEMINI_COMMAND: &str = "gemini --model gemini-2.5-flash -p '{p
 /// flag or swaps the default model; never remove entries (users upgrading
 /// across multiple hops need the whole history to converge).
 const KNOWN_STALE_CLAUDE_COMMANDS: &[&str] = &[
-    // Pre-v1.3.0 default — `claude -p` without any flags. v1.4.4 has
+    // Pre-v1.3.0 default — `claude -p` without any flags. v1.5.0 has
     // come back to a flag-light template (no tool permissions, just a
     // model pin), but the pre-v1.3.0 command STILL needs upgrading
     // because the rest of its lineage (model pin, longer timeout)
     // matters.
     "claude -p '{prompt}'",
     // v1.3.0 – v1.4.0 default — had tool-permission flags but no model
-    // pin. v1.4.4 drops the tool flags entirely (per-memory mode
+    // pin. v1.5.0 drops the tool flags entirely (per-memory mode
     // doesn't invoke tools) so this command string is stale across
     // both axes.
     "claude --permission-mode bypassPermissions --allowedTools 'Bash(memory *)' -p '{prompt}'",
     // v1.4.1 – v1.4.3 default — tool-permission flags + Sonnet pin.
-    // v1.4.4 removes the tool flags because per-memory condense runs
+    // v1.5.0 removes the tool flags because per-memory condense runs
     // entirely inside the model; no shell side effects are needed and
     // the unused permissions were surfacing spurious startup warnings
     // on some claude CLI versions.
@@ -745,7 +745,7 @@ timeout_ms = 30000
     }
 
     /// v1.4.1 – v1.4.3 stored the command with tool flags + Sonnet pin.
-    /// v1.4.4 drops the tool flags (per-memory mode doesn't shell out)
+    /// v1.5.0 drops the tool flags (per-memory mode doesn't shell out)
     /// and the loader must migrate the whole family to the new default.
     #[test]
     fn v143_claude_command_is_upgraded_to_flagless_sonnet_default() {
@@ -767,7 +767,7 @@ timeout_ms = 600000
         let loaded = Settings::load(dir.path()).expect("load ok");
         assert_eq!(loaded.headless.command, DEFAULT_CLAUDE_COMMAND);
         // v1.4.3 already bumped the timeout to 600_000; make sure the
-        // upgrader leaves it untouched on the v1.4.3 → v1.4.4 hop.
+        // upgrader leaves it untouched on the v1.4.3 → v1.5.0 hop.
         assert_eq!(loaded.headless.timeout_ms, DEFAULT_HEADLESS_TIMEOUT_MS);
         let raw = std::fs::read_to_string(dir.path().join(SETTINGS_FILENAME)).unwrap();
         assert!(

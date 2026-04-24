@@ -36,7 +36,7 @@
 //! <usage>IDs are 8-char prefixes. Use `memory get <id>` for full content. ...</usage>
 //! ```
 //!
-//! Tags moved out of per-line formatting (v1.4.4) because repeating the
+//! Tags moved out of per-line formatting (v1.5.0) because repeating the
 //! same tag on every line of a project's output was pure token overhead
 //! — once the reader knows "this project is mostly about X,Y,Z" the
 //! per-memory line doesn't need to restate that. The alphabetical
@@ -414,7 +414,7 @@ pub fn render_memory_list(memories: &[Memory], cwd_project: Option<&str>) -> Str
         let type_label = m.memory_type.as_deref().unwrap_or("?");
         let project_label = m.project.as_deref().unwrap_or("-");
         let preview = one_line_preview(&m.content, 120);
-        // Tags moved to the per-section `<tags>` cloud (v1.4.4) — see
+        // Tags moved to the per-section `<tags>` cloud (v1.5.0) — see
         // module docs. Repeating the same 3-4 tags on every line of a
         // project's list was pure token overhead for no scannable benefit.
         out.push_str(&format!(
@@ -674,7 +674,7 @@ mod tests {
         ];
         let out = render_search_results(&results, Some("agent-memory"), None);
         assert!(out.contains("<project_memories>"));
-        // Per-line tags no longer present (v1.4.4).
+        // Per-line tags no longer present (v1.5.0).
         assert!(!out.contains("[local]"), "per-line tag marker must be gone");
         assert!(out.contains("current project memory (ID:11111111)"));
         assert!(out.contains("<general_knowledge>"));
@@ -791,7 +791,7 @@ mod tests {
         assert!(out.contains("<memories count=\"2\">"));
         assert!(out.contains("1.*(user) agent-memory"));
         assert!(out.contains("2. (user) colorithmic"));
-        // No inline tags on either line (v1.4.4).
+        // No inline tags on either line (v1.5.0).
         assert!(!out.contains("[]"));
         // No tags set → no cloud line.
         assert!(!out.contains("<tags>"));

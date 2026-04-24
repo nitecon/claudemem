@@ -1,4 +1,4 @@
-//! Dream orchestrator (v1.4.4).
+//! Dream orchestrator (v1.5.0).
 //!
 //! Entry point: [`run`]. Called once per `memory-dream` invocation.
 //! Per-project pipeline (replaces Release 2.3's agentic batch mode):
@@ -78,7 +78,7 @@ pub struct DreamConfig<'a> {
     pub full: bool,
     /// Reserved — per-memory condense doesn't batch, but the CLI flag is
     /// retained so existing automation keeps parsing. Ignored by the
-    /// v1.4.4 orchestrator.
+    /// v1.5.0 orchestrator.
     pub batch_size_override: usize,
 }
 
