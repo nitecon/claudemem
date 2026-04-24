@@ -40,21 +40,14 @@ pub const DEFAULT_HEADLESS_TIMEOUT_MS: u64 = 600_000;
 
 /// Canonical command template for Claude on first-run auto-detect.
 ///
-/// Includes the flags required for agentic dream mode to actually work:
-/// - `--permission-mode bypassPermissions` so non-interactive claude doesn't
-///   auto-refuse tool invocations (without this, claude -p returns NO_TOOLS).
-/// - `--allowedTools "Bash(memory *)"` scopes shell access to memory-CLI
-///   invocations only — prompt-injection attempts that try to run arbitrary
-///   shell commands get blocked at the tool-permission layer, not just by
-///   prompt wording.
-/// - `--model sonnet` pins to the current-latest Sonnet alias rather than
-///   a version-stamped tag (e.g. `claude-sonnet-4-6`). Sonnet is the right
-///   price/competence point for memory curation — Opus is overkill for
-///   bulleted condense + classify + forget work and costs ~5× more per
-///   token. The alias tracks Anthropic's rolling Sonnet release without
-///   requiring a local command update.
-pub const DEFAULT_CLAUDE_COMMAND: &str = "claude --permission-mode bypassPermissions \
-     --allowedTools 'Bash(memory *)' --model sonnet -p '{prompt}'";
+/// v1.4.4 drops the tool-permission flags — per-memory condensation
+/// does not invoke any tools, so `bypassPermissions` / `allowedTools`
+/// were dead weight (and a frequent source of `claude -p` startup
+/// warnings when the invoking user didn't have the matching permission
+/// scope). The model pin stays: `--model sonnet` tracks Anthropic's
+/// rolling Sonnet alias, which is the right price/competence point for
+/// condense + classify + forget work without the Opus tax.
+pub const DEFAULT_CLAUDE_COMMAND: &str = "claude --model sonnet -p '{prompt}'";
 
 /// Canonical command template for Gemini on first-run auto-detect.
 ///
@@ -77,14 +70,24 @@ pub const DEFAULT_GEMINI_COMMAND: &str = "gemini --model gemini-2.5-flash -p '{p
 /// flag or swaps the default model; never remove entries (users upgrading
 /// across multiple hops need the whole history to converge).
 const KNOWN_STALE_CLAUDE_COMMANDS: &[&str] = &[
-    // Pre-v1.3.0 default — `claude -p` without tool-permission flags
-    // auto-refuses Bash invocations in non-interactive mode and returns
-    // NO_TOOLS, forcing the dream pass to silently downgrade.
+    // Pre-v1.3.0 default — `claude -p` without any flags. v1.4.4 has
+    // come back to a flag-light template (no tool permissions, just a
+    // model pin), but the pre-v1.3.0 command STILL needs upgrading
+    // because the rest of its lineage (model pin, longer timeout)
+    // matters.
     "claude -p '{prompt}'",
     // v1.3.0 – v1.4.0 default — had tool-permission flags but no model
-    // pin, so the subprocess ran whatever Claude's CLI picked as its
-    // current default (historically Opus). v1.4.1 pins Sonnet for cost.
+    // pin. v1.4.4 drops the tool flags entirely (per-memory mode
+    // doesn't invoke tools) so this command string is stale across
+    // both axes.
     "claude --permission-mode bypassPermissions --allowedTools 'Bash(memory *)' -p '{prompt}'",
+    // v1.4.1 – v1.4.3 default — tool-permission flags + Sonnet pin.
+    // v1.4.4 removes the tool flags because per-memory condense runs
+    // entirely inside the model; no shell side effects are needed and
+    // the unused permissions were surfacing spurious startup warnings
+    // on some claude CLI versions.
+    "claude --permission-mode bypassPermissions --allowedTools 'Bash(memory *)' --model sonnet \
+     -p '{prompt}'",
 ];
 
 /// Gemini command templates from earlier versions that are auto-upgraded
@@ -738,6 +741,42 @@ timeout_ms = 30000
         assert!(
             raw.contains("--model sonnet"),
             "expected upgraded command on disk; got:\n{raw}"
+        );
+    }
+
+    /// v1.4.1 – v1.4.3 stored the command with tool flags + Sonnet pin.
+    /// v1.4.4 drops the tool flags (per-memory mode doesn't shell out)
+    /// and the loader must migrate the whole family to the new default.
+    #[test]
+    fn v143_claude_command_is_upgraded_to_flagless_sonnet_default() {
+        let dir = tmp();
+        let body = r#"
+[backend]
+mode = "headless"
+
+[local]
+active_model = "gemma3"
+downloaded_models = []
+
+[headless]
+command = "claude --permission-mode bypassPermissions --allowedTools 'Bash(memory *)' --model sonnet -p '{prompt}'"
+timeout_ms = 600000
+"#;
+        std::fs::write(dir.path().join(SETTINGS_FILENAME), body).unwrap();
+
+        let loaded = Settings::load(dir.path()).expect("load ok");
+        assert_eq!(loaded.headless.command, DEFAULT_CLAUDE_COMMAND);
+        // v1.4.3 already bumped the timeout to 600_000; make sure the
+        // upgrader leaves it untouched on the v1.4.3 → v1.4.4 hop.
+        assert_eq!(loaded.headless.timeout_ms, DEFAULT_HEADLESS_TIMEOUT_MS);
+        let raw = std::fs::read_to_string(dir.path().join(SETTINGS_FILENAME)).unwrap();
+        assert!(
+            !raw.contains("allowedTools"),
+            "upgraded command must not mention allowedTools; got:\n{raw}"
+        );
+        assert!(
+            raw.contains("--model sonnet"),
+            "upgraded command must keep the Sonnet pin; got:\n{raw}"
         );
     }
 
