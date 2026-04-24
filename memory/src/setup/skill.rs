@@ -1,14 +1,28 @@
-//! `memory setup skill` — install a Claude Code Agent Skill that advertises
-//! the `memory` CLI to the model via auto-loaded description.
+//! `memory setup skill` — install an Agent Skill that advertises the `memory`
+//! CLI to the model via auto-loaded description.
 //!
-//! Skills published under `~/.claude/skills/<name>/SKILL.md` have their
+//! Skills published under `<skills-root>/<name>/SKILL.md` have their
 //! frontmatter `description` injected into the session system prompt (~100
 //! tokens each) at start. The full body is only loaded on-demand when the
 //! model judges the skill relevant, so this file stays out of context until
 //! it earns its place.
 //!
-//! Idempotent: overwrites SKILL.md in place. Writes a `.bak` sibling before
-//! the first destructive overwrite so the user can recover prior content.
+//! Install targets. As of Gemini CLI's skills release (April 2026), two agent
+//! frontends discover skills under tool-native paths:
+//!
+//!   - Claude Code: `~/.claude/skills/<name>/SKILL.md`
+//!   - Gemini CLI:  `~/.gemini/skills/<name>/SKILL.md`
+//!
+//! Both honor the same YAML frontmatter + Markdown body, so a single
+//! [`SKILL_BODY`] constant is written byte-for-byte to every target. The
+//! alias path `~/.agents/skills/` exists but isn't read by Claude Code, so
+//! installing to the tool-native path for each frontend is the bulletproof
+//! choice. No auto-detection — the user opted in to `memory setup skill`
+//! explicitly, so we unconditionally write both files.
+//!
+//! Idempotent: overwrites SKILL.md in place per target. Writes a `.bak`
+//! sibling before each destructive overwrite so the user can recover prior
+//! content.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -128,56 +142,151 @@ memory update                                          # check + install latest
 | `reference` | Pointers to external resources — URLs, dashboards, systems |
 "#;
 
+/// One place the skill should be written. The `agent` label is the
+/// tool-native name (e.g. `"claude"`, `"gemini"`) used in the `<setup>`
+/// status lines so a user can tell at a glance which frontend got updated.
+#[derive(Debug, Clone)]
+pub struct SkillTarget {
+    /// Frontend identifier — stable short string used in status output.
+    pub agent: &'static str,
+    /// Absolute path to the `SKILL.md` file for this frontend.
+    pub path: PathBuf,
+}
+
+/// Enumerate every install destination for the agent-memory skill.
+///
+/// Order is stable: Claude first (the original target and what backward-compat
+/// callers of [`skill_path`] rely on), Gemini second. Both paths are always
+/// returned — no filesystem probing, no auto-detection of whether the agent is
+/// installed. The user opted in to `memory setup skill`, so we write every
+/// known target.
+pub fn skill_targets() -> Result<Vec<SkillTarget>> {
+    let home = dirs::home_dir().context("could not resolve home directory")?;
+    Ok(vec![
+        SkillTarget {
+            agent: "claude",
+            path: home
+                .join(".claude")
+                .join("skills")
+                .join("agent-memory")
+                .join("SKILL.md"),
+        },
+        SkillTarget {
+            agent: "gemini",
+            path: home
+                .join(".gemini")
+                .join("skills")
+                .join("agent-memory")
+                .join("SKILL.md"),
+        },
+    ])
+}
+
+/// Backward-compat alias: returns the Claude install path. Kept so external
+/// callers that hardcoded "the" skill path before the Gemini addition continue
+/// to compile unchanged. Internal probing should prefer [`skill_targets`].
+/// Marked `#[allow(dead_code)]` because the menu probe now walks every target
+/// directly rather than going through this helper — deleting the function
+/// would be a breaking API change for anyone depending on the 1.3.x surface.
+#[allow(dead_code)]
+pub fn skill_path() -> Result<PathBuf> {
+    let mut targets = skill_targets()?;
+    // First entry is Claude by construction. Guard with a clear message in
+    // case the enumeration is ever reordered by accident.
+    let first = targets
+        .drain(..)
+        .next()
+        .context("skill_targets() returned an empty list")?;
+    Ok(first.path)
+}
+
+/// True iff *any* known target has a SKILL.md file present. OR semantics so a
+/// user who wired up only one frontend still gets a "something is there" signal
+/// from external callers. The interactive menu implements its own stricter
+/// "all targets" check inline since half-installed should still prompt a
+/// re-run. Marked `#[allow(dead_code)]` for the same API-stability reason as
+/// [`skill_path`].
+#[allow(dead_code)]
+pub fn is_installed() -> bool {
+    match skill_targets() {
+        Ok(targets) => targets.iter().any(|t| t.path.exists()),
+        Err(_) => false,
+    }
+}
+
 /// Entry point invoked from `cli.rs` for `memory setup skill`.
+///
+/// Arguments:
+/// - `dry_run` — print what would be written for every target without
+///   touching disk.
+/// - `print` — dump `SKILL_BODY` to stdout and exit (no filesystem IO, no
+///   per-target preamble).
 pub fn run(dry_run: bool, print: bool) -> Result<()> {
     if print {
         print!("{SKILL_BODY}");
         return Ok(());
     }
 
-    let target = skill_path().context("could not resolve skill install path")?;
+    let targets = skill_targets().context("could not resolve skill install paths")?;
+    run_install(&targets, dry_run)
+}
 
-    if dry_run {
-        println!("--- DRY RUN: {} ---", target.display());
-        print!("{SKILL_BODY}");
-        println!("--- end preview ---");
-        return Ok(());
+/// Install path for [`run`]. Iterates every target; a failure on one target
+/// does not short-circuit the others — we gather errors and fail at the end
+/// so the user sees the full picture.
+fn run_install(targets: &[SkillTarget], dry_run: bool) -> Result<()> {
+    let mut any_failed = false;
+    for t in targets {
+        if dry_run {
+            println!(
+                r#"<setup status="skill_dry_run" agent="{}" path="{}"/>"#,
+                t.agent,
+                t.path.display()
+            );
+            continue;
+        }
+        match install_one(t) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!(
+                    "Failed to install skill for {} at {}: {e:#}",
+                    t.agent,
+                    t.path.display()
+                );
+                any_failed = true;
+            }
+        }
     }
+    if any_failed {
+        anyhow::bail!("one or more skill targets could not be installed");
+    }
+    Ok(())
+}
 
+fn install_one(target: &SkillTarget) -> Result<()> {
     let parent = target
+        .path
         .parent()
         .context("skill path has no parent directory")?;
     std::fs::create_dir_all(parent)
         .with_context(|| format!("create skill directory {}", parent.display()))?;
 
-    if let Some(backup) = backup_if_exists(&target)? {
-        println!("  backup: {}", backup.display());
+    if let Some(backup) = backup_if_exists(&target.path)? {
+        println!(
+            r#"<setup status="skill_backup" agent="{}" path="{}"/>"#,
+            target.agent,
+            backup.display()
+        );
     }
 
-    std::fs::write(&target, SKILL_BODY)
-        .with_context(|| format!("write skill file {}", target.display()))?;
-    println!("Installed skill at {}", target.display());
+    std::fs::write(&target.path, SKILL_BODY)
+        .with_context(|| format!("write skill file {}", target.path.display()))?;
+    println!(
+        r#"<setup status="skill_installed" agent="{}" path="{}"/>"#,
+        target.agent,
+        target.path.display()
+    );
     Ok(())
-}
-
-/// True iff the skill file is already installed at the global path.
-/// Returns false if the home directory cannot be resolved (the skill cannot
-/// have been installed without a home dir).
-pub fn is_installed() -> bool {
-    skill_path().map(|p| p.exists()).unwrap_or(false)
-}
-
-/// Resolve the canonical install path for the agent-memory skill. Returns
-/// `Err` only when `dirs::home_dir()` cannot determine a home directory —
-/// effectively never on the platforms agent-memory targets, but surfaced as
-/// an error rather than panicking so callers can degrade gracefully.
-pub fn skill_path() -> Result<PathBuf> {
-    let home = dirs::home_dir().context("could not resolve home directory")?;
-    Ok(home
-        .join(".claude")
-        .join("skills")
-        .join("agent-memory")
-        .join("SKILL.md"))
 }
 
 fn backup_if_exists(path: &Path) -> Result<Option<PathBuf>> {
@@ -213,7 +322,7 @@ mod tests {
     #[test]
     fn frontmatter_has_required_name_field() {
         // Skill discovery is keyed on the name field; must match the install
-        // directory (`~/.claude/skills/agent-memory/SKILL.md`).
+        // directory (`.../skills/agent-memory/SKILL.md` under each frontend).
         assert!(SKILL_BODY.contains("name: agent-memory"));
     }
 
@@ -231,7 +340,9 @@ mod tests {
     #[test]
     fn frontmatter_grants_bash_memory_without_prompting() {
         // `allowed-tools` must be present and authorize bare `memory *` calls
-        // so the user is not prompted to approve every CLI invocation.
+        // so the user is not prompted to approve every CLI invocation. Claude
+        // Code honors this key; Gemini CLI silently ignores unknown keys, so
+        // a single body stays compatible with both.
         assert!(SKILL_BODY.contains("allowed-tools: Bash(memory *)"));
     }
 
@@ -307,6 +418,43 @@ mod tests {
         );
     }
 
+    /// `skill_targets` must return both tool-native destinations in a stable
+    /// order (claude first, gemini second). The exact labels are part of the
+    /// `<setup>` status contract — the README documents them — so pin them
+    /// here too.
+    #[test]
+    fn skill_targets_returns_claude_and_gemini_in_order() {
+        let targets = skill_targets().expect("home dir resolves on test platforms");
+        assert_eq!(targets.len(), 2, "expected exactly two skill targets");
+        assert_eq!(targets[0].agent, "claude");
+        assert_eq!(targets[1].agent, "gemini");
+        assert!(
+            targets[0]
+                .path
+                .ends_with(".claude/skills/agent-memory/SKILL.md"),
+            "claude target path: {}",
+            targets[0].path.display()
+        );
+        assert!(
+            targets[1]
+                .path
+                .ends_with(".gemini/skills/agent-memory/SKILL.md"),
+            "gemini target path: {}",
+            targets[1].path.display()
+        );
+        // Both targets must be rooted under $HOME — tests run with whatever
+        // `dirs::home_dir()` returns, so compare against that directly.
+        let home = dirs::home_dir().expect("home dir resolves");
+        for t in &targets {
+            assert!(
+                t.path.starts_with(&home),
+                "target {} not rooted under $HOME ({})",
+                t.path.display(),
+                home.display()
+            );
+        }
+    }
+
     #[test]
     fn backup_path_appends_bak() {
         let p = PathBuf::from("/tmp/foo/SKILL.md");
@@ -331,6 +479,61 @@ mod tests {
         let target = tmp.join("missing.md");
         let backup = backup_if_exists(&target).expect("missing target is not an error");
         assert!(backup.is_none());
+    }
+
+    /// Install → verify both targets got SKILL.md with identical byte content.
+    /// Uses `install_one` directly with synthesized `SkillTarget`s rooted
+    /// under a tempdir so the test doesn't depend on `HOME` being writable
+    /// or on the `run()` dispatch layer.
+    #[test]
+    fn install_writes_identical_skill_to_every_target() {
+        let tmp = tempdir_in_target();
+        let claude_target = SkillTarget {
+            agent: "claude",
+            path: tmp
+                .join(".claude")
+                .join("skills")
+                .join("agent-memory")
+                .join("SKILL.md"),
+        };
+        let gemini_target = SkillTarget {
+            agent: "gemini",
+            path: tmp
+                .join(".gemini")
+                .join("skills")
+                .join("agent-memory")
+                .join("SKILL.md"),
+        };
+        install_one(&claude_target).expect("claude install");
+        install_one(&gemini_target).expect("gemini install");
+
+        let claude_body = std::fs::read_to_string(&claude_target.path).unwrap();
+        let gemini_body = std::fs::read_to_string(&gemini_target.path).unwrap();
+        assert_eq!(
+            claude_body, gemini_body,
+            "claude and gemini SKILL.md contents should match byte-for-byte"
+        );
+        assert_eq!(claude_body, SKILL_BODY);
+    }
+
+    /// A second install over existing content must write a `.bak` sidecar
+    /// and leave the final SKILL.md body equal to the shared constant.
+    #[test]
+    fn install_twice_is_idempotent_with_backup() {
+        let tmp = tempdir_in_target();
+        let target = SkillTarget {
+            agent: "claude",
+            path: tmp.join("skills").join("agent-memory").join("SKILL.md"),
+        };
+        install_one(&target).expect("first install");
+        install_one(&target).expect("second install");
+        let backup = backup_path(&target.path);
+        assert!(
+            backup.exists(),
+            "backup file should exist after second install"
+        );
+        assert_eq!(std::fs::read_to_string(&target.path).unwrap(), SKILL_BODY);
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), SKILL_BODY);
     }
 
     /// Minimal isolated tempdir under `target/` so tests don't depend on the

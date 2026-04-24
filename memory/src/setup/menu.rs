@@ -135,20 +135,37 @@ fn probe_rules() -> ComponentState {
 }
 
 fn probe_skill() -> ComponentState {
-    let installed = skill::is_installed();
-    match skill::skill_path() {
-        Ok(p) if installed => ComponentState {
-            installed: true,
-            detail: format!("installed at {}", p.display()),
-        },
-        Ok(p) => ComponentState {
-            installed: false,
-            detail: format!("not installed ({} missing)", p.display()),
-        },
-        Err(_) => ComponentState {
-            installed: false,
-            detail: "not installed (home directory unavailable)".into(),
-        },
+    // Probe each known target independently so the user sees which frontends
+    // already have the skill and which still need it. A component is flagged
+    // "installed" only when *every* target has the file — a half-installed
+    // state (e.g. Claude only) should still prompt a re-run to top up the
+    // missing side.
+    let targets = match skill::skill_targets() {
+        Ok(t) => t,
+        Err(_) => {
+            return ComponentState {
+                installed: false,
+                detail: "not installed (home directory unavailable)".into(),
+            };
+        }
+    };
+    let mut segments: Vec<String> = Vec::with_capacity(targets.len());
+    let mut present = 0usize;
+    for t in &targets {
+        let exists = t.path.exists();
+        if exists {
+            present += 1;
+        }
+        segments.push(format!(
+            "{} {} ({})",
+            if exists { "[x]" } else { "[ ]" },
+            t.agent,
+            t.path.display()
+        ));
+    }
+    ComponentState {
+        installed: present == targets.len(),
+        detail: segments.join(", "),
     }
 }
 
