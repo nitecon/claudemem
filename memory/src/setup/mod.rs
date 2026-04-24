@@ -7,9 +7,13 @@
 //!
 //! Components:
 //!   - `rules` — injects the `<memory-rules>…</memory-rules>` block into
-//!     known agent rule files (CLAUDE.md, GEMINI.md, AGENTS.md).
-//!   - `skill` — installs `~/.claude/skills/agent-memory/SKILL.md` so
-//!     Claude Code sessions are nudged toward using the CLI.
+//!     known agent rule files (CLAUDE.md, GEMINI.md, AGENTS.md). Creates
+//!     missing rule files when the tool directory exists so fresh installs
+//!     are covered, not just established ones.
+//!   - `skill` — installs `SKILL.md` to `~/.claude/skills/agent-memory/`
+//!     (Claude Code) and `~/.agents/skills/agent-memory/` (cross-agent
+//!     alias honored by Gemini CLI and Codex) so every supported frontend
+//!     auto-advertises the `memory` CLI to its sessions.
 //!
 //! The module only re-exports the public entry points used by `cli.rs`; the
 //! implementation details (markers, body templates, probe helpers) stay

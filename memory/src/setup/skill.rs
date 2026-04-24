@@ -7,18 +7,25 @@
 //! model judges the skill relevant, so this file stays out of context until
 //! it earns its place.
 //!
-//! Install targets. As of Gemini CLI's skills release (April 2026), two agent
-//! frontends discover skills under tool-native paths:
+//! Install targets. As of April 2026 two paths cover every known frontend:
 //!
-//!   - Claude Code: `~/.claude/skills/<name>/SKILL.md`
-//!   - Gemini CLI:  `~/.gemini/skills/<name>/SKILL.md`
+//!   - Claude Code: `~/.claude/skills/<name>/SKILL.md` (tool-native only).
+//!   - Cross-agent alias: `~/.agents/skills/<name>/SKILL.md` — read by Gemini
+//!     CLI (both `~/.gemini/skills/` and `~/.agents/skills/`, with the latter
+//!     taking precedence) and by Codex (user-scope at `$HOME/.agents/skills/`
+//!     exclusively — no `~/.codex/skills/` equivalent). Any future frontend
+//!     honoring the cross-agent convention picks this up for free.
 //!
 //! Both honor the same YAML frontmatter + Markdown body, so a single
-//! [`SKILL_BODY`] constant is written byte-for-byte to every target. The
-//! alias path `~/.agents/skills/` exists but isn't read by Claude Code, so
-//! installing to the tool-native path for each frontend is the bulletproof
-//! choice. No auto-detection — the user opted in to `memory setup skill`
-//! explicitly, so we unconditionally write both files.
+//! [`SKILL_BODY`] constant is written byte-for-byte to every target. No
+//! auto-detection — the user opted in to `memory setup skill` explicitly, so
+//! we unconditionally write both files.
+//!
+//! Legacy path migration. v1.4.0 and v1.4.1 installed the Gemini copy under
+//! `~/.gemini/skills/agent-memory/SKILL.md`. That path is now abandoned in
+//! favor of the cross-agent alias. Every install and uninstall scrubs the
+//! legacy path so users never end up with two copies (or a stale SKILL.md
+//! after uninstall).
 //!
 //! Idempotent: overwrites SKILL.md in place per target. Writes a `.bak`
 //! sibling before each destructive overwrite so the user can recover prior
@@ -142,8 +149,25 @@ memory update                                          # check + install latest
 | `reference` | Pointers to external resources — URLs, dashboards, systems |
 "#;
 
+/// Legacy install paths that prior releases used. Each entry is a tuple of
+/// `(agent_label, relative_path_from_home)` and is scrubbed unconditionally
+/// on every install and every `--remove` so users migrating from an older
+/// version never end up with a stale copy they didn't ask for.
+///
+/// Order of entries: oldest first. When adding a new migration, append.
+///
+/// Rationale for this being a const list: future path changes become a
+/// one-line append here plus a single test entry, rather than bespoke
+/// cleanup code scattered through the installer.
+const LEGACY_SKILL_PATHS: &[(&str, &[&str])] = &[
+    // v1.4.0 / v1.4.1 wrote Gemini's copy here. Superseded in v1.4.2 by the
+    // cross-agent `~/.agents/skills/` alias (which Gemini also reads, and
+    // which Codex reads exclusively).
+    ("gemini", &[".gemini", "skills", "agent-memory", "SKILL.md"]),
+];
+
 /// One place the skill should be written. The `agent` label is the
-/// tool-native name (e.g. `"claude"`, `"gemini"`) used in the `<setup>`
+/// tool-native name (e.g. `"claude"`, `"shared"`) used in the `<setup>`
 /// status lines so a user can tell at a glance which frontend got updated.
 #[derive(Debug, Clone)]
 pub struct SkillTarget {
@@ -156,10 +180,17 @@ pub struct SkillTarget {
 /// Enumerate every install destination for the agent-memory skill.
 ///
 /// Order is stable: Claude first (the original target and what backward-compat
-/// callers of [`skill_path`] rely on), Gemini second. Both paths are always
-/// returned — no filesystem probing, no auto-detection of whether the agent is
-/// installed. The user opted in to `memory setup skill`, so we write every
-/// known target.
+/// callers of [`skill_path`] rely on), then the cross-agent `~/.agents/skills/`
+/// alias second. Both paths are always returned — no filesystem probing, no
+/// auto-detection of whether the agent is installed. The user opted in to
+/// `memory setup skill`, so we write every known target.
+///
+/// The label `"shared"` is used for the cross-agent path instead of
+/// `"agents"` because `<setup agent="agents"/>` reads awkwardly — the
+/// double-up of "agent" makes it look like a typo. `"shared"` conveys the
+/// relationship (one SKILL.md, multiple frontends read it) without conflict.
+/// The label is surfaced to the user via `<setup>` status lines, so it is a
+/// soft contract — tests pin the exact string.
 pub fn skill_targets() -> Result<Vec<SkillTarget>> {
     let home = dirs::home_dir().context("could not resolve home directory")?;
     Ok(vec![
@@ -172,9 +203,9 @@ pub fn skill_targets() -> Result<Vec<SkillTarget>> {
                 .join("SKILL.md"),
         },
         SkillTarget {
-            agent: "gemini",
+            agent: "shared",
             path: home
-                .join(".gemini")
+                .join(".agents")
                 .join("skills")
                 .join("agent-memory")
                 .join("SKILL.md"),
@@ -182,12 +213,30 @@ pub fn skill_targets() -> Result<Vec<SkillTarget>> {
     ])
 }
 
+/// Resolve the absolute paths of every legacy install target that predated
+/// the current [`skill_targets`] list. Same ordering semantics as
+/// [`LEGACY_SKILL_PATHS`] (oldest first).
+fn legacy_skill_targets() -> Result<Vec<SkillTarget>> {
+    let home = dirs::home_dir().context("could not resolve home directory")?;
+    Ok(LEGACY_SKILL_PATHS
+        .iter()
+        .map(|(agent, parts)| {
+            let mut p = home.clone();
+            for part in *parts {
+                p.push(part);
+            }
+            SkillTarget { agent, path: p }
+        })
+        .collect())
+}
+
 /// Backward-compat alias: returns the Claude install path. Kept so external
-/// callers that hardcoded "the" skill path before the Gemini addition continue
-/// to compile unchanged. Internal probing should prefer [`skill_targets`].
-/// Marked `#[allow(dead_code)]` because the menu probe now walks every target
-/// directly rather than going through this helper — deleting the function
-/// would be a breaking API change for anyone depending on the 1.3.x surface.
+/// callers that hardcoded "the" skill path before the multi-target addition
+/// continue to compile unchanged. Internal probing should prefer
+/// [`skill_targets`]. Marked `#[allow(dead_code)]` because the menu probe now
+/// walks every target directly rather than going through this helper —
+/// deleting the function would be a breaking API change for anyone depending
+/// on the 1.3.x surface.
 #[allow(dead_code)]
 pub fn skill_path() -> Result<PathBuf> {
     let mut targets = skill_targets()?;
@@ -231,19 +280,37 @@ pub fn run(dry_run: bool, print: bool, remove: bool) -> Result<()> {
     }
 
     let targets = skill_targets().context("could not resolve skill install paths")?;
+    let legacy = legacy_skill_targets().context("could not resolve legacy skill paths")?;
 
     if remove {
-        return run_remove(&targets, dry_run);
+        return run_remove(&targets, &legacy, dry_run);
     }
 
-    run_install(&targets, dry_run)
+    run_install(&targets, &legacy, dry_run)
 }
 
-/// Install path for [`run`]. Iterates every target; a failure on one target
+/// Install path for [`run`]. Iterates every current target; a failure on one
 /// does not short-circuit the others — we gather errors and fail at the end
-/// so the user sees the full picture.
-fn run_install(targets: &[SkillTarget], dry_run: bool) -> Result<()> {
+/// so the user sees the full picture. Legacy paths are scrubbed before the
+/// new files are written so a partial cleanup failure still surfaces alongside
+/// any install failures.
+fn run_install(targets: &[SkillTarget], legacy: &[SkillTarget], dry_run: bool) -> Result<()> {
     let mut any_failed = false;
+
+    // Legacy cleanup runs first: removing a stale file has no downstream
+    // effect on the fresh install, so any failure here is a standalone signal
+    // rather than a blocker for the install itself.
+    for t in legacy {
+        if let Err(e) = cleanup_legacy_one(t, dry_run) {
+            eprintln!(
+                "Failed to clean legacy skill for {} at {}: {e:#}",
+                t.agent,
+                t.path.display()
+            );
+            any_failed = true;
+        }
+    }
+
     for t in targets {
         if dry_run {
             println!(
@@ -299,9 +366,13 @@ fn install_one(target: &SkillTarget) -> Result<()> {
 
 /// Remove path for [`run`]. Mirrors [`run_install`]: every target is visited,
 /// missing files emit `skill_absent`, successful removals emit
-/// `skill_removed`. Dry-run prints what *would* happen without touching disk.
-fn run_remove(targets: &[SkillTarget], dry_run: bool) -> Result<()> {
+/// `skill_removed`. Legacy paths are scrubbed unconditionally so
+/// `memory setup skill --remove` produces a clean uninstall regardless of
+/// which version originally installed the skill. Dry-run prints what *would*
+/// happen without touching disk.
+fn run_remove(targets: &[SkillTarget], legacy: &[SkillTarget], dry_run: bool) -> Result<()> {
     let mut any_failed = false;
+
     for t in targets {
         if dry_run {
             let status = if t.path.exists() {
@@ -329,6 +400,18 @@ fn run_remove(targets: &[SkillTarget], dry_run: bool) -> Result<()> {
             }
         }
     }
+
+    for t in legacy {
+        if let Err(e) = cleanup_legacy_one(t, dry_run) {
+            eprintln!(
+                "Failed to clean legacy skill for {} at {}: {e:#}",
+                t.agent,
+                t.path.display()
+            );
+            any_failed = true;
+        }
+    }
+
     if any_failed {
         anyhow::bail!("one or more skill targets could not be removed");
     }
@@ -351,6 +434,50 @@ fn remove_one(target: &SkillTarget) -> Result<()> {
         target.agent,
         target.path.display()
     );
+    Ok(())
+}
+
+/// Delete a single legacy skill file if present, then prune empty parent
+/// directories up through the `.../skills/agent-memory/` and
+/// `.../skills/` levels. Prunes stop at the first non-empty parent so we
+/// never touch a directory the user populated with unrelated skills.
+///
+/// Missing files are a silent no-op — this function is called on every
+/// install and every uninstall, so most of the time there is nothing to do.
+/// Dry-run mode emits a `skill_legacy_dry_run` line per existing file
+/// without modifying disk.
+fn cleanup_legacy_one(target: &SkillTarget, dry_run: bool) -> Result<()> {
+    if !target.path.exists() {
+        return Ok(());
+    }
+
+    if dry_run {
+        println!(
+            r#"<setup status="skill_legacy_dry_run" agent="{}" path="{}"/>"#,
+            target.agent,
+            target.path.display()
+        );
+        return Ok(());
+    }
+
+    std::fs::remove_file(&target.path)
+        .with_context(|| format!("remove legacy skill file {}", target.path.display()))?;
+    println!(
+        r#"<setup status="skill_legacy_removed" agent="{}" path="{}"/>"#,
+        target.agent,
+        target.path.display()
+    );
+
+    // Best-effort prune of the per-skill directory and its `skills/` parent.
+    // `remove_dir` only succeeds on an empty directory, so any unrelated
+    // content blocks the prune and we silently stop. This is exactly the
+    // conservative behavior we want — we only tidy up what we created.
+    if let Some(skill_dir) = target.path.parent() {
+        let _ = std::fs::remove_dir(skill_dir);
+        if let Some(skills_root) = skill_dir.parent() {
+            let _ = std::fs::remove_dir(skills_root);
+        }
+    }
     Ok(())
 }
 
@@ -406,8 +533,8 @@ mod tests {
     fn frontmatter_grants_bash_memory_without_prompting() {
         // `allowed-tools` must be present and authorize bare `memory *` calls
         // so the user is not prompted to approve every CLI invocation. Claude
-        // Code honors this key; Gemini CLI silently ignores unknown keys, so
-        // a single body stays compatible with both.
+        // Code honors this key; Gemini CLI and Codex silently ignore unknown
+        // keys, so a single body stays compatible with all three.
         assert!(SKILL_BODY.contains("allowed-tools: Bash(memory *)"));
     }
 
@@ -483,16 +610,17 @@ mod tests {
         );
     }
 
-    /// `skill_targets` must return both tool-native destinations in a stable
-    /// order (claude first, gemini second). The exact labels are part of the
-    /// `<setup>` status contract — the README documents them — so pin them
-    /// here too.
+    /// `skill_targets` must return exactly two tool-neutral destinations in
+    /// stable order: Claude first (tool-native), then the cross-agent
+    /// `~/.agents/skills/` alias that covers Gemini CLI and Codex. The exact
+    /// labels (`"claude"`, `"shared"`) are part of the `<setup>` status
+    /// contract — the README documents them — so pin them here too.
     #[test]
-    fn skill_targets_returns_claude_and_gemini_in_order() {
+    fn skill_targets_returns_claude_and_shared_in_order() {
         let targets = skill_targets().expect("home dir resolves on test platforms");
         assert_eq!(targets.len(), 2, "expected exactly two skill targets");
         assert_eq!(targets[0].agent, "claude");
-        assert_eq!(targets[1].agent, "gemini");
+        assert_eq!(targets[1].agent, "shared");
         assert!(
             targets[0]
                 .path
@@ -503,8 +631,8 @@ mod tests {
         assert!(
             targets[1]
                 .path
-                .ends_with(".gemini/skills/agent-memory/SKILL.md"),
-            "gemini target path: {}",
+                .ends_with(".agents/skills/agent-memory/SKILL.md"),
+            "shared target path: {}",
             targets[1].path.display()
         );
         // Both targets must be rooted under $HOME — tests run with whatever
@@ -518,6 +646,22 @@ mod tests {
                 home.display()
             );
         }
+    }
+
+    /// `~/.gemini/skills/agent-memory/SKILL.md` is a v1.4.0/v1.4.1 legacy
+    /// install path. The migration table must list it with the `gemini`
+    /// label so cleanup status lines are attributable.
+    #[test]
+    fn legacy_skill_paths_include_gemini_migration() {
+        let legacy = legacy_skill_targets().expect("home dir resolves");
+        assert!(
+            legacy
+                .iter()
+                .any(|t| t.agent == "gemini"
+                    && t.path.ends_with(".gemini/skills/agent-memory/SKILL.md")),
+            "legacy list must contain the .gemini migration entry: {:?}",
+            legacy
+        );
     }
 
     #[test]
@@ -561,22 +705,22 @@ mod tests {
                 .join("agent-memory")
                 .join("SKILL.md"),
         };
-        let gemini_target = SkillTarget {
-            agent: "gemini",
+        let shared_target = SkillTarget {
+            agent: "shared",
             path: tmp
-                .join(".gemini")
+                .join(".agents")
                 .join("skills")
                 .join("agent-memory")
                 .join("SKILL.md"),
         };
         install_one(&claude_target).expect("claude install");
-        install_one(&gemini_target).expect("gemini install");
+        install_one(&shared_target).expect("shared install");
 
         let claude_body = std::fs::read_to_string(&claude_target.path).unwrap();
-        let gemini_body = std::fs::read_to_string(&gemini_target.path).unwrap();
+        let shared_body = std::fs::read_to_string(&shared_target.path).unwrap();
         assert_eq!(
-            claude_body, gemini_body,
-            "claude and gemini SKILL.md contents should match byte-for-byte"
+            claude_body, shared_body,
+            "claude and shared SKILL.md contents should match byte-for-byte"
         );
         assert_eq!(claude_body, SKILL_BODY);
     }
@@ -616,6 +760,197 @@ mod tests {
         assert!(!target.path.exists());
         // Second remove on missing file must not error.
         remove_one(&target).expect("second remove is a no-op");
+    }
+
+    /// `cleanup_legacy_one` removes the file AND prunes the now-empty
+    /// per-skill and `skills/` parent directories so a subsequent `ls`
+    /// shows no trace of the old install layout.
+    #[test]
+    fn cleanup_legacy_one_removes_file_and_empty_parents() {
+        let tmp = tempdir_in_target();
+        let path = tmp
+            .join(".gemini")
+            .join("skills")
+            .join("agent-memory")
+            .join("SKILL.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "stale body").unwrap();
+
+        let target = SkillTarget {
+            agent: "gemini",
+            path: path.clone(),
+        };
+        cleanup_legacy_one(&target, false).expect("cleanup should succeed");
+
+        assert!(!path.exists(), "stale SKILL.md should be gone");
+        let per_skill_dir = path.parent().unwrap();
+        assert!(
+            !per_skill_dir.exists(),
+            "empty agent-memory/ parent should be pruned"
+        );
+        let skills_root = per_skill_dir.parent().unwrap();
+        assert!(
+            !skills_root.exists(),
+            "empty skills/ parent should be pruned"
+        );
+        // The tool home (`.gemini/`) itself must survive — that's the
+        // user's settings directory, not ours to delete.
+        assert!(
+            skills_root.parent().unwrap().exists(),
+            "tool home directory must not be pruned"
+        );
+    }
+
+    /// When the `skills/` sibling contains other skills, the prune must
+    /// stop at the first non-empty parent — we only tidy up empties we
+    /// created, never directories the user populated.
+    #[test]
+    fn cleanup_legacy_one_stops_prune_at_populated_parent() {
+        let tmp = tempdir_in_target();
+        let stale = tmp
+            .join(".gemini")
+            .join("skills")
+            .join("agent-memory")
+            .join("SKILL.md");
+        let sibling = tmp
+            .join(".gemini")
+            .join("skills")
+            .join("other-skill")
+            .join("SKILL.md");
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(sibling.parent().unwrap()).unwrap();
+        std::fs::write(&stale, "stale").unwrap();
+        std::fs::write(&sibling, "unrelated user skill").unwrap();
+
+        let target = SkillTarget {
+            agent: "gemini",
+            path: stale.clone(),
+        };
+        cleanup_legacy_one(&target, false).expect("cleanup should succeed");
+
+        assert!(!stale.exists(), "stale SKILL.md should be gone");
+        assert!(
+            !stale.parent().unwrap().exists(),
+            "empty agent-memory/ parent should be pruned"
+        );
+        assert!(
+            sibling.exists(),
+            "unrelated user skill must survive the prune"
+        );
+        assert!(
+            sibling.parent().unwrap().parent().unwrap().exists(),
+            "populated skills/ root must survive"
+        );
+    }
+
+    /// `cleanup_legacy_one` on a missing file must be a silent no-op — it's
+    /// called on every install and every uninstall, so most invocations
+    /// find nothing to do.
+    #[test]
+    fn cleanup_legacy_one_noop_when_missing() {
+        let tmp = tempdir_in_target();
+        let target = SkillTarget {
+            agent: "gemini",
+            path: tmp
+                .join(".gemini")
+                .join("skills")
+                .join("agent-memory")
+                .join("SKILL.md"),
+        };
+        cleanup_legacy_one(&target, false).expect("missing file is not an error");
+    }
+
+    /// End-to-end: run_install against a tempdir pre-seeded with a stale
+    /// legacy SKILL.md must delete the stale file and install the two
+    /// current targets.
+    #[test]
+    fn run_install_cleans_legacy_and_writes_current_targets() {
+        let tmp = tempdir_in_target();
+        let legacy_path = tmp
+            .join(".gemini")
+            .join("skills")
+            .join("agent-memory")
+            .join("SKILL.md");
+        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        std::fs::write(&legacy_path, "stale body").unwrap();
+
+        let targets = vec![
+            SkillTarget {
+                agent: "claude",
+                path: tmp
+                    .join(".claude")
+                    .join("skills")
+                    .join("agent-memory")
+                    .join("SKILL.md"),
+            },
+            SkillTarget {
+                agent: "shared",
+                path: tmp
+                    .join(".agents")
+                    .join("skills")
+                    .join("agent-memory")
+                    .join("SKILL.md"),
+            },
+        ];
+        let legacy = vec![SkillTarget {
+            agent: "gemini",
+            path: legacy_path.clone(),
+        }];
+
+        run_install(&targets, &legacy, false).expect("install should succeed");
+
+        assert!(!legacy_path.exists(), "legacy path should be cleaned");
+        for t in &targets {
+            assert_eq!(
+                std::fs::read_to_string(&t.path).unwrap(),
+                SKILL_BODY,
+                "current target {} should have fresh body",
+                t.path.display()
+            );
+        }
+    }
+
+    /// `--remove` semantics: even when only the legacy path exists (a user
+    /// who installed v1.4.1 but never upgraded), uninstall wipes it cleanly.
+    #[test]
+    fn run_remove_cleans_legacy_even_when_current_absent() {
+        let tmp = tempdir_in_target();
+        let legacy_path = tmp
+            .join(".gemini")
+            .join("skills")
+            .join("agent-memory")
+            .join("SKILL.md");
+        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        std::fs::write(&legacy_path, "stale body").unwrap();
+
+        let targets = vec![
+            SkillTarget {
+                agent: "claude",
+                path: tmp
+                    .join(".claude")
+                    .join("skills")
+                    .join("agent-memory")
+                    .join("SKILL.md"),
+            },
+            SkillTarget {
+                agent: "shared",
+                path: tmp
+                    .join(".agents")
+                    .join("skills")
+                    .join("agent-memory")
+                    .join("SKILL.md"),
+            },
+        ];
+        let legacy = vec![SkillTarget {
+            agent: "gemini",
+            path: legacy_path.clone(),
+        }];
+
+        run_remove(&targets, &legacy, false).expect("remove should succeed");
+        assert!(
+            !legacy_path.exists(),
+            "legacy path must be removed during --remove even when current targets are absent"
+        );
     }
 
     /// Minimal isolated tempdir under `target/` so tests don't depend on the

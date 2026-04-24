@@ -353,14 +353,18 @@ pub enum SetupCommands {
     /// sessions via the always-loaded skill description (~100 tokens). The
     /// full body only loads on demand.
     ///
-    /// Writes `SKILL.md` to every known agent frontend unconditionally:
-    ///   - `~/.claude/skills/agent-memory/SKILL.md` (Claude Code)
-    ///   - `~/.gemini/skills/agent-memory/SKILL.md` (Gemini CLI)
+    /// Writes `SKILL.md` to every known skill-root unconditionally:
+    ///   - `~/.claude/skills/agent-memory/SKILL.md` (Claude Code, tool-native)
+    ///   - `~/.agents/skills/agent-memory/SKILL.md` (cross-agent alias — read
+    ///     by Gemini CLI, Codex, and any future frontend honoring the shared
+    ///     `.agents/skills/` convention)
     ///
-    /// Both frontends read the same YAML frontmatter + Markdown body, so the
+    /// Every frontend reads the same YAML frontmatter + Markdown body, so
     /// identical byte contents are written to each target. No auto-detection
     /// of whether the agent is installed — running `memory setup skill` is
-    /// the opt-in signal.
+    /// the opt-in signal. Legacy install paths (v1.4.0/v1.4.1's
+    /// `~/.gemini/skills/agent-memory/SKILL.md`) are scrubbed on every
+    /// install and every `--remove`.
     Skill {
         /// Show the resulting file content without writing anything.
         #[arg(long)]
