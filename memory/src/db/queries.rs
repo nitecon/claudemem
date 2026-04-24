@@ -258,13 +258,20 @@ pub fn delete_memory(conn: &Connection, id: &str) -> Result<bool, MemoryError> {
     Ok(changed > 0)
 }
 
+/// Bump the `access_count` counter for every id in `ids`.
+///
+/// Intentionally does NOT touch `updated_at` — reads are not edits, and
+/// stamping them as such would make every `memory get` / `memory context`
+/// resurface a memory at the top of `ORDER BY updated_at DESC` lists (and
+/// poison the dream incremental cutoff, which uses `updated_at > last_dream_at`
+/// to find new work). Prior to v1.4.4 this function did bump `updated_at`
+/// and caused exactly those regressions; keep the SQL minimal and the
+/// semantics read-only so neither problem returns.
 pub fn increment_access(conn: &Connection, ids: &[String]) -> Result<(), MemoryError> {
-    let mut stmt = conn.prepare(
-        "UPDATE memories SET access_count = access_count + 1, updated_at = ?1 WHERE id = ?2",
-    )?;
-    let now = chrono::Utc::now().to_rfc3339();
+    let mut stmt =
+        conn.prepare("UPDATE memories SET access_count = access_count + 1 WHERE id = ?1")?;
     for id in ids {
-        stmt.execute(params![now, id])?;
+        stmt.execute(params![id])?;
     }
     Ok(())
 }
@@ -1415,6 +1422,34 @@ mod resolve_id_tests {
         let snap = snapshot_dream_rows(&conn, &ids).unwrap();
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].0, "aaaaaaaa-0000-1111-2222-000000000001");
+    }
+
+    #[test]
+    fn increment_access_does_not_touch_updated_at() {
+        // Reads must not bump `updated_at`. Prior to v1.4.4 this function
+        // did, and it polluted `ORDER BY updated_at DESC` lists + dream's
+        // incremental cutoff. This test pins the read-only semantics.
+        let conn = fresh_db();
+        let id = "aaaaaaaa-0000-1111-2222-000000000001";
+        insert(&conn, id);
+        let before = get_memory_by_id(&conn, id).unwrap();
+
+        // Sleep briefly so any accidental `updated_at = now()` would land
+        // on a distinguishable timestamp, making the negative assertion
+        // meaningful even on fast machines.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        increment_access(&conn, std::slice::from_ref(&id.to_string())).unwrap();
+
+        let after = get_memory_by_id(&conn, id).unwrap();
+        assert_eq!(
+            after.updated_at, before.updated_at,
+            "read path must not bump updated_at"
+        );
+        assert_eq!(
+            after.access_count,
+            before.access_count + 1,
+            "access_count must still increment"
+        );
     }
 
     #[test]
