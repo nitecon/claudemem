@@ -25,11 +25,18 @@ use thiserror::Error;
 /// Default filename inside `$AGENT_MEMORY_DIR`. Lives next to `memory.db`.
 pub const SETTINGS_FILENAME: &str = "dream.toml";
 
-/// Default timeout for the headless subprocess, in milliseconds. Tuned so
-/// a single-memory condense can accommodate slow first-call model spin-up
-/// (Claude / Gemini CLIs cold-start around 3–8s in practice) without
-/// leaving the dream pass hanging indefinitely on a wedged subprocess.
-pub const DEFAULT_HEADLESS_TIMEOUT_MS: u64 = 30_000;
+/// Default timeout for the headless subprocess, in milliseconds. Sized
+/// for agentic batched curation: Claude running through a full `memory
+/// update` / `memory forget` / `memory move` sequence across a batch of
+/// up to ~100 memories routinely takes several minutes once cold-start +
+/// per-memory deliberation + tool-call round trips are combined. The
+/// previous 30s ceiling was tuned for single-memory non-agentic condense
+/// and killed real agentic passes mid-flight.
+///
+/// Ten minutes gives comfortable headroom for the expected worst case
+/// (100-memory agentic batch on a slow provider) while still bounding a
+/// wedged subprocess so the dream pass can't hang indefinitely.
+pub const DEFAULT_HEADLESS_TIMEOUT_MS: u64 = 600_000;
 
 /// Canonical command template for Claude on first-run auto-detect.
 ///
