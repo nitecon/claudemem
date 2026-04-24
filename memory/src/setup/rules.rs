@@ -38,15 +38,26 @@
 //!   3. `~/.config/codex/AGENTS.md` if only the XDG path is present.
 //!   4. Skip Codex entirely if none of the above.
 //!
-//! Claude Code coupling: when the target rule file is a Claude `CLAUDE.md`
-//! (user or project scope), we also merge `"autoMemoryEnabled": false` into
-//! the matching `settings.json`. The installed rules block redirects the
-//! agent to route ALL memory operations through the `memory` CLI, so leaving
-//! Claude Code's native auto-memory on would cause the agent to write into
-//! two stores in parallel (Claude's own `MEMORY.md` and this tool's SQLite
-//! DB), producing silent duplication and drift. The `--remove` path reverses
-//! the merge by deleting the key rather than forcing it to `true`.
+//! Native-memory coupling: when the rules block is installed, we must also
+//! disable each supported agent tool's native memory system. The rules
+//! block redirects the agent to route ALL memory operations through the
+//! `memory` CLI, so leaving native memory on would cause the agent to
+//! write into two stores in parallel — the tool's built-in memory file
+//! and this tool's SQLite DB — producing silent duplication and drift.
+//! The `--remove` path reverses each merge by deleting the key rather
+//! than forcing it back to `true` (absence and `true` are semantically
+//! different and we don't know what the user had before install).
+//!
+//! Per-agent coupling:
+//!
+//! | Agent    | Target file                   | Key written                       |
+//! |----------|-------------------------------|-----------------------------------|
+//! | Claude   | `~/.claude/settings.json`     | `"autoMemoryEnabled": false`      |
+//! | Gemini   | `~/.gemini/settings.json`     | `"save_memory"` in `excludeTools` |
+//! | Codex    | `~/.codex/config.toml`        | `[features] memories = false`     |
 
+use crate::setup::codex_config_toml;
+use crate::setup::gemini_settings_json;
 use crate::setup::settings_json::{self, SettingsOutcome};
 use anyhow::{Context, Result};
 use std::io::{self, BufRead, Write};
@@ -631,10 +642,21 @@ fn strip_block(existing: &str) -> String {
     format!("{before}{trimmed_after}")
 }
 
-/// Drive the paired `settings.json` mutation after a successful rule-file
-/// change. Silent no-op for non-Claude rule files (GEMINI/AGENTS). Status
-/// is emitted as a light-XML `<setup .../>` line matching the existing
-/// installer output vocabulary.
+/// Drive the paired native-memory-disable mutation after a successful
+/// rule-file change. Dispatches on the rule file's agent kind:
+///
+/// - Claude (`CLAUDE.md`) → write `autoMemoryEnabled: false` into
+///   `settings.json`.
+/// - Gemini (`GEMINI.md`) → add `save_memory` to `excludeTools` in
+///   `settings.json`.
+/// - Codex (`AGENTS.md`) → set `[features] memories = false` in
+///   `config.toml`.
+/// - Anything else → silent no-op.
+///
+/// Status lines are emitted as light-XML `<setup .../>` records matching
+/// the installer's existing output vocabulary. The `key` and `value`
+/// attributes name the concrete setting touched so scripted consumers and
+/// humans both have a single line to grep against.
 ///
 /// Failures here do NOT unwind the rule-file mutation — the `.bak` sibling
 /// lets the user recover from that if needed. Instead we flag `any_failed`
@@ -647,16 +669,91 @@ fn sync_auto_memory(
     dry_run: bool,
     any_failed: &mut bool,
 ) {
-    let Some(settings_path) = settings_json::settings_path_for_rule_file(rule_file) else {
-        // Non-Claude rule files have no matching settings.json — silent skip.
+    // Claude — JSON scalar key.
+    if let Some(settings_path) = settings_json::settings_path_for_rule_file(rule_file) {
+        run_settings_op(
+            &settings_path,
+            settings_json::AUTO_MEMORY_KEY,
+            "false",
+            "(removed)",
+            action,
+            dry_run,
+            any_failed,
+            settings_json::disable_auto_memory,
+            settings_json::remove_auto_memory,
+        );
         return;
-    };
+    }
 
+    // Gemini — JSON array membership.
+    if let Some(settings_path) = gemini_settings_json::settings_path_for_rule_file(rule_file) {
+        run_settings_op(
+            &settings_path,
+            gemini_settings_json::EXCLUDE_TOOLS_KEY,
+            gemini_settings_json::SAVE_MEMORY_TOOL,
+            // Remove `value` attribute is always `(removed)`; the paired
+            // `key` already names the entry being pulled.
+            "(removed)",
+            action,
+            dry_run,
+            any_failed,
+            gemini_settings_json::disable_save_memory,
+            gemini_settings_json::remove_save_memory,
+        );
+        return;
+    }
+
+    // Codex — TOML nested key. Derived from the rule file's own parent
+    // directory so `CODEX_HOME` / XDG precedence stays consistent with
+    // the AGENTS.md target the caller just mutated.
+    let home = dirs::home_dir();
+    let codex_home_override = std::env::var("CODEX_HOME").ok().map(PathBuf::from);
+    if let Some(home) = home.as_deref() {
+        if let Some(config_path) = codex_config_toml::config_path_for_rule_file(
+            rule_file,
+            home,
+            codex_home_override.as_deref(),
+        ) {
+            run_settings_op(
+                &config_path,
+                "features.memories",
+                "false",
+                "(removed)",
+                action,
+                dry_run,
+                any_failed,
+                codex_config_toml::disable_memories,
+                codex_config_toml::remove_memories,
+            );
+        }
+    }
+    // All other rule files → no paired settings to touch.
+}
+
+/// Shared executor for the three per-agent settings mutations. Folds the
+/// common dry-run handling, outcome-to-status mapping, and status-line
+/// emission into one place so each per-agent caller only has to supply the
+/// display strings and the two operation closures.
+#[allow(clippy::too_many_arguments)]
+fn run_settings_op<D, R>(
+    settings_path: &Path,
+    key_label: &str,
+    install_value: &str,
+    remove_value: &str,
+    action: AutoMemoryAction,
+    dry_run: bool,
+    any_failed: &mut bool,
+    disable: D,
+    remove: R,
+) where
+    D: FnOnce(&Path) -> Result<SettingsOutcome>,
+    R: FnOnce(&Path) -> Result<SettingsOutcome>,
+{
     if dry_run {
         println!(
             r#"<setup status="settings_dry_run" path="{}" key="{}" action="{}"/>"#,
             settings_path.display(),
-            settings_json::AUTO_MEMORY_KEY,
+            key_label,
             match action {
                 AutoMemoryAction::Disable => "disable",
                 AutoMemoryAction::Remove => "remove",
@@ -666,8 +763,8 @@ fn sync_auto_memory(
     }
 
     let outcome = match action {
-        AutoMemoryAction::Disable => settings_json::disable_auto_memory(&settings_path),
-        AutoMemoryAction::Remove => settings_json::remove_auto_memory(&settings_path),
+        AutoMemoryAction::Disable => disable(settings_path),
+        AutoMemoryAction::Remove => remove(settings_path),
     };
 
     match outcome {
@@ -680,20 +777,20 @@ fn sync_auto_memory(
                 SettingsOutcome::AlreadyAbsent => "settings_key_already_absent",
             };
             let value = match action {
-                AutoMemoryAction::Disable => "false",
-                AutoMemoryAction::Remove => "(removed)",
+                AutoMemoryAction::Disable => install_value,
+                AutoMemoryAction::Remove => remove_value,
             };
             println!(
                 r#"<setup status="{}" path="{}" key="{}" value="{}"/>"#,
                 status,
                 settings_path.display(),
-                settings_json::AUTO_MEMORY_KEY,
+                key_label,
                 value,
             );
         }
         Err(e) => {
             eprintln!(
-                "Failed to update settings.json at {}: {e:#}",
+                "Failed to update settings at {}: {e:#}",
                 settings_path.display()
             );
             *any_failed = true;
@@ -1202,5 +1299,248 @@ mod tests {
             agent_label_for_rule_file(Path::new("/x/custom/FOOBAR.md")),
             "unknown"
         );
+    }
+
+    // -- integration: native-memory sync across all three agents --------------
+    //
+    // The install/remove cycle below drives `sync_auto_memory` directly
+    // (rather than spawning the CLI) so the assertions stay fast and
+    // deterministic. For each agent we:
+    //
+    //   1. Stage a fake home with pre-existing unrelated settings/config
+    //      content the user might reasonably have.
+    //   2. Run the install sync and assert the native-memory-disable key
+    //      lands alongside the pre-existing content.
+    //   3. Run the remove sync and assert the pre-existing content is
+    //      unchanged while the key is gone.
+    //
+    // Covers Claude (scalar JSON key), Gemini (JSON array membership), and
+    // Codex (nested TOML key) in a single exercise.
+
+    #[test]
+    fn sync_auto_memory_install_and_remove_cycle_across_all_agents() {
+        let home_dir = tempdir_in_target();
+
+        // Stage Claude: user has a theme preference already.
+        let claude_dir = home_dir.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let claude_rule = claude_dir.join("CLAUDE.md");
+        std::fs::write(&claude_rule, "# Claude instructions\n").unwrap();
+        let claude_settings = claude_dir.join("settings.json");
+        std::fs::write(&claude_settings, r#"{"theme": "dark"}"#).unwrap();
+
+        // Stage Gemini: user has a theme and a non-save_memory exclude.
+        let gemini_dir = home_dir.join(".gemini");
+        std::fs::create_dir_all(&gemini_dir).unwrap();
+        let gemini_rule = gemini_dir.join("GEMINI.md");
+        std::fs::write(&gemini_rule, "# Gemini instructions\n").unwrap();
+        let gemini_settings = gemini_dir.join("settings.json");
+        std::fs::write(
+            &gemini_settings,
+            r#"{"theme": "dark", "excludeTools": ["run_shell_command"]}"#,
+        )
+        .unwrap();
+
+        // Stage Codex: user has a UI theme set.
+        let codex_dir = home_dir.join(".codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        let codex_rule = codex_dir.join("AGENTS.md");
+        std::fs::write(&codex_rule, "# Codex instructions\n").unwrap();
+        let codex_config = codex_dir.join("config.toml");
+        std::fs::write(&codex_config, "[ui]\ntheme = \"dark\"\n").unwrap();
+
+        // -- install --------------------------------------------------------
+        let mut any_failed = false;
+        sync_auto_memory(
+            &claude_rule,
+            AutoMemoryAction::Disable,
+            false,
+            &mut any_failed,
+        );
+        sync_auto_memory(
+            &gemini_rule,
+            AutoMemoryAction::Disable,
+            false,
+            &mut any_failed,
+        );
+        sync_auto_memory(
+            &codex_rule,
+            AutoMemoryAction::Disable,
+            false,
+            &mut any_failed,
+        );
+        assert!(
+            !any_failed,
+            "install must not surface any per-agent failures"
+        );
+
+        // Claude: autoMemoryEnabled=false added, theme preserved.
+        let claude_body = std::fs::read_to_string(&claude_settings).unwrap();
+        let claude_parsed: serde_json::Value = serde_json::from_str(&claude_body).unwrap();
+        let claude_obj = claude_parsed.as_object().unwrap();
+        assert_eq!(claude_obj.get("theme").unwrap(), "dark");
+        assert_eq!(
+            claude_obj.get("autoMemoryEnabled").unwrap(),
+            &serde_json::Value::Bool(false)
+        );
+
+        // Gemini: save_memory appended, prior entry + theme preserved.
+        let gemini_body = std::fs::read_to_string(&gemini_settings).unwrap();
+        let gemini_parsed: serde_json::Value = serde_json::from_str(&gemini_body).unwrap();
+        let gemini_obj = gemini_parsed.as_object().unwrap();
+        assert_eq!(gemini_obj.get("theme").unwrap(), "dark");
+        let gemini_arr = gemini_obj.get("excludeTools").unwrap().as_array().unwrap();
+        let gemini_names: Vec<&str> = gemini_arr.iter().filter_map(|v| v.as_str()).collect();
+        assert!(gemini_names.contains(&"run_shell_command"));
+        assert!(gemini_names.contains(&"save_memory"));
+
+        // Codex: features.memories=false added, [ui] preserved.
+        let codex_body = std::fs::read_to_string(&codex_config).unwrap();
+        let codex_parsed: toml::value::Table = toml::from_str(&codex_body).unwrap();
+        let ui = codex_parsed.get("ui").and_then(|v| v.as_table()).unwrap();
+        assert_eq!(ui.get("theme").unwrap().as_str(), Some("dark"));
+        let features = codex_parsed
+            .get("features")
+            .and_then(|v| v.as_table())
+            .unwrap();
+        assert_eq!(features.get("memories").unwrap().as_bool(), Some(false));
+
+        // -- remove ---------------------------------------------------------
+        let mut any_failed = false;
+        sync_auto_memory(
+            &claude_rule,
+            AutoMemoryAction::Remove,
+            false,
+            &mut any_failed,
+        );
+        sync_auto_memory(
+            &gemini_rule,
+            AutoMemoryAction::Remove,
+            false,
+            &mut any_failed,
+        );
+        sync_auto_memory(
+            &codex_rule,
+            AutoMemoryAction::Remove,
+            false,
+            &mut any_failed,
+        );
+        assert!(
+            !any_failed,
+            "remove must not surface any per-agent failures"
+        );
+
+        // Claude reverts to theme-only.
+        let claude_parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&claude_settings).unwrap()).unwrap();
+        let claude_obj = claude_parsed.as_object().unwrap();
+        assert_eq!(claude_obj.get("theme").unwrap(), "dark");
+        assert!(!claude_obj.contains_key("autoMemoryEnabled"));
+
+        // Gemini reverts: save_memory gone, run_shell_command stays.
+        let gemini_parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&gemini_settings).unwrap()).unwrap();
+        let gemini_obj = gemini_parsed.as_object().unwrap();
+        assert_eq!(gemini_obj.get("theme").unwrap(), "dark");
+        let gemini_arr = gemini_obj.get("excludeTools").unwrap().as_array().unwrap();
+        let gemini_names: Vec<&str> = gemini_arr.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(gemini_names, vec!["run_shell_command"]);
+
+        // Codex reverts: features table gone, [ui] stays.
+        let codex_parsed: toml::value::Table =
+            toml::from_str(&std::fs::read_to_string(&codex_config).unwrap()).unwrap();
+        assert!(
+            !codex_parsed.contains_key("features"),
+            "empty features table must be dropped on remove"
+        );
+        let ui = codex_parsed.get("ui").and_then(|v| v.as_table()).unwrap();
+        assert_eq!(ui.get("theme").unwrap().as_str(), Some("dark"));
+    }
+
+    /// Fresh install case: no pre-existing settings/config at all. The
+    /// sync helpers must create the target files from scratch for each
+    /// agent and still revert cleanly on remove.
+    #[test]
+    fn sync_auto_memory_creates_fresh_files_per_agent() {
+        let home_dir = tempdir_in_target();
+
+        let claude_dir = home_dir.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let claude_rule = claude_dir.join("CLAUDE.md");
+
+        let gemini_dir = home_dir.join(".gemini");
+        std::fs::create_dir_all(&gemini_dir).unwrap();
+        let gemini_rule = gemini_dir.join("GEMINI.md");
+
+        let codex_dir = home_dir.join(".codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        let codex_rule = codex_dir.join("AGENTS.md");
+
+        let mut any_failed = false;
+        sync_auto_memory(
+            &claude_rule,
+            AutoMemoryAction::Disable,
+            false,
+            &mut any_failed,
+        );
+        sync_auto_memory(
+            &gemini_rule,
+            AutoMemoryAction::Disable,
+            false,
+            &mut any_failed,
+        );
+        sync_auto_memory(
+            &codex_rule,
+            AutoMemoryAction::Disable,
+            false,
+            &mut any_failed,
+        );
+        assert!(!any_failed);
+
+        assert!(claude_dir.join("settings.json").exists());
+        assert!(gemini_dir.join("settings.json").exists());
+        assert!(codex_dir.join("config.toml").exists());
+
+        // Remove cycle should collapse each file back to a benign state.
+        let mut any_failed = false;
+        sync_auto_memory(
+            &claude_rule,
+            AutoMemoryAction::Remove,
+            false,
+            &mut any_failed,
+        );
+        sync_auto_memory(
+            &gemini_rule,
+            AutoMemoryAction::Remove,
+            false,
+            &mut any_failed,
+        );
+        sync_auto_memory(
+            &codex_rule,
+            AutoMemoryAction::Remove,
+            false,
+            &mut any_failed,
+        );
+        assert!(!any_failed);
+
+        // Claude collapses to `{}` (keeps the file per documented policy).
+        let claude_parsed: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(claude_dir.join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(claude_parsed.as_object().unwrap().is_empty());
+
+        // Gemini likewise collapses to `{}`.
+        let gemini_parsed: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(gemini_dir.join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(gemini_parsed.as_object().unwrap().is_empty());
+
+        // Codex config collapses to an empty document.
+        let codex_parsed: toml::value::Table =
+            toml::from_str(&std::fs::read_to_string(codex_dir.join("config.toml")).unwrap())
+                .unwrap();
+        assert!(codex_parsed.is_empty());
     }
 }
