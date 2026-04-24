@@ -61,6 +61,25 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = 0)]
     pub limit: usize,
 
+    /// Force a full re-walk, ignoring `project_state.last_dream_at`. Useful
+    /// after a prompt change or a manual repair when you want every row
+    /// re-evaluated regardless of its last-processed timestamp.
+    ///
+    /// On a large DB this is slow — the default incremental mode bounds
+    /// each run by the day's new writes, which is the point of the
+    /// `project_state` table. Only reach for `--full` when you know why.
+    #[arg(long, global = true)]
+    pub full: bool,
+
+    /// Override the agentic/non-agentic batch size for this invocation.
+    /// `0` = use the mode-appropriate default (100 agentic, 1 non-agentic).
+    ///
+    /// Agentic mode chunks candidates into N-memory batches before invoking
+    /// the LLM; non-agentic mode ignores this flag's value beyond `0` vs
+    /// non-zero (per-memory condensation doesn't batch).
+    #[arg(long, global = true, default_value_t = 0)]
+    pub batch_size: usize,
+
     /// Override the backend for a single invocation
     /// (headless | local | disabled). Does NOT mutate `dream.toml`.
     #[arg(long, global = true, value_parser = parse_backend_mode)]
@@ -202,6 +221,30 @@ mod tests {
     fn bare_limit_flag_is_parsed() {
         let cli = Cli::parse_from(["memory-dream", "--limit", "42"]);
         assert_eq!(cli.limit, 42);
+    }
+
+    #[test]
+    fn bare_full_flag_is_parsed() {
+        let cli = Cli::parse_from(["memory-dream", "--full"]);
+        assert!(cli.full);
+    }
+
+    #[test]
+    fn full_flag_defaults_to_false() {
+        let cli = Cli::parse_from(["memory-dream"]);
+        assert!(!cli.full);
+    }
+
+    #[test]
+    fn batch_size_override_is_parsed() {
+        let cli = Cli::parse_from(["memory-dream", "--batch-size", "50"]);
+        assert_eq!(cli.batch_size, 50);
+    }
+
+    #[test]
+    fn batch_size_defaults_to_zero() {
+        let cli = Cli::parse_from(["memory-dream"]);
+        assert_eq!(cli.batch_size, 0);
     }
 
     #[test]
