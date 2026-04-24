@@ -349,9 +349,18 @@ pub enum SetupCommands {
         remove: bool,
     },
 
-    /// Install a Claude Code skill at `~/.claude/skills/agent-memory/SKILL.md`
-    /// so the `memory` CLI is auto-advertised to sessions via the always-loaded
-    /// skill description (~100 tokens). The full body only loads on demand.
+    /// Install an Agent Skill so the `memory` CLI is auto-advertised to
+    /// sessions via the always-loaded skill description (~100 tokens). The
+    /// full body only loads on demand.
+    ///
+    /// Writes `SKILL.md` to every known agent frontend unconditionally:
+    ///   - `~/.claude/skills/agent-memory/SKILL.md` (Claude Code)
+    ///   - `~/.gemini/skills/agent-memory/SKILL.md` (Gemini CLI)
+    ///
+    /// Both frontends read the same YAML frontmatter + Markdown body, so the
+    /// identical byte contents are written to each target. No auto-detection
+    /// of whether the agent is installed — running `memory setup skill` is
+    /// the opt-in signal.
     Skill {
         /// Show the resulting file content without writing anything.
         #[arg(long)]
@@ -359,6 +368,11 @@ pub enum SetupCommands {
         /// Print the SKILL.md to stdout and exit (no file IO).
         #[arg(long)]
         print: bool,
+        /// Delete the installed `SKILL.md` from every known target. Missing
+        /// files are a silent no-op per target. Inverse of the default
+        /// install, matching `setup rules --remove`.
+        #[arg(long)]
+        remove: bool,
     },
 
     /// Run rules → skill non-interactively.
@@ -889,7 +903,11 @@ fn execute_setup(command: Option<SetupCommands>) -> anyhow::Result<()> {
             print,
             remove,
         }) => rules::run(target, all, dry_run, print, remove),
-        Some(SetupCommands::Skill { dry_run, print }) => skill::run(dry_run, print),
+        Some(SetupCommands::Skill {
+            dry_run,
+            print,
+            remove,
+        }) => skill::run(dry_run, print, remove),
         Some(SetupCommands::All { yes }) => menu::run_all(yes),
     }
 }

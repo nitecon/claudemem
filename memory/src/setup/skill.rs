@@ -217,17 +217,25 @@ pub fn is_installed() -> bool {
 /// Entry point invoked from `cli.rs` for `memory setup skill`.
 ///
 /// Arguments:
-/// - `dry_run` — print what would be written for every target without
-///   touching disk.
+/// - `dry_run` — print what would be written (or removed) for every target
+///   without touching disk.
 /// - `print` — dump `SKILL_BODY` to stdout and exit (no filesystem IO, no
 ///   per-target preamble).
-pub fn run(dry_run: bool, print: bool) -> Result<()> {
+/// - `remove` — inverse of install: delete the SKILL.md file at each known
+///   target. Missing files are a silent no-op per target (parity with
+///   `setup rules --remove` which silently skips files that lack the block).
+pub fn run(dry_run: bool, print: bool, remove: bool) -> Result<()> {
     if print {
         print!("{SKILL_BODY}");
         return Ok(());
     }
 
     let targets = skill_targets().context("could not resolve skill install paths")?;
+
+    if remove {
+        return run_remove(&targets, dry_run);
+    }
+
     run_install(&targets, dry_run)
 }
 
@@ -283,6 +291,63 @@ fn install_one(target: &SkillTarget) -> Result<()> {
         .with_context(|| format!("write skill file {}", target.path.display()))?;
     println!(
         r#"<setup status="skill_installed" agent="{}" path="{}"/>"#,
+        target.agent,
+        target.path.display()
+    );
+    Ok(())
+}
+
+/// Remove path for [`run`]. Mirrors [`run_install`]: every target is visited,
+/// missing files emit `skill_absent`, successful removals emit
+/// `skill_removed`. Dry-run prints what *would* happen without touching disk.
+fn run_remove(targets: &[SkillTarget], dry_run: bool) -> Result<()> {
+    let mut any_failed = false;
+    for t in targets {
+        if dry_run {
+            let status = if t.path.exists() {
+                "skill_dry_run_remove"
+            } else {
+                "skill_absent"
+            };
+            println!(
+                r#"<setup status="{}" agent="{}" path="{}"/>"#,
+                status,
+                t.agent,
+                t.path.display()
+            );
+            continue;
+        }
+        match remove_one(t) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!(
+                    "Failed to remove skill for {} at {}: {e:#}",
+                    t.agent,
+                    t.path.display()
+                );
+                any_failed = true;
+            }
+        }
+    }
+    if any_failed {
+        anyhow::bail!("one or more skill targets could not be removed");
+    }
+    Ok(())
+}
+
+fn remove_one(target: &SkillTarget) -> Result<()> {
+    if !target.path.exists() {
+        println!(
+            r#"<setup status="skill_absent" agent="{}" path="{}"/>"#,
+            target.agent,
+            target.path.display()
+        );
+        return Ok(());
+    }
+    std::fs::remove_file(&target.path)
+        .with_context(|| format!("remove skill file {}", target.path.display()))?;
+    println!(
+        r#"<setup status="skill_removed" agent="{}" path="{}"/>"#,
         target.agent,
         target.path.display()
     );
@@ -534,6 +599,23 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&target.path).unwrap(), SKILL_BODY);
         assert_eq!(std::fs::read_to_string(&backup).unwrap(), SKILL_BODY);
+    }
+
+    /// `remove_one` deletes the file cleanly and is a no-op on a missing
+    /// target (mirrors the silent-skip contract for `--remove`).
+    #[test]
+    fn remove_one_deletes_then_noop_on_missing() {
+        let tmp = tempdir_in_target();
+        let target = SkillTarget {
+            agent: "claude",
+            path: tmp.join("skills").join("agent-memory").join("SKILL.md"),
+        };
+        install_one(&target).expect("install");
+        assert!(target.path.exists());
+        remove_one(&target).expect("first remove");
+        assert!(!target.path.exists());
+        // Second remove on missing file must not error.
+        remove_one(&target).expect("second remove is a no-op");
     }
 
     /// Minimal isolated tempdir under `target/` so tests don't depend on the

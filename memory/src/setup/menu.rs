@@ -199,7 +199,7 @@ fn run_components(components: &[Component]) -> Result<()> {
             // second interactive prompt — the menu's selection step already
             // got user consent for *which components* to install.
             Component::Rules => rules::run(None, true, false, false, false),
-            Component::Skill => skill::run(false, false),
+            Component::Skill => skill::run(false, false, false),
         };
         if let Err(e) = result {
             eprintln!("{} failed: {e:#}", c.label());
