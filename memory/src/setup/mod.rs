@@ -15,10 +15,19 @@
 //!     alias honored by Gemini CLI and Codex) so every supported frontend
 //!     auto-advertises the `memory` CLI to its sessions.
 //!
+//! The `rules` installer couples to per-agent sibling helpers that disable
+//! each agent tool's native memory system in parallel with the rules
+//! block, preventing dual-write drift between our SQLite store and the
+//! tool's built-in memory surface:
+//!
+//!   - `settings_json` — Claude Code (`autoMemoryEnabled: false`).
+//!   - `gemini_settings_json` — Gemini CLI (`save_memory` in `excludeTools`).
+//!
 //! The module only re-exports the public entry points used by `cli.rs`; the
 //! implementation details (markers, body templates, probe helpers) stay
 //! private to their respective submodules.
 
+pub mod gemini_settings_json;
 pub mod menu;
 pub mod rules;
 pub mod settings_json;

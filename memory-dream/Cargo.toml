@@ -47,7 +47,7 @@ hex = "0.4"
 # Settings file (dream.toml) — TOML parse/serialize for the persistent
 # backend/model config layer. Intentionally separate from the SQLite store
 # so the file is human-editable and version-controllable.
-toml = "0.8"
+toml = { workspace = true }
 
 # PATH probing for the first-run auto-detect: checks for `claude` / `gemini`
 # binaries so a fresh install defaults to the right backend without prompts.
