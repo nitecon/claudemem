@@ -192,6 +192,27 @@ memory forget --id <uuid>
 memory prune --max-age-days 90 [--dry-run]
 ```
 
+### Memory quality gate (MANDATORY)
+
+Store memories only when they will help a future agent work faster. A good memory captures reusable patterns, operational procedures, user preferences, non-obvious constraints, failure causes, or "how to / why" guidance. Write for a cold agent who has not seen this session: the memory should tell them what to do next, which tool or system to use, and why that path is correct.
+
+Do **not** store facts that can be recovered from git history, repository inspection, CI/release systems, or the agent-tools task/comms surfaces. In particular, do not store routine deployment status, version numbers, release events, commit SHAs, branch state, "CI passed", "tag was pushed", or "deployed version X" memories.
+
+Exception: store deployment/version facts only when they explain a failure mode or encode a reusable procedure that prevents future mistakes.
+
+Prefer:
+
+- Dev server `https://foo-dev.nitecon.org` is deployed by Eventic on main branch push; do not manually deploy. Average deploy time is about 2 minutes, so set a timer before checking.
+
+Avoid:
+
+- "Deployed version 1.2.0."
+- "Tag v1.2.0 was pushed."
+- "Commit abc123 passed CI."
+- "Updated pattern 019dc55f with a Mumble/Murmur example."
+
+If a user refers to "patterns", they likely mean gateway-backed `agent-tools patterns` stored under `https://gateway.nitecon.org`. A useful memory says to inspect the current CLI with `agent-tools patterns --help`, then use `agent-tools patterns get/update/check` as appropriate. Do not save a memory that only says a pattern was updated; save the reusable workflow and the reason it matters.
+
 ### Rule A -- Pre-action behavior recall (MANDATORY)
 
 Before starting any user-requested task, run one `memory context "<task>"` call first. A single call returns both global directives (1.25× boost) and project-specific directives (1.5× boost). Do not skip for "quick" tasks: directives the user has already stated must never need to be re-stated. If the `hint` field flags zero global-scope matches, pause and reflect — or ask before acting.

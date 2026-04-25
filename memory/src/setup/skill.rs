@@ -120,6 +120,36 @@ memory store "<content>" -m <type> --scope global -t "<tags>"   # universal pref
 # types: user, feedback, project, reference
 ```
 
+## Memory quality gate
+
+Store memories only when they will help a future agent work faster. Good
+memories capture reusable patterns, operational procedures, user preferences,
+non-obvious constraints, failure causes, or "how to / why" guidance. Write for
+a cold agent who has not seen this session: the memory should tell them what to
+do next, which tool or system to use, and why that path is correct.
+
+Do **not** store facts recoverable from git history, repository inspection,
+CI/release systems, or agent-tools tasks/comms. Avoid routine deployment status,
+version numbers, release events, commit SHAs, branch state, "CI passed", "tag
+was pushed", or "deployed version X" memories.
+
+Exception: store deployment/version facts only when they explain a failure mode
+or encode a reusable procedure that prevents future mistakes. Prefer:
+
+- Dev server `https://foo-dev.nitecon.org` is deployed by Eventic on main branch
+  push; do not manually deploy. Average deploy time is about 2 minutes, so set
+  a timer before checking.
+
+Avoid: "Deployed version 1.2.0"; "Tag v1.2.0 was pushed"; "Commit abc123
+passed CI"; "Updated pattern 019dc55f with a Mumble/Murmur example."
+
+If a user refers to "patterns", they likely mean gateway-backed
+`agent-tools patterns` stored under `https://gateway.nitecon.org`. A useful
+memory says to inspect the current CLI with `agent-tools patterns --help`, then
+use `agent-tools patterns get/update/check` as appropriate. Do not save a
+memory that only says a pattern was updated; save the reusable workflow and the
+reason it matters.
+
 Write audit-ready descriptions — explain the **why**, not just the what.
 
 ## Filter, list, inspect
@@ -625,6 +655,34 @@ mod tests {
         assert!(
             SKILL_BODY.contains("MUST ask"),
             "skill body must carry the mandatory-ask clause for ambiguous scope"
+        );
+    }
+
+    #[test]
+    fn body_documents_memory_quality_gate() {
+        assert!(
+            SKILL_BODY.contains("Memory quality gate"),
+            "skill body must include the memory quality gate"
+        );
+        assert!(
+            SKILL_BODY.contains("Do **not** store facts recoverable from git history"),
+            "skill body must warn against storing git-derived state"
+        );
+        assert!(
+            SKILL_BODY.contains("deployment/version facts only when they explain a failure mode"),
+            "skill body must allow deployment/version facts only for failure modes or reusable procedures"
+        );
+        assert!(
+            SKILL_BODY.contains("Deployed version 1.2.0"),
+            "skill body must include a concrete bad version-memory example"
+        );
+        assert!(
+            SKILL_BODY.contains("cold agent"),
+            "skill body must instruct agents to write for cold-start retrieval"
+        );
+        assert!(
+            SKILL_BODY.contains("agent-tools patterns --help"),
+            "skill body must include the agent-tools patterns workflow example"
         );
     }
 

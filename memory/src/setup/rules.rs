@@ -153,6 +153,41 @@ memory prune --max-age-days 90 [--dry-run]
 memory update
 ```
 
+### Memory quality gate (MANDATORY)
+
+Store memories only when they will help a future agent work faster. A good
+memory captures reusable patterns, operational procedures, user preferences,
+non-obvious constraints, failure causes, or "how to / why" guidance. Write for
+a cold agent who has not seen this session: the memory should tell them what to
+do next, which tool or system to use, and why that path is correct.
+
+Do **not** store facts that can be recovered from git history, repository
+inspection, CI/release systems, or the agent-tools task/comms surfaces. In
+particular, do not store routine deployment status, version numbers, release
+events, commit SHAs, branch state, "CI passed", "tag was pushed", or "deployed
+version X" memories.
+
+Exception: store deployment/version facts only when they explain a failure mode
+or encode a reusable procedure that prevents future mistakes. Prefer:
+
+- "Dev server `https://foo-dev.nitecon.org` is deployed by Eventic on main
+  branch push; do not manually deploy. Average deploy time is about 2 minutes,
+  so set a timer before checking."
+
+Avoid:
+
+- "Deployed version 1.2.0."
+- "Tag v1.2.0 was pushed."
+- "Commit abc123 passed CI."
+- "Updated pattern 019dc55f with a Mumble/Murmur example."
+
+If a user refers to "patterns", they likely mean gateway-backed
+`agent-tools patterns` stored under `https://gateway.nitecon.org`. A useful
+memory says to inspect the current CLI with `agent-tools patterns --help`, then
+use `agent-tools patterns get/update/check` as appropriate. Do not save a
+memory that only says a pattern was updated; save the reusable workflow and the
+reason it matters.
+
 ### Retrieval strategy
 
 1. **Pre-Task**: run `memory context "<task>"` before reading code. If a similar
@@ -165,8 +200,8 @@ memory update
    global-scope preferences in your top-K. Treat them as directives, not
    suggestions — they encode rules the user has already stated once.
 5. **Post-Task**: run `memory store` for any non-obvious decisions, user
-   preferences, or reusable patterns. Audit-ready descriptions — explain the
-   "why," not just the "what."
+   preferences, reusable patterns, or failure causes that pass the quality
+   gate. Audit-ready descriptions — explain the "why," not just the "what."
 
 ### Rule A — Pre-action behavior recall (MANDATORY)
 
@@ -966,6 +1001,35 @@ mod tests {
         assert!(
             b.contains("MUST ask"),
             "Rule B must include the mandatory-ask clause for ambiguous phrasing"
+        );
+    }
+
+    #[test]
+    fn build_block_documents_memory_quality_gate() {
+        let b = build_block();
+        assert!(
+            b.contains("Memory quality gate"),
+            "block must include the memory quality gate"
+        );
+        assert!(
+            b.contains("Do **not** store facts that can be recovered from git history"),
+            "block must warn against storing git-derived state"
+        );
+        assert!(
+            b.contains("deployment/version facts only when they explain a failure mode"),
+            "block must allow deployment/version facts only for failure modes or reusable procedures"
+        );
+        assert!(
+            b.contains("Deployed version 1.2.0"),
+            "block must include a concrete bad version-memory example"
+        );
+        assert!(
+            b.contains("cold agent"),
+            "block must instruct agents to write for cold-start retrieval"
+        );
+        assert!(
+            b.contains("agent-tools patterns --help"),
+            "block must include the agent-tools patterns workflow example"
         );
     }
 
