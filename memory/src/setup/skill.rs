@@ -42,7 +42,15 @@ use std::path::{Path, PathBuf};
 /// surface in one screen.
 const SKILL_BODY: &str = r#"---
 name: agent-memory
-description: Persistent hybrid-search memory for AI coding agents via the `memory` CLI — semantic + BM25 search with project (1.5×) and global (1.25×) scope tiers, cross-session recall. Apply the Memory First/Last rule: every task MUST begin with `memory context "<task>"` (pre-task recall, returns both scopes in one call) and end with `memory store` (post-task save) when functionality changed, classifying scope as project or `--scope global` for universal preferences. Use for storing user directives, project decisions, debugging insights, and reusable patterns.
+description: >-
+  Persistent hybrid-search memory for AI coding agents via the `memory` CLI -
+  semantic + BM25 search with project (1.5x) and global (1.25x) scope tiers,
+  cross-session recall. Apply the Memory First/Last rule: every task MUST begin
+  with `memory context "<task>"` (pre-task recall, returns both scopes in one
+  call) and end with `memory store` (post-task save) when functionality changed,
+  classifying scope as project or `--scope global` for universal preferences.
+  Use for storing user directives, project decisions, debugging insights, and
+  reusable patterns.
 allowed-tools: Bash(memory *)
 ---
 
@@ -509,6 +517,26 @@ mod tests {
     fn body_starts_with_frontmatter_fence() {
         // Skills require the YAML-style `---` fence as the very first bytes.
         assert!(SKILL_BODY.starts_with("---\n"));
+    }
+
+    #[test]
+    fn frontmatter_description_uses_folded_block_scalar() {
+        // The description contains colon-space substrings such as
+        // "rule: every task"; plain YAML scalars treat those as mappings and
+        // break Codex skill loading. Keep it as a block scalar.
+        let frontmatter = SKILL_BODY
+            .strip_prefix("---\n")
+            .and_then(|s| s.split_once("\n---\n"))
+            .map(|(fm, _)| fm)
+            .expect("skill body must contain fenced frontmatter");
+        assert!(
+            frontmatter.contains("description: >-\n"),
+            "description must be a YAML block scalar"
+        );
+        assert!(
+            !frontmatter.contains("description: Persistent"),
+            "description must not be a plain scalar"
+        );
     }
 
     #[test]

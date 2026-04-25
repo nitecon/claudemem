@@ -444,6 +444,16 @@ pub fn auto_update(data_dir: &Path) {
     // Mark early so a failure does not cause repeated attempts.
     mark_checked(data_dir);
 
+    // `reqwest::blocking` owns a small Tokio runtime internally. Running it
+    // directly inside our `#[tokio::main]` runtime can panic when that inner
+    // runtime is dropped, so isolate the blocking updater on a plain thread.
+    match std::thread::spawn(run_auto_update_check).join() {
+        Ok(()) => {}
+        Err(_) => eprintln!("[WARN] Update check panicked"),
+    }
+}
+
+fn run_auto_update_check() {
     let (latest_version, tag) = match get_latest_release() {
         Ok(v) => v,
         Err(e) => {
